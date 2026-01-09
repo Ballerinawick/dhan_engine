@@ -9,7 +9,7 @@ load_dotenv()
 
 from instrument_master import InstrumentMaster
 from dhan_depth20_ws import DhanTwentyDepthWS
-from dhan_ltp_rest_engine import DhanLtpRestEngine
+from ltp_rest_engine import DhanLtpRestEngine
 
 from tick_filter import TickFilter
 from quant_processor import QuantProcessor
