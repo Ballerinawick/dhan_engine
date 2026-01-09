@@ -8,7 +8,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 
-from instrument_master import InstrumentMaster
 from dhan_marketfeed_ws import DhanLiveMarketFeedWS
 from dhan_depth20_ws import DhanTwentyDepthWS
 
