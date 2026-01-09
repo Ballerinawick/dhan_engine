@@ -1,217 +1,181 @@
-# run_ws_9_instruments.py
-import os
-import time
-import csv
-from datetime import datetime
-from pathlib import Path
-
-from dotenv import load_dotenv
-load_dotenv()
-
-from dhan_marketfeed_ws import DhanLiveMarketFeedWS
-from dhan_depth20_ws import DhanTwentyDepthWS
-
-from tick_filter import TickFilter
-from quant_processor import QuantProcessor
-from microstructure_state import MicrostructureState
-from signal_engine import SignalEngine
-from depth_micro_features import DepthMicroFeatureBuilder
+# instrument_master.py
+import pandas as pd
 
 
-# Allow override in Railway
-CSV_FILE = os.getenv("CSV_FILE", "api-scrip-master.csv")
+class InstrumentMaster:
+    """
+    Reads Dhan api-scrip-master.csv and extracts:
+    - Nearest FUTIDX for index (NIFTY / BANKNIFTY / FINNIFTY)
+    - Nearest OPTIDX expiry
+    - Find option SecurityId by (index, expiry, strike, CE/PE)
+    """
 
-INDEXES = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
-STRIKE_STEP = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
+    def __init__(self, csv_path: str):
+        self.df = pd.read_csv(csv_path, low_memory=False)
+        self.df.columns = self.df.columns.astype(str).str.strip()
+        print("✅ CSV LOADED | rows:", len(self.df))
 
-# Options depth segment (Dhan docs for derivatives depth commonly NSE_FNO)
-OPT_EXCHANGE_SEGMENT_20D = "NSE_FNO"
+        # Normalize string columns
+        obj_cols = self.df.select_dtypes(include=["object"]).columns
+        for c in obj_cols:
+            self.df[c] = self.df[c].astype(str).str.strip()
 
-SWITCH_COOLDOWN_SEC = 8.0
-HEARTBEAT_SEC = 30.0
+        # Required columns (CSV VERIFIED)
+        required = [
+            "SEM_EXM_EXCH_ID",
+            "SEM_SEGMENT",
+            "SEM_SMST_SECURITY_ID",
+            "SEM_INSTRUMENT_NAME",
+            "SEM_TRADING_SYMBOL",
+            "SEM_CUSTOM_SYMBOL",
+            "SEM_OPTION_TYPE",
+            "SEM_STRIKE_PRICE",
+            "SEM_LOT_UNITS",
+            "SEM_EXPIRY_DATE",
+        ]
+        for r in required:
+            if r not in self.df.columns:
+                raise KeyError(f"Missing required column: {r}")
 
+        # Parse expiry once
+        self.df["SEM_EXPIRY_DATE"] = pd.to_datetime(self.df["SEM_EXPIRY_DATE"], errors="coerce")
 
-def compute_itm_strikes(ltp: float, step: int):
-    # ATM rounding
-    atm = int(round(ltp / step) * step)
-    # 1 ITM CE and 1 ITM PE around ATM (your current design)
-    return atm, atm - step, atm + step
+        # Strike numeric
+        self.df["SEM_STRIKE_PRICE"] = pd.to_numeric(self.df["SEM_STRIKE_PRICE"], errors="coerce")
 
+        # Caches for speed
+        self._opt_cache = {}  # key: (index_upper) -> OPTIDX df
+        self._fut_cache = {}  # key: (index_upper) -> FUTIDX df
 
-def main():
-    token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
-    client_id = os.getenv("DHAN_CLIENT_ID", "").strip()
-    if not token or not client_id:
-        raise RuntimeError("Missing DHAN_ACCESS_TOKEN / DHAN_CLIENT_ID (set in environment variables)")
+    # ---------------------------------------------------
+    # Internal: OPTIDX filtered dataframe for index
+    # ---------------------------------------------------
+    def _get_optidx_df(self, index: str):
+        idx = str(index).upper().strip()
+        if idx in self._opt_cache:
+            return self._opt_cache[idx]
 
-    master = InstrumentMaster(CSV_FILE)
+        df = self.df
+        opts = df[
+            (df["SEM_EXM_EXCH_ID"] == "NSE")
+            & (df["SEM_SEGMENT"] == "D")
+            & (df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == "OPTIDX")
+            & (df["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.startswith(idx, na=False))
+        ].copy()
 
-    tick_filter = TickFilter()
-    quant = QuantProcessor()
-    micro = MicrostructureState()
-    signal_engine = SignalEngine()
-    feature_builder = DepthMicroFeatureBuilder()
+        opts = opts.dropna(subset=["SEM_EXPIRY_DATE", "SEM_STRIKE_PRICE", "SEM_SMST_SECURITY_ID", "SEM_OPTION_TYPE"])
+        self._opt_cache[idx] = opts
+        return opts
 
-    # ---------- CSV LOGGER SETUP ----------
-    Path("logs").mkdir(exist_ok=True)
-    log_file = f"logs/market_ticks_{datetime.now().strftime('%Y-%m-%d')}.csv"
+    # ---------------------------------------------------
+    # Internal: FUTIDX filtered dataframe for index
+    # ---------------------------------------------------
+    def _get_futidx_df(self, index: str):
+        idx = str(index).upper().strip()
+        if idx in self._fut_cache:
+            return self._fut_cache[idx]
 
-    csv_fp = open(log_file, "a", newline="")
-    csv_writer = csv.writer(csv_fp)
+        df = self.df
+        fut = df[
+            (df["SEM_EXM_EXCH_ID"] == "NSE")
+            & (df["SEM_SEGMENT"] == "D")
+            & (df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == "FUTIDX")
+            & (df["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.startswith(idx, na=False))
+        ].copy()
 
-    if csv_fp.tell() == 0:
-        csv_writer.writerow([
-            "timestamp", "tag", "ltp", "flow",
-            "volume", "vol_delta",
-            "oi", "oi_delta",
-            "bid_qty", "ask_qty",
-            "absorption_flag", "absorption_strength",
-            "vacuum_flag",
-            "delta", "theta",
-            "signal"
-        ])
+        fut = fut.dropna(subset=["SEM_EXPIRY_DATE", "SEM_SMST_SECURITY_ID"])
+        self._fut_cache[idx] = fut
+        return fut
 
-    print("\n🚀 LIVE MODE (CSV + FUT-from-CSV)")
-    print("1) FUT LTP  -> MarketFeed WS (FULL packet)")
-    print("2) OPTIONS -> ONE TwentyDepth WS (20 depth)\n")
+    # ---------------------------------------------------
+    # ✅ FUT: Nearest (active) Index Future (current month / next expiry)
+    # ---------------------------------------------------
+    def get_nearest_future(self, index_name: str):
+        idx = str(index_name).upper().strip()
+        fut = self._get_futidx_df(idx)
 
-    fut_ltp = {k: 0.0 for k in INDEXES}
-    current = {idx: {"atm": None, "last_switch": 0.0} for idx in INDEXES}
-    latest_sig = {}
+        now = pd.Timestamp.now()
+        fut2 = fut[fut["SEM_EXPIRY_DATE"] >= now].copy()
 
-    last_heartbeat = 0.0
+        if fut2.empty:
+            # If no future expiry exists, this means CSV is outdated OR system time mismatch
+            raise Exception(f"❌ No ACTIVE FUT found for {idx} (expiry >= now). Check CSV freshness/time.")
 
-    # ---------- OPTION DEPTH CALLBACK ----------
-    def on_opt_depth(secid: int, tag: str, bid, ask):
+        row = fut2.sort_values("SEM_EXPIRY_DATE").iloc[0]
+
+        return {
+            "security_id": str(row["SEM_SMST_SECURITY_ID"]),
+            "symbol": str(row["SEM_TRADING_SYMBOL"]),
+            "expiry": row["SEM_EXPIRY_DATE"],
+            "lot_size": int(float(row["SEM_LOT_UNITS"])) if "SEM_LOT_UNITS" in row else 0,
+        }
+
+    # ---------------------------------------------------
+    # ✅ NEW: Direct helper (execution layer uses this)
+    # Returns string SecurityId
+    # ---------------------------------------------------
+    def get_current_fut_security_id(self, index_name: str) -> str:
+        fut = self.get_nearest_future(index_name)
+        return str(fut["security_id"])
+
+    # ---------------------------------------------------
+    # ✅ NEW: Direct helper for FUT segment (always NSE_FNO for derivatives feed)
+    # Keeps your execution layer clean
+    # ---------------------------------------------------
+    def get_fut_exchange_segment(self) -> str:
+        return "NSE_FNO"
+
+    # ---------------------------------------------------
+    # ✅ Nearest option expiry for index (OPTIDX)
+    # Returns pandas Timestamp
+    # ---------------------------------------------------
+    def get_nearest_option_expiry(self, index: str):
+        opts = self._get_optidx_df(index)
+
+        now = pd.Timestamp.now()
+        opts2 = opts[opts["SEM_EXPIRY_DATE"] >= now]
+
+        if opts2.empty:
+            raise Exception(f"❌ No OPTIDX expiry >= now for {index}. Check system time or CSV expiries.")
+
+        expiry = opts2["SEM_EXPIRY_DATE"].sort_values().iloc[0]
+        return expiry
+
+    # ---------------------------------------------------
+    # Find SecurityId for exact option (index, expiry_dt, strike, CE/PE)
+    # ---------------------------------------------------
+    def find_option_security_id(self, index: str, expiry_dt, strike, opt_type: str):
+        idx = str(index).upper().strip()
+        ot = str(opt_type).upper().strip()
+
+        if ot not in ("CE", "PE"):
+            raise ValueError("opt_type must be 'CE' or 'PE'")
+
+        exp = pd.to_datetime(expiry_dt, errors="coerce")
+        if pd.isna(exp):
+            raise Exception(f"❌ Invalid expiry provided: {expiry_dt}")
+        exp_date = exp.date()
+
         try:
-            micro_raw = feature_builder.build(secid, bid, ask)
-            tick = tick_filter.extract({**micro_raw, "tag": tag})
-            q = quant.compute(tick)
-            q = micro.update(q)
-            sig = signal_engine.generate(q)
+            strike_f = float(strike)
+        except Exception:
+            raise Exception(f"❌ Invalid strike: {strike}")
 
-            latest_sig[tag] = sig
+        opts = self._get_optidx_df(idx)
 
-            # -------- CSV LOG --------
-            csv_writer.writerow([
-                datetime.now().strftime("%H:%M:%S"),
-                tag,
-                q.get("ltp", 0),
-                q.get("flow", 0),
-                q.get("volume", 0),
-                q.get("vol_delta", 0),
-                q.get("oi", 0),
-                q.get("oi_delta", 0),
-                q.get("bid_qty", 0),
-                q.get("ask_qty", 0),
-                q.get("absorption_flag"),
-                q.get("absorption_strength"),
-                q.get("vacuum_flag"),
-                q.get("delta", 0),
-                q.get("theta", 0),
-                sig
-            ])
-            csv_fp.flush()
+        df = opts[
+            (opts["SEM_EXPIRY_DATE"].dt.date == exp_date)
+            & (opts["SEM_OPTION_TYPE"].astype(str).str.upper() == ot)
+        ].copy()
 
-            # -------- CONSOLE (only if signal interesting) --------
-            if sig != "HOLD":
-                print(f"{datetime.now().strftime('%H:%M:%S')} | {tag} → {sig}")
+        if df.empty:
+            raise Exception(f"❌ No OPTIDX rows for {idx} expiry={exp_date} type={ot}")
 
-        except Exception as e:
-            # Never crash WS thread
-            print("❌ on_opt_depth error:", str(e))
+        df["__strike_diff"] = (df["SEM_STRIKE_PRICE"].astype(float) - strike_f).abs()
+        df = df.sort_values("__strike_diff")
 
-    depth20 = DhanTwentyDepthWS(
-        token=token,
-        client_id=client_id,
-        auth_type=2,
-        exchange_segment=OPT_EXCHANGE_SEGMENT_20D,
-        on_depth=on_opt_depth,
-        debug=False
-    )
-    depth20.connect()
-    print("✅ 20Depth WS started (OPTIONS only)")
+        best = df.iloc[0]
+        if float(best["__strike_diff"]) > 0.001:
+            raise Exception(f"❌ No SecurityId found for {idx} {exp_date} {strike_f} {ot}")
 
-    # ---------- FUT MARKETFEED CALLBACK ----------
-    def on_fut_full(secid: int, tag: str, ltp: float, depth5):
-        idx = tag.replace("_FUT", "")
-        if idx in fut_ltp:
-            fut_ltp[idx] = float(ltp)
-
-    mfeed = DhanLiveMarketFeedWS(
-        token=token,
-        client_id=client_id,
-        auth_type=2,
-        on_full=on_fut_full,
-        debug=False
-    )
-    mfeed.connect()
-
-    # ✅ Build FUT subscriptions dynamically from CSV (no hardcode)
-    fut_subs = []
-    fut_seg = master.get_fut_exchange_segment()  # "NSE_FNO"
-
-    for idx in INDEXES:
-        fut_id = master.get_current_fut_security_id(idx)  # current active FUTIDX securityId
-        fut_subs.append({
-            "ExchangeSegment": fut_seg,
-            "SecurityId": str(fut_id),
-            "tag": f"{idx}_FUT"
-        })
-
-    mfeed.subscribe_full(fut_subs)
-
-    print("✅ Subscribed FUTs (from CSV):")
-    for s in fut_subs:
-        print("   ", s)
-
-    print("\n⏳ Waiting for FUT LTP ticks...\n")
-
-    # ---------- MAIN LOOP ----------
-    while True:
-        now_ts = time.time()
-
-        # Heartbeat so Railway logs keep showing life
-        if now_ts - last_heartbeat >= HEARTBEAT_SEC:
-            last_heartbeat = now_ts
-            fut_state = " | ".join([f"{k}:{fut_ltp[k]:.2f}" for k in INDEXES])
-            print(f"🫀 {datetime.now().strftime('%H:%M:%S')} HEARTBEAT | FUT_LTP => {fut_state}")
-
-        for idx in INDEXES:
-            ltp = fut_ltp[idx]
-            if ltp <= 0:
-                continue
-
-            step = STRIKE_STEP[idx]
-            atm, ce_strike, pe_strike = compute_itm_strikes(ltp, step)
-
-            # switch only when ATM changes and cooldown passed
-            if (
-                current[idx]["atm"] != atm
-                and (now_ts - current[idx]["last_switch"]) >= SWITCH_COOLDOWN_SEC
-            ):
-                current[idx]["atm"] = atm
-                current[idx]["last_switch"] = now_ts
-
-                expiry = master.get_nearest_option_expiry(idx)
-                ce_secid = master.find_option_security_id(idx, expiry, ce_strike, "CE")
-                pe_secid = master.find_option_security_id(idx, expiry, pe_strike, "PE")
-
-                # Subscribe options to 20-depth
-                depth20.subscribe([
-                    {"SecurityId": str(ce_secid), "tag": f"{idx}_CE"},
-                    {"SecurityId": str(pe_secid), "tag": f"{idx}_PE"},
-                ])
-
-                # ✅ Print strike AND securityId (so no confusion)
-                print(
-                    f"🔁 [{idx}] FUT_LTP:{ltp:.2f} | ATM:{atm} | "
-                    f"CE_STRIKE:{ce_strike} (secid:{ce_secid}) | "
-                    f"PE_STRIKE:{pe_strike} (secid:{pe_secid})"
-                )
-
-        time.sleep(0.2)
-
-
-if __name__ == "__main__":
-    main()
+        return int(float(best["SEM_SMST_SECURITY_ID"]))
