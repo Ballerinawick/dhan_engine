@@ -1,111 +1,84 @@
-# tick_filter.py
+import time
 from datetime import datetime
+
 
 class TickFilter:
     """
-    Works for:
-    - Dhan WS ticks (depth: {buy/sell})
-    - Dhan OptionChain legs (top_bid_price/top_ask_price etc.)
-    Ensures Greeks + IV + OI + volume pass through to your pipeline.
+    Depth → Synthetic Tick converter
+
+    Designed for:
+    - Dhan 20Depth WS (bid / ask only)
+    - No dependency on trade prints
+    - Momentum-safe (price reacts first in book)
     """
 
     def __init__(self):
-        self.prev_volume = None
-        self.prev_oi = None
+        self.prev_mid = None
+        self.prev_ts = None
+        self.prev_bid_qty = None
+        self.prev_ask_qty = None
 
     def extract(self, raw_tick: dict):
-        # ---- timestamp (keep utc for stable math) ----
-        ts = datetime.utcnow()
+        """
+        raw_tick expected keys:
+          - bid: DepthSide
+          - ask: DepthSide
+          - tag
+        """
 
-        # -----------------------------
-        # (A) LTP
-        # -----------------------------
-        ltp = float(raw_tick.get("last_price", 0.0) or 0.0)
+        ts = time.time()
 
-        # -----------------------------
-        # (B) BID/ASK (support both WS & OptionChain)
-        # -----------------------------
-        bid_price = bid_qty = ask_price = ask_qty = 0.0
+        bid = raw_tick.get("bid")
+        ask = raw_tick.get("ask")
 
-        depth = raw_tick.get("depth") or {}
-        buy = depth.get("buy") or []
-        sell = depth.get("sell") or []
+        if not bid or not ask:
+            return None
 
-        if buy or sell:
-            # WS-style depth
-            bid_price = float(buy[0]["price"]) if buy else 0.0
-            bid_qty   = float(buy[0]["quantity"]) if buy else 0.0
+        # ---- TOP OF BOOK ----
+        bid_price = float(bid.prices[0])
+        ask_price = float(ask.prices[0])
+        bid_qty = int(bid.qty[0])
+        ask_qty = int(ask.qty[0])
 
-            ask_price = float(sell[0]["price"]) if sell else 0.0
-            ask_qty   = float(sell[0]["quantity"]) if sell else 0.0
-        else:
-            # OptionChain-style top of book
-            bid_price = float(raw_tick.get("top_bid_price", 0.0) or 0.0)
-            ask_price = float(raw_tick.get("top_ask_price", 0.0) or 0.0)
-            bid_qty   = float(raw_tick.get("top_bid_quantity", 0.0) or 0.0)
-            ask_qty   = float(raw_tick.get("top_ask_quantity", 0.0) or 0.0)
+        if bid_price <= 0 or ask_price <= 0:
+            return None
 
-        spread = (ask_price - bid_price) if (bid_price > 0 and ask_price > 0) else 0.0
+        # ---- SYNTHETIC PRICE ----
+        mid = (bid_price + ask_price) / 2.0
 
-        # -----------------------------
-        # (C) Volume / OI + deltas
-        # -----------------------------
-        volume = int(raw_tick.get("volume", 0) or 0)
-        oi     = int(raw_tick.get("oi", 0) or 0)
+        # ---- PRICE SPEED ----
+        price_speed = 0.0
+        if self.prev_mid is not None and self.prev_ts is not None:
+            dt = max(0.001, ts - self.prev_ts)
+            price_speed = (mid - self.prev_mid) / dt
 
-        last_traded_qty = 0
-        if self.prev_volume is not None and volume >= self.prev_volume:
-            last_traded_qty = volume - self.prev_volume
-        self.prev_volume = volume
+        # ---- SYNTHETIC VOLUME (QUEUE CHANGE) ----
+        vol = 0
+        if self.prev_bid_qty is not None and self.prev_ask_qty is not None:
+            vol = abs(bid_qty - self.prev_bid_qty) + abs(ask_qty - self.prev_ask_qty)
 
-        oi_change = 0
-        if self.prev_oi is not None:
-            oi_change = oi - self.prev_oi
-        self.prev_oi = oi
-
-        # -----------------------------
-        # (D) Greeks / IV (pass-through)
-        # -----------------------------
-        delta = float(raw_tick.get("delta", 0.0) or 0.0)
-        gamma = float(raw_tick.get("gamma", 0.0) or 0.0)
-        theta = float(raw_tick.get("theta", 0.0) or 0.0)
-        vega  = float(raw_tick.get("vega", 0.0) or 0.0)
-        iv    = float(raw_tick.get("implied_volatility", 0.0) or 0.0)
-
-        # -----------------------------
-        # (E) Optional metadata (expiry / underlying)
-        # -----------------------------
-        expiry = raw_tick.get("expiry")              # "YYYY-MM-DD"
-        underlying_ltp = float(raw_tick.get("underlying_ltp", 0.0) or 0.0)
-
-        # For WS ticks these exist:
-        buy_qty = int(raw_tick.get("buy_quantity", 0) or 0)
-        sell_qty = int(raw_tick.get("sell_quantity", 0) or 0)
+        self.prev_mid = mid
+        self.prev_ts = ts
+        self.prev_bid_qty = bid_qty
+        self.prev_ask_qty = ask_qty
 
         return {
-            "ts": ts,
-            "ltp": ltp,
+            "ts": datetime.utcnow(),
 
+            # core price
+            "ltp": mid,
             "bid_price": bid_price,
-            "bid_qty": bid_qty,
             "ask_price": ask_price,
+            "spread": ask_price - bid_price,
+
+            # order flow
+            "bid_qty": bid_qty,
             "ask_qty": ask_qty,
-            "spread": spread,
+            "volume": vol,
 
-            "volume": volume,
-            "oi": oi,
-            "oi_change": oi_change,
-            "last_traded_qty": last_traded_qty,
+            # momentum primitives
+            "price_speed": price_speed,
 
-            "buy_qty": buy_qty,
-            "sell_qty": sell_qty,
-
-            "delta": delta,
-            "gamma": gamma,
-            "theta": theta,
-            "vega": vega,
-            "iv": iv,
-
-            "expiry": expiry,
-            "underlying_ltp": underlying_ltp,
+            # tags
+            "tag": raw_tick.get("tag"),
         }
