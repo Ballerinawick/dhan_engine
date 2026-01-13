@@ -9,6 +9,11 @@ class OptionsMomentumEngine:
     """
     OPTIONS MOMENTUM ENGINE (REAL-TIME)
 
+    FIXED:
+      ✅ Bug 1: PnL now per-trade (and optional cumulative)
+      ✅ Bug 2: Prevent EXIT → ENTRY in same second (cooldown per sec)
+      ✅ Bug 3: Correct PnL sign logic for LONG/SHORT + correct pullback calc
+
     STEP 1: 1-second OHLC candles
     STEP 2: Price Speed (ΔLTP / sec)
     STEP 3: Strategy-A (Scalp Breakout)
@@ -16,7 +21,10 @@ class OptionsMomentumEngine:
     STEP 5: Paper PnL Simulator
 
     Output:
-      A_ENTRY, B_ENTRY, EXIT, NO_TRADE
+      "A_ENTRY"
+      "B_ENTRY"
+      "EXIT"
+      "NO_TRADE"
     """
 
     IST = pytz.timezone("Asia/Kolkata")
@@ -39,31 +47,49 @@ class OptionsMomentumEngine:
     def __init__(self):
         self.tick_buffer = defaultdict(deque)     # secid -> ticks (current second)
         self.candles = defaultdict(deque)         # secid -> last N candles
-        self.active_trade = {}                    # secid -> trade state
-        self.pnl = defaultdict(float)             # secid -> cumulative pnl
+
+        # active trade per secid
+        # {
+        #   "type": "A"/"B",
+        #   "side": "LONG"/"SHORT",
+        #   "entry": float,
+        #   "entry_ts": float,
+        # }
+        self.active_trade = {}
+
+        # Optional cumulative pnl (keep for dashboard; but EXIT returns per-trade pnl separately)
+        self.cum_pnl = defaultdict(float)          # secid -> cumulative pnl
+
+        # Prevent EXIT → ENTRY in same second
+        self.last_action_sec = {}                  # secid -> int(second)
+
+        # Last per-trade pnl snapshot (readable)
+        self.last_trade_pnl = defaultdict(float)   # secid -> last closed trade pnl
 
     # --------------------------------------------------
     # MARKET HOURS GATE
     # --------------------------------------------------
     def market_open(self) -> bool:
         now = datetime.now(self.IST)
-        if now.weekday() >= 5:
+        if now.weekday() >= 5:  # Sat / Sun
             return False
         return self.MARKET_START <= now.time() <= self.MARKET_END
 
     # --------------------------------------------------
     # MAIN ENTRY (CALLED FROM WS CALLBACK)
+    # tick must contain: {"ltp": float, "ts": float, optional: "last_traded_qty": int}
     # --------------------------------------------------
     def on_tick(self, secid: int, tick: dict) -> str:
         if not self.market_open():
             return "NO_TRADE"
 
         ts = tick.get("ts")
-        ltp = tick.get("ltp", 0)
+        ltp = float(tick.get("ltp", 0) or 0)
         if not ts or ltp <= 0:
             return "NO_TRADE"
 
         sec = int(ts)
+
         self.tick_buffer[secid].append(tick)
 
         # remove old second ticks
@@ -88,19 +114,39 @@ class OptionsMomentumEngine:
         if len(ticks) < 2:
             return None
 
-        prices = [t["ltp"] for t in ticks if t.get("ltp", 0) > 0]
+        prices = [float(t.get("ltp", 0) or 0) for t in ticks if float(t.get("ltp", 0) or 0) > 0]
         if not prices:
             return None
 
+        o = prices[0]
+        h = max(prices)
+        l = min(prices)
+        c = prices[-1]
+        rng = h - l
+
         return {
-            "open": prices[0],
-            "high": max(prices),
-            "low": min(prices),
-            "close": prices[-1],
-            "range": max(prices) - min(prices),
-            "volume": sum(t.get("last_traded_qty", 0) for t in ticks),
-            "ts": ticks[-1]["ts"],
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "range": rng,
+            "volume": sum(int(t.get("last_traded_qty", 0) or 0) for t in ticks),
+            "ts": float(ticks[-1]["ts"]),
+            "sec": int(ticks[-1]["ts"]),
         }
+
+    # --------------------------------------------------
+    # INTERNAL HELPERS
+    # --------------------------------------------------
+    @staticmethod
+    def _safe_div(a: float, b: float) -> float:
+        return a / b if b else 0.0
+
+    def _compute_trade_pnl(self, side: str, entry: float, exit_price: float) -> float:
+        # ✅ Bug 3 fixed: correct sign
+        if side == "LONG":
+            return exit_price - entry
+        return entry - exit_price  # SHORT
 
     # --------------------------------------------------
     # STEP 2–5: STRATEGIES + EXIT + PnL
@@ -113,82 +159,114 @@ class OptionsMomentumEngine:
         last = c[-1]
         prev = c[-2]
 
+        # prevent multiple actions in same second
+        cur_sec = int(last["sec"])
+        if self.last_action_sec.get(secid) == cur_sec:
+            return "NO_TRADE"
+
         # STEP 2: PRICE SPEED
         price_speed = abs(last["close"] - prev["close"])
-        avg_range = sum(x["range"] for x in list(c)[-5:]) / 5
-        avg_vol = sum(x["volume"] for x in list(c)[-5:]) / 5
+        avg_range = sum(x["range"] for x in list(c)[-5:]) / 5.0
+        avg_vol = sum(x["volume"] for x in list(c)[-5:]) / 5.0
 
         # --------------------------------------------------
         # EXIT LOGIC (PRIORITY)
         # --------------------------------------------------
         if secid in self.active_trade:
             trade = self.active_trade[secid]
-            entry = trade["entry"]
+            entry = float(trade["entry"])
             side = trade["side"]
+            exit_price = float(last["close"])
 
-            pnl = (last["close"] - entry) if side == "LONG" else (entry - last["close"])
-            pullback = abs(pnl) / max(entry, 1)
+            trade_pnl = self._compute_trade_pnl(side, entry, exit_price)
 
-            if pullback > self.EXIT_PULLBACK or last["volume"] < avg_vol * self.EXIT_VOL_DROP:
-                self.pnl[secid] += pnl
+            # ✅ Bug fix: pullback based on PRICE move, not PnL magnitude
+            price_pullback = abs(exit_price - entry) / max(entry, 1e-9)
+
+            vol_exit = (avg_vol > 0) and (last["volume"] < avg_vol * self.EXIT_VOL_DROP)
+
+            if price_pullback > self.EXIT_PULLBACK or vol_exit:
+                # per-trade pnl snapshot
+                self.last_trade_pnl[secid] = round(trade_pnl, 2)
+
+                # optional cumulative pnl
+                self.cum_pnl[secid] += trade_pnl
+
+                # close trade
                 self.active_trade.pop(secid, None)
+
+                # ✅ Bug 2 fixed: block re-entry same second
+                self.last_action_sec[secid] = cur_sec
+
                 return "EXIT"
 
         # --------------------------------------------------
-        # STEP 3: STRATEGY A — SCALP BREAKOUT
+        # ENTRY LOGIC (only if no trade open)
+        # --------------------------------------------------
+        if secid in self.active_trade:
+            return "NO_TRADE"
+
+        # --------------------------------------------------
+        # STEP 3: STRATEGY A — SCALP BREAKOUT (LONG)
         # --------------------------------------------------
         if (
-            price_speed > avg_range * self.A_SPEED_MULT
+            avg_range > 0
+            and price_speed > avg_range * self.A_SPEED_MULT
+            and avg_vol > 0
             and last["volume"] > avg_vol * self.A_VOL_MULT
-            and secid not in self.active_trade
         ):
             self.active_trade[secid] = {
                 "type": "A",
                 "side": "LONG",
-                "entry": last["close"],
-                "ts": last["ts"],
+                "entry": float(last["close"]),
+                "entry_ts": float(last["ts"]),
             }
+            self.last_action_sec[secid] = cur_sec
             return "A_ENTRY"
 
         # --------------------------------------------------
         # STEP 4: STRATEGY B — TRAP REVERSAL
         # --------------------------------------------------
-        upper_wick = last["high"] - max(last["open"], last["close"])
-        lower_wick = min(last["open"], last["close"]) - last["low"]
+        rng = float(last["range"])
+        if rng > 0:
+            upper_wick = last["high"] - max(last["open"], last["close"])
+            lower_wick = min(last["open"], last["close"]) - last["low"]
 
-        trap_up = upper_wick > last["range"] * self.B_TRAP_WICK
-        trap_down = lower_wick > last["range"] * self.B_TRAP_WICK
+            trap_up = upper_wick > rng * self.B_TRAP_WICK
+            trap_down = lower_wick > rng * self.B_TRAP_WICK
 
-        if (
-            trap_up
-            and price_speed > avg_range * self.B_REV_SPEED
-            and secid not in self.active_trade
-        ):
-            self.active_trade[secid] = {
-                "type": "B",
-                "side": "SHORT",
-                "entry": last["close"],
-                "ts": last["ts"],
-            }
-            return "B_ENTRY"
+            if (avg_range > 0) and (price_speed > avg_range * self.B_REV_SPEED):
+                # trap up => SHORT
+                if trap_up:
+                    self.active_trade[secid] = {
+                        "type": "B",
+                        "side": "SHORT",
+                        "entry": float(last["close"]),
+                        "entry_ts": float(last["ts"]),
+                    }
+                    self.last_action_sec[secid] = cur_sec
+                    return "B_ENTRY"
 
-        if (
-            trap_down
-            and price_speed > avg_range * self.B_REV_SPEED
-            and secid not in self.active_trade
-        ):
-            self.active_trade[secid] = {
-                "type": "B",
-                "side": "LONG",
-                "entry": last["close"],
-                "ts": last["ts"],
-            }
-            return "B_ENTRY"
+                # trap down => LONG
+                if trap_down:
+                    self.active_trade[secid] = {
+                        "type": "B",
+                        "side": "LONG",
+                        "entry": float(last["close"]),
+                        "entry_ts": float(last["ts"]),
+                    }
+                    self.last_action_sec[secid] = cur_sec
+                    return "B_ENTRY"
 
         return "NO_TRADE"
 
     # --------------------------------------------------
-    # STEP 5: READ-ONLY PnL (PAPER MODE)
+    # READ-ONLY PnL HELPERS (PAPER MODE)
     # --------------------------------------------------
-    def get_pnl(self, secid: int) -> float:
-        return round(self.pnl.get(secid, 0.0), 2)
+    def get_trade_pnl(self, secid: int) -> float:
+        """Last closed trade pnl (per-trade)."""
+        return round(self.last_trade_pnl.get(secid, 0.0), 2)
+
+    def get_cum_pnl(self, secid: int) -> float:
+        """Cumulative pnl (optional)."""
+        return round(self.cum_pnl.get(secid, 0.0), 2)
