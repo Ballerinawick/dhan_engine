@@ -1,5 +1,4 @@
 # options_momentum_engine.py
-import time
 from collections import defaultdict, deque
 from datetime import datetime, time as dtime
 import pytz
@@ -10,14 +9,18 @@ class OptionsMomentumEngine:
     OPTIONS MOMENTUM ENGINE (REAL-TIME)
 
     ADDED:
-      ✅ Day-of-cycle awareness (Tue → Expiry)
+      ✅ Day-of-cycle awareness (Tue → Expiry Tue)  [your custom cycle]
       ✅ Time-of-day regime awareness
       ✅ Adaptive aggression (NO Greeks needed)
 
     FIXED:
-      ✅ Per-trade PnL
-      ✅ No EXIT→ENTRY same second
+      ✅ Deque slicing crash (use list(c)[-5:])
+      ✅ Per-trade PnL + cumulative PnL
+      ✅ No EXIT→ENTRY same second (per-sec cooldown)
       ✅ Correct LONG / SHORT PnL
+
+    Output:
+      "A_ENTRY", "B_ENTRY", "EXIT", "NO_TRADE"
     """
 
     IST = pytz.timezone("Asia/Kolkata")
@@ -32,47 +35,48 @@ class OptionsMomentumEngine:
     BASE_A_VOL = 2.5
 
     BASE_B_WICK = 0.65
-    BASE_B_SPEED = 0.7
+    BASE_B_SPEED = 0.7  # trap reversal needs at least some speed confirmation
 
     EXIT_PULLBACK = 0.40
     EXIT_VOL_DROP = 0.40
 
     def __init__(self):
-        self.tick_buffer = defaultdict(deque)
-        self.candles = defaultdict(deque)
+        self.tick_buffer = defaultdict(deque)   # secid -> ticks (current second)
+        self.candles = defaultdict(deque)       # secid -> last N 1s candles
 
-        self.active_trade = {}
-        self.last_action_sec = {}
+        self.active_trade = {}                  # secid -> trade dict
+        self.last_action_sec = {}               # secid -> last action second (cooldown)
 
-        self.last_trade_pnl = defaultdict(float)
-        self.cum_pnl = defaultdict(float)
+        self.last_trade_pnl = defaultdict(float)  # secid -> last closed trade pnl
+        self.cum_pnl = defaultdict(float)         # secid -> cumulative pnl (optional)
 
     # --------------------------------------------------
     # MARKET HOURS
     # --------------------------------------------------
     def market_open(self) -> bool:
         now = datetime.now(self.IST)
-        if now.weekday() >= 5:
+        if now.weekday() >= 5:  # Sat/Sun
             return False
         return self.MARKET_START <= now.time() <= self.MARKET_END
 
     # --------------------------------------------------
-    # DAY CYCLE (Tue start → Tue expiry)
+    # DAY CYCLE (your custom mapping)
+    # contract start: Tue(1) day1, Wed day2, Fri day3, Mon day4, Tue day5 (expiry)
+    #
+    # NOTE: Both start-Tue and expiry-Tue are "Tuesday".
+    # We can't detect which Tuesday without expiry-date input.
+    # So we treat Tuesday as day5 by default (safer/stricter),
+    # because expiry behavior is the dangerous one.
     # --------------------------------------------------
     def option_day_index(self) -> int:
-        wd = datetime.now(self.IST).weekday()
-        # Tue=1, Wed=2, Fri=4, Mon=0
-        if wd == 1:
-            return 1  # Tue
-        if wd == 2:
-            return 2  # Wed
-        if wd == 4:
-            return 3  # Fri
-        if wd == 0:
-            return 4  # Mon
-        if wd == 1:
-            return 5  # Expiry Tue
-        return 0
+        wd = datetime.now(self.IST).weekday()  # Mon=0 Tue=1 Wed=2 Thu=3 Fri=4
+        mapping = {
+            2: 2,  # Wed -> day2
+            4: 3,  # Fri -> day3
+            0: 4,  # Mon -> day4
+            1: 5,  # Tue -> day5 (expiry-safe default)
+        }
+        return mapping.get(wd, 0)  # Thu or unknown -> 0 (neutral)
 
     # --------------------------------------------------
     # TIME REGIME
@@ -89,6 +93,7 @@ class OptionsMomentumEngine:
 
     # --------------------------------------------------
     # MAIN ENTRY
+    # tick must contain: {"ltp": float, "ts": float, optional: "last_traded_qty": int}
     # --------------------------------------------------
     def on_tick(self, secid: int, tick: dict) -> str:
         if not self.market_open():
@@ -102,6 +107,7 @@ class OptionsMomentumEngine:
         sec = int(ts)
         self.tick_buffer[secid].append(tick)
 
+        # keep only ticks for current second
         while self.tick_buffer[secid] and int(self.tick_buffer[secid][0]["ts"]) < sec:
             self.tick_buffer[secid].popleft()
 
@@ -123,16 +129,21 @@ class OptionsMomentumEngine:
         if len(ticks) < 2:
             return None
 
-        prices = [t["ltp"] for t in ticks if t.get("ltp", 0) > 0]
+        prices = [float(t.get("ltp", 0) or 0) for t in ticks if float(t.get("ltp", 0) or 0) > 0]
         if not prices:
             return None
 
+        o = prices[0]
+        h = max(prices)
+        l = min(prices)
+        c = prices[-1]
+
         return {
-            "open": prices[0],
-            "high": max(prices),
-            "low": min(prices),
-            "close": prices[-1],
-            "range": max(prices) - min(prices),
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "range": h - l,
             "volume": sum(int(t.get("last_traded_qty", 0) or 0) for t in ticks),
             "ts": float(ticks[-1]["ts"]),
             "sec": int(ticks[-1]["ts"]),
@@ -153,24 +164,42 @@ class OptionsMomentumEngine:
             return "NO_TRADE"
 
         last, prev = c[-1], c[-2]
-        cur_sec = last["sec"]
+        cur_sec = int(last["sec"])
 
+        # cooldown: prevent EXIT→ENTRY (or multi actions) in same second
         if self.last_action_sec.get(secid) == cur_sec:
             return "NO_TRADE"
 
         price_speed = abs(last["close"] - prev["close"])
-        avg_range = sum(x["range"] for x in c[-5:]) / 5
-        avg_vol = sum(x["volume"] for x in c[-5:]) / 5
+
+        # ✅ FIX: deque slicing crash
+        last5 = list(c)[-5:]
+        avg_range = sum(x["range"] for x in last5) / max(len(last5), 1)
+        avg_vol = sum(x["volume"] for x in last5) / max(len(last5), 1)
 
         day = self.option_day_index()
         regime = self.time_regime()
 
         # -------- adaptive multipliers --------
-        decay_penalty = 1.0 + (day * 0.15)      # expiry → stricter
-        time_boost = 0.8 if regime == "OPEN" else 1.2 if regime == "TREND" else 1.0
+        # expiry day => stricter filters (avoid fake spikes / gamma noise)
+        decay_penalty = 1.0 + (day * 0.15)
+
+        # OPEN: too noisy => slightly stricter
+        # TREND: allow faster entries
+        if regime == "OPEN":
+            time_boost = 1.10
+        elif regime == "TREND":
+            time_boost = 0.90
+        elif regime == "CLOSE":
+            time_boost = 1.15
+        else:
+            time_boost = 1.00
 
         A_SPEED = self.BASE_A_SPEED * decay_penalty * time_boost
         A_VOL = self.BASE_A_VOL * decay_penalty
+
+        B_SPEED = self.BASE_B_SPEED * decay_penalty * time_boost
+        B_WICK = self.BASE_B_WICK  # keep wick constant (structure-based)
 
         # -------- EXIT --------
         if secid in self.active_trade:
@@ -178,52 +207,65 @@ class OptionsMomentumEngine:
             pnl = self._trade_pnl(t["side"], t["entry"], last["close"])
             pull = abs(last["close"] - t["entry"]) / max(t["entry"], 1e-9)
 
-            if pull > self.EXIT_PULLBACK or last["volume"] < avg_vol * self.EXIT_VOL_DROP:
+            vol_exit = (avg_vol > 0) and (last["volume"] < avg_vol * self.EXIT_VOL_DROP)
+
+            if pull > self.EXIT_PULLBACK or vol_exit:
                 self.last_trade_pnl[secid] = round(pnl, 2)
                 self.cum_pnl[secid] += pnl
-                self.active_trade.pop(secid)
+                self.active_trade.pop(secid, None)
                 self.last_action_sec[secid] = cur_sec
                 return "EXIT"
 
+        # if still in trade, do nothing
         if secid in self.active_trade:
             return "NO_TRADE"
 
-        # -------- STRATEGY A --------
-        if avg_range > 0 and price_speed > avg_range * A_SPEED and last["volume"] > avg_vol * A_VOL:
+        # -------- STRATEGY A (Breakout LONG) --------
+        if (
+            avg_range > 0
+            and price_speed > avg_range * A_SPEED
+            and avg_vol > 0
+            and last["volume"] > avg_vol * A_VOL
+        ):
             self.active_trade[secid] = {
                 "type": "A",
                 "side": "LONG",
-                "entry": last["close"],
-                "ts": last["ts"],
+                "entry": float(last["close"]),
+                "ts": float(last["ts"]),
             }
             self.last_action_sec[secid] = cur_sec
             return "A_ENTRY"
 
-        # -------- STRATEGY B --------
-        rng = last["range"]
-        if rng > 0:
-            uw = last["high"] - max(last["open"], last["close"])
-            lw = min(last["open"], last["close"]) - last["low"]
+        # -------- STRATEGY B (Trap Reversal) --------
+        rng = float(last["range"])
+        if rng > 0 and avg_range > 0:
+            uw = float(last["high"]) - max(float(last["open"]), float(last["close"]))
+            lw = min(float(last["open"]), float(last["close"])) - float(last["low"])
 
-            if uw > rng * self.BASE_B_WICK:
-                self.active_trade[secid] = {
-                    "type": "B",
-                    "side": "SHORT",
-                    "entry": last["close"],
-                    "ts": last["ts"],
-                }
-                self.last_action_sec[secid] = cur_sec
-                return "B_ENTRY"
+            trap_up = uw > rng * B_WICK
+            trap_down = lw > rng * B_WICK
 
-            if lw > rng * self.BASE_B_WICK:
-                self.active_trade[secid] = {
-                    "type": "B",
-                    "side": "LONG",
-                    "entry": last["close"],
-                    "ts": last["ts"],
-                }
-                self.last_action_sec[secid] = cur_sec
-                return "B_ENTRY"
+            # add speed confirmation so B doesn't fire randomly
+            if price_speed > avg_range * B_SPEED:
+                if trap_up:
+                    self.active_trade[secid] = {
+                        "type": "B",
+                        "side": "SHORT",
+                        "entry": float(last["close"]),
+                        "ts": float(last["ts"]),
+                    }
+                    self.last_action_sec[secid] = cur_sec
+                    return "B_ENTRY"
+
+                if trap_down:
+                    self.active_trade[secid] = {
+                        "type": "B",
+                        "side": "LONG",
+                        "entry": float(last["close"]),
+                        "ts": float(last["ts"]),
+                    }
+                    self.last_action_sec[secid] = cur_sec
+                    return "B_ENTRY"
 
         return "NO_TRADE"
 
@@ -235,3 +277,7 @@ class OptionsMomentumEngine:
 
     def get_cum_pnl(self, secid: int) -> float:
         return round(self.cum_pnl.get(secid, 0.0), 2)
+
+    # Backward-compatible alias (if any runner still calls get_pnl)
+    def get_pnl(self, secid: int) -> float:
+        return self.get_trade_pnl(secid)
