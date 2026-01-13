@@ -1,4 +1,3 @@
-# run_ws_9_instruments.py
 import os
 import time
 import csv
@@ -28,18 +27,13 @@ STRIKE_STEP = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
 
 OPT_EXCHANGE_SEGMENT_20D = "NSE_FNO"
 
-# ✅ One-shot FUT LTP (REST) – we will STOP after we get first valid LTPs
-REST_POLL_INTERVAL_SEC = 1.05  # keep > 1s to avoid 429
-REST_MAX_WAIT_SEC = 45         # try up to 45 sec to get initial LTP (adjust if needed)
-
-# ✅ After we subscribe CE/PE once, we won’t keep switching by ATM
-SUBSCRIBE_ONCE_ONLY = True
+REST_POLL_INTERVAL_SEC = 1.2
+REST_MAX_WAIT_SEC = 45
 
 HEARTBEAT_SEC = 30.0
 
-# ✅ Raw CE/PE "tick JSON" print (throttled per tag)
 PRINT_RAW_JSON = True
-RAW_JSON_THROTTLE_SEC = 1.0  # print at most 1 per sec per tag
+RAW_JSON_THROTTLE_SEC = 1.0
 
 
 def compute_itm_strikes(ltp: float, step: int):
@@ -55,12 +49,7 @@ def main():
 
     # -------- CORE OBJECTS --------
     master = InstrumentMaster(CSV_FILE)
-
-    ltp_rest = DhanLtpRestEngine(
-        access_token=token,
-        client_id=client_id,
-        debug=True
-    )
+    ltp_rest = DhanLtpRestEngine(token, client_id, debug=True)
 
     tick_filter = TickFilter()
     quant = QuantProcessor()
@@ -90,43 +79,54 @@ def main():
     print("1) FUT LTP  -> REST (ONLY UNTIL FIRST VALID LTP)")
     print("2) OPTIONS -> ONE 20Depth WS (main focus)\n")
 
-    # -------- PREPARE FUT SECURITY IDS (FROM CSV) --------
+    # -------- FUT IDS --------
     fut_secids = {}
     for idx in INDEXES:
         fut = master.get_nearest_future(idx)
         fut_secids[idx] = int(fut["security_id"])
 
     fut_ltp = {k: 0.0 for k in INDEXES}
-    subscribed_once = {k: False for k in INDEXES}
-
-    # For throttled raw JSON printing
-    last_raw_print = {}  # tag -> epoch
+    last_raw_print = {}
 
     # -------- OPTION DEPTH CALLBACK --------
     def on_opt_depth(secid: int, tag: str, bid, ask):
         try:
-            # ✅ Build micro raw from depth20
             raw = feature_builder.build(secid, bid, ask)
-
-            # ✅ Your TickFilter expects keys like last_price/depth/etc
-            # feature_builder should already provide compatible keys.
-            tick = tick_filter.extract({**(raw or {}), "tag": tag})
-
-            # ✅ IMPORTANT GUARDS (fixes NoneType crash)
-            if tick is None:
+            if not raw:
                 return
 
-            q = quant.compute(tick)
-            if q is None:
+            raw["tag"] = tag
+            raw["secid"] = secid
+            raw["ts"] = time.time()
+
+            # 🔥 RAW OPTION TICK PRINT (THIS WAS MISSING EARLIER)
+            if PRINT_RAW_JSON:
+                now = time.time()
+                lp = last_raw_print.get(tag, 0.0)
+                if (now - lp) >= RAW_JSON_THROTTLE_SEC:
+                    last_raw_print[tag] = now
+
+                    print(
+                        f"📌 OPT_TICK_JSON | {tag} | "
+                        f"LTP:{raw.get('ltp', 0):.2f} | "
+                        f"BID_Q:{raw.get('bid_qty', 0)} | "
+                        f"ASK_Q:{raw.get('ask_qty', 0)} | "
+                        f"FLOW:{raw.get('flow', 0):.0f} | "
+                        f"IMB:{raw.get('imbalance_5', 0):+.2f} | "
+                        f"VAC:{raw.get('vacuum_flag')} | "
+                        f"ABS:{raw.get('absorption_flag')}"
+                    )
+
+            q = quant.compute(raw)
+            if not q:
                 return
 
             q = micro.update(q)
-            if q is None:
+            if not q:
                 return
 
             sig = signal_engine.generate(q) or "HOLD"
 
-            # -------- CSV LOG --------
             csv_writer.writerow([
                 datetime.now().strftime("%H:%M:%S"),
                 tag,
@@ -147,31 +147,12 @@ def main():
             ])
             csv_fp.flush()
 
-            # -------- RAW "TICK JSON" PRINT (THROTTLED) --------
-            if PRINT_RAW_JSON:
-                now = time.time()
-                lp = last_raw_print.get(tag, 0.0)
-                if (now - lp) >= RAW_JSON_THROTTLE_SEC:
-                    last_raw_print[tag] = now
-
-                    # Build a clean JSON snapshot (safe, no heavy objects)
-                    snap = {
-                        "ts": datetime.utcnow().isoformat() + "Z",
-                        "tag": tag,
-                        "security_id": int(secid),
-                        "ltp": q.get("ltp", 0),
-                        "bid_price": q.get("bid_price", 0),
-                        "bid_qty": q.get("bid_qty", 0),
-                        "ask_price": q.get("ask_price", 0),
-                        "ask_qty": q.get("ask_qty", 0),
-                        "spread": q.get("spread", 0),
-                        "signal": sig,
-                    }
-                    print("📌 OPT_TICK_JSON:", json.dumps(snap, separators=(",", ":")))
-
-            # -------- SIGNAL PRINT --------
             if sig != "HOLD":
-                print(f"{datetime.now().strftime('%H:%M:%S')} | {tag} → {sig}")
+                print(
+                    f"🚨 SIGNAL | {tag} | "
+                    f"LTP:{q.get('ltp', 0):.2f} | "
+                    f"FLOW:{q.get('flow', 0):.0f} → {sig}"
+                )
 
         except Exception as e:
             print("❌ on_opt_depth error:", e)
@@ -188,67 +169,50 @@ def main():
     depth20.connect()
     print("✅ 20Depth WS started")
 
-    # ------------------------------------------------------------------
-    # ✅ STEP 1: ONE-SHOT FUT LTP via REST (stop after first valid LTPs)
-    # ------------------------------------------------------------------
+    # -------- ONE-SHOT FUT LTP --------
     print("\n⏳ Fetching initial FUT LTP (REST one-shot mode)...")
     t0 = time.time()
-    last_heartbeat = 0.0
+    last_hb = 0.0
 
     while True:
         now = time.time()
 
-        # Heartbeat (so Railway logs show life)
-        if now - last_heartbeat >= HEARTBEAT_SEC:
-            last_heartbeat = now
+        if now - last_hb >= HEARTBEAT_SEC:
+            last_hb = now
             print(
                 f"🫀 {datetime.now().strftime('%H:%M:%S')} HEARTBEAT | "
                 + " | ".join([f"{k}:{fut_ltp[k]:.2f}" for k in INDEXES])
             )
 
-        # Stop waiting if timed out
         if (now - t0) > REST_MAX_WAIT_SEC:
-            print("⚠️ REST initial LTP wait timeout. Proceeding with whatever we got.")
+            print("⚠️ REST timeout, proceeding.")
             break
 
-        # Call REST (max once per second)
-        ltp_map = ltp_rest.fetch_ltp_map({
-            "NSE_FNO": list(fut_secids.values())
-        })
-
-        # If failed, sleep and retry
+        ltp_map = ltp_rest.fetch_ltp_map({"NSE_FNO": list(fut_secids.values())})
         if not ltp_map:
             time.sleep(REST_POLL_INTERVAL_SEC)
             continue
 
-        # Update fut_ltp
         for idx, secid in fut_secids.items():
             if secid in ltp_map:
-                fut_ltp[idx] = float(ltp_map[secid] or 0.0)
+                fut_ltp[idx] = float(ltp_map[secid] or 0)
 
-        # Check if we got at least one valid LTP per index
-        got_all = all(fut_ltp[i] > 0 for i in INDEXES)
-        if got_all:
-            print("✅ Initial FUT LTP captured (one-shot). Stopping REST calls now.")
+        if all(fut_ltp[i] > 0 for i in INDEXES):
+            print("✅ Initial FUT LTP captured (one-shot).")
             break
 
-        # Sleep to respect rate limit
         time.sleep(REST_POLL_INTERVAL_SEC)
 
-    # ------------------------------------------------------------------
-    # ✅ STEP 2: Use that ONE-SHOT FUT LTP to select ITM CE/PE and subscribe
-    # ------------------------------------------------------------------
+    # -------- SUBSCRIBE CE / PE --------
     print("\n🎯 Selecting CE/PE once and subscribing to 20Depth...")
     for idx in INDEXES:
         ltp = fut_ltp[idx]
         if ltp <= 0:
-            print(f"⚠️ {idx}: FUT LTP not available, skipping CE/PE subscribe.")
             continue
 
-        step = STRIKE_STEP[idx]
-        atm, ce_strike, pe_strike = compute_itm_strikes(ltp, step)
-
+        atm, ce_strike, pe_strike = compute_itm_strikes(ltp, STRIKE_STEP[idx])
         expiry = master.get_nearest_option_expiry(idx)
+
         ce = master.find_option_security_id(idx, expiry, ce_strike, "CE")
         pe = master.find_option_security_id(idx, expiry, pe_strike, "PE")
 
@@ -257,27 +221,19 @@ def main():
             {"SecurityId": str(pe), "tag": f"{idx}_PE"},
         ])
 
-        subscribed_once[idx] = True
-
         print(
             f"✅ [{idx}] FUT:{ltp:.2f} ATM:{atm} "
             f"CE:{ce_strike}(id:{ce}) PE:{pe_strike}(id:{pe})"
         )
 
-    print("\n🔥 LIVE: Now focusing ONLY on CE/PE depth ticks (REST stopped).")
-    print("   You should start seeing 📌 OPT_TICK_JSON logs.\n")
+    print("\n🔥 LIVE: Now focusing ONLY on CE/PE depth ticks.\n")
 
-    # ------------------------------------------------------------------
-    # ✅ STEP 3: Run forever just for CE/PE ticks (no REST, no switching)
-    # ------------------------------------------------------------------
-    last_heartbeat2 = 0.0
+    # -------- RUN FOREVER --------
+    last_hb2 = 0.0
     while True:
-        now = time.time()
-        if now - last_heartbeat2 >= HEARTBEAT_SEC:
-            last_heartbeat2 = now
+        if time.time() - last_hb2 >= HEARTBEAT_SEC:
+            last_hb2 = time.time()
             print(f"🫀 {datetime.now().strftime('%H:%M:%S')} HEARTBEAT | OPTIONS_STREAM_RUNNING")
-
-        # If you want ATM switching later, set SUBSCRIBE_ONCE_ONLY=False and implement here.
         time.sleep(0.2)
 
 
