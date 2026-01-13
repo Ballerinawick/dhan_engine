@@ -1,4 +1,3 @@
-# run_ws_9_instruments.py
 import os
 import time
 from datetime import datetime
@@ -71,11 +70,11 @@ def main():
             action = momentum_engine.on_tick(secid, raw)
 
             if action != "NO_TRADE":
-                pnl = momentum_engine.get_pnl(secid)
+                pnl = momentum_engine.get_trade_pnl(secid)  # ✅ FIXED
                 print(
                     f"🚦 {datetime.now().strftime('%H:%M:%S')} | "
                     f"{tag} | {action} | "
-                    f"LTP:{raw['ltp']:.2f} | PnL:{pnl:.2f}"
+                    f"LTP:{raw['ltp']:.2f} | TradePnL:{pnl:.2f}"
                 )
 
         except Exception as e:
