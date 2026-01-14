@@ -1,4 +1,3 @@
-# options_momentum_engine.py
 from collections import defaultdict, deque
 from datetime import datetime, time as dtime
 import pytz
@@ -9,9 +8,10 @@ class OptionsMomentumEngine:
     OPTIONS MOMENTUM ENGINE (REAL-TIME)
 
     ADDED:
-      ✅ Day-of-cycle awareness (Tue → Expiry Tue)  [your custom cycle]
+      ✅ Day-of-cycle awareness (Wed day1 → Tue day5 Expiry)
       ✅ Time-of-day regime awareness
       ✅ Adaptive aggression (NO Greeks needed)
+      ✅ Prints day + cycle-day + regime
 
     FIXED:
       ✅ Deque slicing crash (use list(c)[-5:])
@@ -26,7 +26,7 @@ class OptionsMomentumEngine:
     IST = pytz.timezone("Asia/Kolkata")
 
     MARKET_START = dtime(9, 10)
-    MARKET_END = dtime(15, 35)
+    MARKET_END = dtime(15, 30)  # ✅ requirement: stop by 03:30 PM
 
     # -----------------------------
     # BASE STRATEGY THRESHOLDS
@@ -50,6 +50,9 @@ class OptionsMomentumEngine:
         self.last_trade_pnl = defaultdict(float)  # secid -> last closed trade pnl
         self.cum_pnl = defaultdict(float)         # secid -> cumulative pnl (optional)
 
+        # ✅ for printing day/regime without spamming
+        self._last_ctx_print_sec = None
+
     # --------------------------------------------------
     # MARKET HOURS
     # --------------------------------------------------
@@ -60,23 +63,29 @@ class OptionsMomentumEngine:
         return self.MARKET_START <= now.time() <= self.MARKET_END
 
     # --------------------------------------------------
-    # DAY CYCLE (your custom mapping)
-    # contract start: Tue(1) day1, Wed day2, Fri day3, Mon day4, Tue day5 (expiry)
-    #
-    # NOTE: Both start-Tue and expiry-Tue are "Tuesday".
-    # We can't detect which Tuesday without expiry-date input.
-    # So we treat Tuesday as day5 by default (safer/stricter),
-    # because expiry behavior is the dangerous one.
+    # DAY CYCLE (your updated mapping)
+    # contract start: Wed day1, Thu day2, Fri day3, Mon day4, Tue day5 (expiry)
     # --------------------------------------------------
     def option_day_index(self) -> int:
         wd = datetime.now(self.IST).weekday()  # Mon=0 Tue=1 Wed=2 Thu=3 Fri=4
         mapping = {
-            2: 2,  # Wed -> day2
+            2: 1,  # Wed -> day1
+            3: 2,  # Thu -> day2
             4: 3,  # Fri -> day3
             0: 4,  # Mon -> day4
-            1: 5,  # Tue -> day5 (expiry-safe default)
+            1: 5,  # Tue -> day5 (expiry)
         }
-        return mapping.get(wd, 0)  # Thu or unknown -> 0 (neutral)
+        return mapping.get(wd, 0)  # Sat/Sun handled elsewhere, other -> 0
+
+    def option_day_label(self) -> str:
+        now = datetime.now(self.IST)
+        wd_name = now.strftime("%a")  # Mon/Tue/Wed...
+        d = self.option_day_index()
+        if d == 0:
+            return f"{wd_name} | Day0(Neutral)"
+        if d == 5:
+            return f"{wd_name} | Day5(Expiry)"
+        return f"{wd_name} | Day{d}"
 
     # --------------------------------------------------
     # TIME REGIME
@@ -92,16 +101,34 @@ class OptionsMomentumEngine:
         return "CLOSE"
 
     # --------------------------------------------------
+    # PRINT DAY/TIME (once per minute)
+    # --------------------------------------------------
+    def _print_day_context(self, ts: float):
+        sec = int(ts)
+        minute_key = sec // 60
+        if self._last_ctx_print_sec == minute_key:
+            return
+        self._last_ctx_print_sec = minute_key
+
+        now = datetime.now(self.IST)
+        print(
+            f"🗓️ {now.strftime('%H:%M:%S')} IST | {self.option_day_label()} | Regime:{self.time_regime()}"
+        )
+
+    # --------------------------------------------------
     # MAIN ENTRY
     # tick must contain: {"ltp": float, "ts": float, optional: "last_traded_qty": int}
     # --------------------------------------------------
     def on_tick(self, secid: int, tick: dict) -> str:
-        if not self.market_open():
-            return "NO_TRADE"
-
         ts = tick.get("ts")
         ltp = float(tick.get("ltp", 0) or 0)
         if not ts or ltp <= 0:
+            return "NO_TRADE"
+
+        # ✅ prints day/time/regime
+        self._print_day_context(float(ts))
+
+        if not self.market_open():
             return "NO_TRADE"
 
         sec = int(ts)
@@ -181,11 +208,8 @@ class OptionsMomentumEngine:
         regime = self.time_regime()
 
         # -------- adaptive multipliers --------
-        # expiry day => stricter filters (avoid fake spikes / gamma noise)
         decay_penalty = 1.0 + (day * 0.15)
 
-        # OPEN: too noisy => slightly stricter
-        # TREND: allow faster entries
         if regime == "OPEN":
             time_boost = 1.10
         elif regime == "TREND":
@@ -199,7 +223,7 @@ class OptionsMomentumEngine:
         A_VOL = self.BASE_A_VOL * decay_penalty
 
         B_SPEED = self.BASE_B_SPEED * decay_penalty * time_boost
-        B_WICK = self.BASE_B_WICK  # keep wick constant (structure-based)
+        B_WICK = self.BASE_B_WICK
 
         # -------- EXIT --------
         if secid in self.active_trade:
@@ -216,7 +240,6 @@ class OptionsMomentumEngine:
                 self.last_action_sec[secid] = cur_sec
                 return "EXIT"
 
-        # if still in trade, do nothing
         if secid in self.active_trade:
             return "NO_TRADE"
 
@@ -245,7 +268,6 @@ class OptionsMomentumEngine:
             trap_up = uw > rng * B_WICK
             trap_down = lw > rng * B_WICK
 
-            # add speed confirmation so B doesn't fire randomly
             if price_speed > avg_range * B_SPEED:
                 if trap_up:
                     self.active_trade[secid] = {
@@ -278,6 +300,5 @@ class OptionsMomentumEngine:
     def get_cum_pnl(self, secid: int) -> float:
         return round(self.cum_pnl.get(secid, 0.0), 2)
 
-    # Backward-compatible alias (if any runner still calls get_pnl)
     def get_pnl(self, secid: int) -> float:
         return self.get_trade_pnl(secid)
