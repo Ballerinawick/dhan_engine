@@ -1,6 +1,7 @@
 import os
 import time
-from datetime import datetime
+from datetime import datetime, time as dtime
+import pytz
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -11,6 +12,7 @@ from ltp_rest_engine import DhanLtpRestEngine
 
 from depth_micro_features import DepthMicroFeatureBuilder
 from options_momentum_engine import OptionsMomentumEngine
+from paper_trade_manager import PaperTradeManager   # ✅ NEW
 
 
 # ---------------- CONFIG ----------------
@@ -24,6 +26,17 @@ OPT_EXCHANGE_SEGMENT_20D = "NSE_FNO"
 REST_POLL_INTERVAL_SEC = 1.1
 REST_MAX_WAIT_SEC = 45
 HEARTBEAT_SEC = 30.0
+
+IST = pytz.timezone("Asia/Kolkata")
+MARKET_START = dtime(9, 10)
+MARKET_END = dtime(15, 35)
+
+
+def market_open():
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    return MARKET_START <= now.time() <= MARKET_END
 
 
 def compute_itm_strikes(ltp: float, step: int):
@@ -48,6 +61,7 @@ def main():
 
     feature_builder = DepthMicroFeatureBuilder()
     momentum_engine = OptionsMomentumEngine()
+    paper_trader = PaperTradeManager(capital=10000)   # ✅ NEW
 
     # ---------------- FUT IDS ----------------
     fut_secids = {}
@@ -60,6 +74,9 @@ def main():
     # ---------------- OPTION DEPTH CALLBACK ----------------
     def on_opt_depth(secid: int, tag: str, bid, ask):
         try:
+            if not market_open():
+                return
+
             raw = feature_builder.build(secid, bid, ask)
             if not raw:
                 return
@@ -67,15 +84,25 @@ def main():
             raw["secid"] = secid
             raw["tag"] = tag
 
+            # 🔁 LIVE MTM
+            paper_trader.on_tick(secid, raw["ltp"])
+
             action = momentum_engine.on_tick(secid, raw)
 
-            if action != "NO_TRADE":
-                pnl = momentum_engine.get_trade_pnl(secid)  # ✅ FIXED
-                print(
-                    f"🚦 {datetime.now().strftime('%H:%M:%S')} | "
-                    f"{tag} | {action} | "
-                    f"LTP:{raw['ltp']:.2f} | TradePnL:{pnl:.2f}"
-                )
+            # ---------------- ENTRY ----------------
+            if action in ("A_ENTRY", "B_ENTRY"):
+                trade = momentum_engine.active_trade.get(secid)
+                if trade:
+                    paper_trader.on_entry(
+                        secid=secid,
+                        tag=tag,
+                        side=trade["side"],
+                        ltp=raw["ltp"]
+                    )
+
+            # ---------------- EXIT ----------------
+            elif action == "EXIT":
+                paper_trader.on_exit(secid, raw["ltp"])
 
         except Exception as e:
             print("❌ on_opt_depth error:", e)
@@ -161,14 +188,20 @@ def main():
     print("\n🔥 LIVE: Options Momentum Engine ACTIVE\n")
 
     # --------------------------------------------------
-    # RUN FOREVER (ENGINE CONTROLS MARKET HOURS)
+    # RUN LOOP (AUTO STOPS AFTER MARKET)
     # --------------------------------------------------
     last_hb = 0.0
     while True:
+        if not market_open():
+            print("🛑 Market closed. Sleeping to save cloud cost.")
+            time.sleep(60)
+            continue
+
         now = time.time()
         if now - last_hb >= HEARTBEAT_SEC:
             last_hb = now
             print(f"🫀 {datetime.now().strftime('%H:%M:%S')} ENGINE_RUNNING")
+
         time.sleep(0.2)
 
 
