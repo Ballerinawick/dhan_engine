@@ -21,7 +21,7 @@ class PaperTradeManager:
         "FINNIFTY": 60,
     }
 
-    def __init__(self, capital=10000, log_interval_sec=5):
+    def __init__(self, capital=100000, log_interval_sec=5):
         self.initial_capital = float(capital)
         self.cash = float(capital)
 
@@ -46,6 +46,9 @@ class PaperTradeManager:
     def on_entry(self, secid, tag, side, ltp, lots=1):
         if secid in self.positions:
             return  # already open
+
+        if side == "SHORT":
+            return
 
         index = self._extract_index(tag)
         if not index:
