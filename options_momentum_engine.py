@@ -2,6 +2,8 @@ from collections import defaultdict, deque
 from datetime import datetime, time as dtime
 import pytz
 
+from trading_models import ScoringInputs, expected_move, score_momentum
+
 
 class OptionsMomentumEngine:
     """
@@ -302,3 +304,48 @@ class OptionsMomentumEngine:
 
     def get_pnl(self, secid: int) -> float:
         return self.get_trade_pnl(secid)
+
+    # --------------------------------------------------
+    # OPTIONAL: Scoring + Expected Move utilities
+    # (No effect on existing flow unless explicitly called.)
+    # --------------------------------------------------
+    def build_scoring_inputs(
+        self,
+        *,
+        imbalance_5: float,
+        flow: float,
+        vacuum_flag: bool,
+        absorption_flag: bool,
+        absorption_strength: float,
+        price_speed: float,
+        avg_range: float,
+        avg_volume: float,
+        last_volume: float,
+    ) -> ScoringInputs:
+        return ScoringInputs(
+            imbalance_5=imbalance_5,
+            flow=flow,
+            vacuum_flag=vacuum_flag,
+            absorption_flag=absorption_flag,
+            absorption_strength=absorption_strength,
+            price_speed=price_speed,
+            avg_range=avg_range,
+            avg_volume=avg_volume,
+            last_volume=last_volume,
+            day_index=self.option_day_index(),
+            time_regime=self.time_regime(),
+        )
+
+    def score_from_inputs(self, inputs: ScoringInputs):
+        return score_momentum(inputs)
+
+    def expected_move_from_stats(
+        self, *, avg_range: float, avg_volume: float, last_volume: float
+    ) -> float:
+        return expected_move(
+            avg_range=avg_range,
+            avg_volume=avg_volume,
+            last_volume=last_volume,
+            time_regime=self.time_regime(),
+            day_index=self.option_day_index(),
+        )
