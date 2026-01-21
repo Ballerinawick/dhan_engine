@@ -61,7 +61,7 @@ def main():
 
     feature_builder = DepthMicroFeatureBuilder()
     momentum_engine = OptionsMomentumEngine()
-    paper_trader = PaperTradeManager(capital=50000)   # ✅ NEW
+    paper_trader = PaperTradeManager(capital=100000)   # ✅ NEW
 
     # ---------------- FUT IDS ----------------
     fut_secids = {}
