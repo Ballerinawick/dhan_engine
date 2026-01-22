@@ -6,14 +6,6 @@ from trading_models import ScoringInputs, expected_move, score_momentum
 
 
 class OptionsMomentumEngine:
-    """
-    OPTIONS MOMENTUM ENGINE (REAL-TIME)
-
-    ✔ Existing dynamic exit untouched
-    ✔ Sideways exit added (behavior-based)
-    ✔ Big winners keep running
-    ✔ Sideways positions exit safely
-    """
 
     IST = ZoneInfo("Asia/Kolkata")
 
@@ -30,11 +22,11 @@ class OptionsMomentumEngine:
     EXIT_PULLBACK = 0.40
     EXIT_VOL_DROP = 0.40
 
-    # ---------------- SIDEWAYS EXIT ----------------
-    SIDEWAYS_MIN_HOLD_SEC = 120
-    SIDEWAYS_RANGE_FACTOR = 0.35
-    SIDEWAYS_VOL_FACTOR = 0.60
-    SIDEWAYS_MAX_PNL_PCT = 0.15
+    # ---------------- SIDEWAYS EXIT (NEW) ----------------
+    SIDEWAYS_MIN_HOLD_SEC = 120      # must survive at least 2 mins
+    SIDEWAYS_RANGE_RATIO = 0.35      # candle compression
+    SIDEWAYS_VOL_RATIO = 0.60        # volume drying
+    SIDEWAYS_MAX_PNL_PCT = 0.15      # only small PnL / flat trades
 
     def __init__(self):
         self.tick_buffer = defaultdict(deque)
@@ -78,7 +70,8 @@ class OptionsMomentumEngine:
 
     # --------------------------------------------------
     def _print_day_context(self, ts):
-        minute_key = int(ts) // 60
+        sec = int(ts)
+        minute_key = sec // 60
         if self._last_ctx_print_sec == minute_key:
             return
         self._last_ctx_print_sec = minute_key
@@ -123,7 +116,7 @@ class OptionsMomentumEngine:
         if len(ticks) < 2:
             return None
 
-        prices = [float(t["ltp"]) for t in ticks if t.get("ltp")]
+        prices = [float(t.get("ltp", 0) or 0) for t in ticks if float(t.get("ltp", 0) or 0) > 0]
         if not prices:
             return None
 
@@ -133,7 +126,7 @@ class OptionsMomentumEngine:
             "low": min(prices),
             "close": prices[-1],
             "range": max(prices) - min(prices),
-            "volume": sum(int(t.get("last_traded_qty", 0)) for t in ticks),
+            "volume": sum(int(t.get("last_traded_qty", 0) or 0) for t in ticks),
             "ts": float(ticks[-1]["ts"]),
             "sec": int(ticks[-1]["ts"]),
         }
@@ -149,15 +142,27 @@ class OptionsMomentumEngine:
             return "NO_TRADE"
 
         last, prev = c[-1], c[-2]
-        cur_sec = last["sec"]
+        cur_sec = int(last["sec"])
 
         if self.last_action_sec.get(secid) == cur_sec:
             return "NO_TRADE"
 
-        last5 = list(c)[-5:]
-        avg_range = sum(x["range"] for x in last5) / len(last5)
-        avg_vol = sum(x["volume"] for x in last5) / len(last5)
         price_speed = abs(last["close"] - prev["close"])
+
+        last5 = list(c)[-5:]
+        avg_range = sum(x["range"] for x in last5) / max(len(last5), 1)
+        avg_vol = sum(x["volume"] for x in last5) / max(len(last5), 1)
+
+        day = self.option_day_index()
+        regime = self.time_regime()
+
+        decay_penalty = 1.0 + (day * 0.15)
+        time_boost = 1.10 if regime == "OPEN" else 0.90 if regime == "TREND" else 1.15 if regime == "CLOSE" else 1.00
+
+        A_SPEED = self.BASE_A_SPEED * decay_penalty * time_boost
+        A_VOL = self.BASE_A_VOL * decay_penalty
+
+        B_SPEED = self.BASE_B_SPEED * decay_penalty * time_boost
 
         # ==================================================
         # 🔴 EXISTING DYNAMIC EXIT (UNCHANGED)
@@ -166,16 +171,17 @@ class OptionsMomentumEngine:
             t = self.active_trade[secid]
             pnl = self._trade_pnl(t["side"], t["entry"], last["close"])
             pull = abs(last["close"] - t["entry"]) / max(t["entry"], 1e-9)
-
-            vol_exit = avg_vol > 0 and last["volume"] < avg_vol * self.EXIT_VOL_DROP
+            vol_exit = (avg_vol > 0) and (last["volume"] < avg_vol * self.EXIT_VOL_DROP)
 
             if pull > self.EXIT_PULLBACK or vol_exit:
+                self.last_trade_pnl[secid] = round(pnl, 2)
+                self.cum_pnl[secid] += pnl
                 self.active_trade.pop(secid)
                 self.last_action_sec[secid] = cur_sec
                 return "EXIT"
 
         # ==================================================
-        # 🟡 SIDEWAYS EXIT (ADDED)
+        # 🟡 SIDEWAYS EXIT (NEW, SAFE)
         # ==================================================
         if secid in self.active_trade:
             t = self.active_trade[secid]
@@ -183,13 +189,15 @@ class OptionsMomentumEngine:
             pnl = self._trade_pnl(t["side"], t["entry"], last["close"])
             pnl_pct = abs(pnl) / max(t["entry"], 1e-9)
 
-            tight_range = avg_range < (price_speed + avg_range) * self.SIDEWAYS_RANGE_FACTOR
-            weak_volume = avg_vol > 0 and last["volume"] < avg_vol * self.SIDEWAYS_VOL_FACTOR
+            compressed_range = avg_range < (prev["range"] * self.SIDEWAYS_RANGE_RATIO)
+            weak_volume = avg_vol > 0 and last["volume"] < avg_vol * self.SIDEWAYS_VOL_RATIO
+            low_speed = price_speed < avg_range * 0.4
 
             if (
                 age >= self.SIDEWAYS_MIN_HOLD_SEC
-                and tight_range
+                and compressed_range
                 and weak_volume
+                and low_speed
                 and pnl_pct < self.SIDEWAYS_MAX_PNL_PCT
             ):
                 self.active_trade.pop(secid)
@@ -200,13 +208,19 @@ class OptionsMomentumEngine:
             return "NO_TRADE"
 
         # ==================================================
-        # 🟢 STRATEGY A — BREAKOUT LONG
+        # 🟢 STRATEGY A (Breakout LONG) — UNCHANGED
         # ==================================================
-        if avg_range > 0 and price_speed > avg_range * self.BASE_A_SPEED and avg_vol > 0:
+        if (
+            avg_range > 0
+            and price_speed > avg_range * A_SPEED
+            and avg_vol > 0
+            and last["volume"] > avg_vol * A_VOL
+        ):
             self.active_trade[secid] = {
+                "type": "A",
                 "side": "LONG",
-                "entry": last["close"],
-                "ts": last["ts"],
+                "entry": float(last["close"]),
+                "ts": float(last["ts"]),
             }
             self.last_action_sec[secid] = cur_sec
             return "A_ENTRY"
