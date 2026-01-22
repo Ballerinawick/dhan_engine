@@ -11,6 +11,7 @@ class PaperTradeManager:
     ✔ 1 lot per entry (scalable later)
     ✔ Full-lot exit only
     ✔ Consolidated MTM logging
+    ✔ Open-position snapshot (entry, LTP, age, exit reason)
     ✔ Clean, low-noise logs
     """
 
@@ -40,10 +41,14 @@ class PaperTradeManager:
                 return idx
         return None
 
+    def _fmt_duration(self, seconds: float) -> str:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m{s:02d}s"
+
     # --------------------------------------------------
     # ENTRY (LOT BASED)
     # --------------------------------------------------
-    def on_entry(self, secid, tag, side, ltp, lots=1):
+    def on_entry(self, secid, tag, side, ltp, lots=1, reason="ENTRY"):
         if secid in self.positions:
             return  # already open
 
@@ -61,6 +66,7 @@ class PaperTradeManager:
         if cost > self.cash:
             return  # insufficient capital
 
+        now_ts = time.time()
         self.cash -= cost
 
         self.positions[secid] = {
@@ -71,17 +77,19 @@ class PaperTradeManager:
             "qty": qty,
             "entry": ltp,
             "ltp": ltp,
+            "entry_ts": now_ts,
+            "entry_reason": reason,
         }
 
         print(
             f"🟢 ENTRY | {tag} | {side} | "
-            f"Lots:{lots} | Qty:{qty} | Entry:{ltp:.2f}"
+            f"Lots:{lots} | Qty:{qty} | Entry:{ltp:.2f} | Reason:{reason}"
         )
 
     # --------------------------------------------------
     # EXIT (FULL LOT ONLY)
     # --------------------------------------------------
-    def on_exit(self, secid, ltp):
+    def on_exit(self, secid, ltp, reason="EXIT"):
         pos = self.positions.pop(secid, None)
         if not pos:
             return
@@ -98,10 +106,15 @@ class PaperTradeManager:
         self.cash += qty * ltp
         self.realized_pnl += pnl
 
+        hold_sec = time.time() - pos["entry_ts"]
+
         print(
             f"🔴 EXIT | {pos['tag']} | "
             f"Lots:{pos['lots']} | "
-            f"Exit:{ltp:.2f} | PnL:{pnl:+.2f}"
+            f"Exit:{ltp:.2f} | "
+            f"PnL:{pnl:+.2f} | "
+            f"Hold:{self._fmt_duration(hold_sec)} | "
+            f"Reason:{reason}"
         )
 
     # --------------------------------------------------
@@ -117,11 +130,12 @@ class PaperTradeManager:
             self._log_consolidated()
 
     # --------------------------------------------------
-    # CONSOLIDATED PORTFOLIO LOG
+    # CONSOLIDATED PORTFOLIO + OPEN SNAPSHOT
     # --------------------------------------------------
     def _log_consolidated(self):
         unrealized = 0.0
         used_margin = 0.0
+        now = time.time()
 
         for p in self.positions.values():
             entry = p["entry"]
@@ -147,3 +161,19 @@ class PaperTradeManager:
             f"Realized:{self.realized_pnl:+.2f} | "
             f"NetPnL:{net_pnl:+.2f}"
         )
+
+        if not self.positions:
+            return
+
+        print("📌 OPEN POSITIONS:")
+        for p in self.positions.values():
+            hold = self._fmt_duration(now - p["entry_ts"])
+            pnl = (p["ltp"] - p["entry"]) * p["qty"]
+
+            print(
+                f"  - {p['tag']} | "
+                f"Entry:{p['entry']:.2f} | "
+                f"LTP:{p['ltp']:.2f} | "
+                f"Hold:{hold} | "
+                f"PnL:{pnl:+.2f}"
+            )
