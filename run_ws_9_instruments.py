@@ -1,7 +1,7 @@
 import os
 import time
 from datetime import datetime, time as dtime
-import pytz
+from zoneinfo import ZoneInfo  # ✅ built-in (Python 3.9+)
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -12,7 +12,7 @@ from ltp_rest_engine import DhanLtpRestEngine
 
 from depth_micro_features import DepthMicroFeatureBuilder
 from options_momentum_engine import OptionsMomentumEngine
-from paper_trade_manager import PaperTradeManager   # ✅ NEW
+from paper_trade_manager import PaperTradeManager
 
 
 # ---------------- CONFIG ----------------
@@ -27,14 +27,14 @@ REST_POLL_INTERVAL_SEC = 1.1
 REST_MAX_WAIT_SEC = 45
 HEARTBEAT_SEC = 30.0
 
-IST = pytz.timezone("Asia/Kolkata")
+IST = ZoneInfo("Asia/Kolkata")  # ✅ REPLACED pytz
 MARKET_START = dtime(9, 10)
 MARKET_END = dtime(15, 35)
 
 
 def market_open():
     now = datetime.now(IST)
-    if now.weekday() >= 5:
+    if now.weekday() >= 5:  # Sat/Sun
         return False
     return MARKET_START <= now.time() <= MARKET_END
 
@@ -61,7 +61,7 @@ def main():
 
     feature_builder = DepthMicroFeatureBuilder()
     momentum_engine = OptionsMomentumEngine()
-    paper_trader = PaperTradeManager(capital=100000)   # ✅ NEW
+    paper_trader = PaperTradeManager(capital=100000)
 
     # ---------------- FUT IDS ----------------
     fut_secids = {}
@@ -132,7 +132,7 @@ def main():
         if now - last_heartbeat >= HEARTBEAT_SEC:
             last_heartbeat = now
             print(
-                f"🫀 {datetime.now().strftime('%H:%M:%S')} HEARTBEAT | "
+                f"🫀 {datetime.now(IST).strftime('%H:%M:%S')} HEARTBEAT | "
                 + " | ".join([f"{k}:{fut_ltp[k]:.2f}" for k in INDEXES])
             )
 
@@ -200,7 +200,7 @@ def main():
         now = time.time()
         if now - last_hb >= HEARTBEAT_SEC:
             last_hb = now
-            print(f"🫀 {datetime.now().strftime('%H:%M:%S')} ENGINE_RUNNING")
+            print(f"🫀 {datetime.now(IST).strftime('%H:%M:%S')} ENGINE_RUNNING")
 
         time.sleep(0.2)
 
