@@ -27,14 +27,14 @@ REST_POLL_INTERVAL_SEC = 1.1
 REST_MAX_WAIT_SEC = 45
 HEARTBEAT_SEC = 30.0
 
-IST = ZoneInfo("Asia/Kolkata")  # ✅ REPLACED pytz
+IST = ZoneInfo("Asia/Kolkata")
 MARKET_START = dtime(9, 10)
 MARKET_END = dtime(15, 35)
 
 
 def market_open():
     now = datetime.now(IST)
-    if now.weekday() >= 5:  # Sat/Sun
+    if now.weekday() >= 5:
         return False
     return MARKET_START <= now.time() <= MARKET_END
 
@@ -97,12 +97,17 @@ def main():
                         secid=secid,
                         tag=tag,
                         side=trade["side"],
-                        ltp=raw["ltp"]
+                        ltp=raw["ltp"],
+                        reason=action        # ✅ ADDED (ENTRY REASON)
                     )
 
             # ---------------- EXIT ----------------
             elif action == "EXIT":
-                paper_trader.on_exit(secid, raw["ltp"])
+                paper_trader.on_exit(
+                    secid,
+                    raw["ltp"],
+                    reason=action            # ✅ ADDED (EXIT REASON)
+                )
 
         except Exception as e:
             print("❌ on_opt_depth error:", e)
@@ -188,7 +193,7 @@ def main():
     print("\n🔥 LIVE: Options Momentum Engine ACTIVE\n")
 
     # --------------------------------------------------
-    # RUN LOOP (AUTO STOPS AFTER MARKET)
+    # RUN LOOP
     # --------------------------------------------------
     last_hb = 0.0
     while True:
