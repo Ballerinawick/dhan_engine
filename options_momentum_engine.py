@@ -1,6 +1,6 @@
 from collections import defaultdict, deque
 from datetime import datetime, time as dtime
-import pytz
+from zoneinfo import ZoneInfo  # ✅ built-in (no install needed)
 
 from trading_models import ScoringInputs, expected_move, score_momentum
 
@@ -25,7 +25,7 @@ class OptionsMomentumEngine:
       "A_ENTRY", "B_ENTRY", "EXIT", "NO_TRADE"
     """
 
-    IST = pytz.timezone("Asia/Kolkata")
+    IST = ZoneInfo("Asia/Kolkata")  # ✅ replaced pytz timezone
 
     MARKET_START = dtime(9, 10)
     MARKET_END = dtime(15, 30)  # ✅ requirement: stop by 03:30 PM
