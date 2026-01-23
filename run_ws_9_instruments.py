@@ -1,7 +1,7 @@
 import os
 import time
 from datetime import datetime, time as dtime
-from zoneinfo import ZoneInfo  # ✅ built-in (Python 3.9+)
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -13,6 +13,9 @@ from ltp_rest_engine import DhanLtpRestEngine
 from depth_micro_features import DepthMicroFeatureBuilder
 from options_momentum_engine import OptionsMomentumEngine
 from paper_trade_manager import PaperTradeManager
+
+# ✅ NEW IMPORT
+from option_chain_selector import OptionChainSelector
 
 
 # ---------------- CONFIG ----------------
@@ -63,6 +66,19 @@ def main():
     momentum_engine = OptionsMomentumEngine()
     paper_trader = PaperTradeManager(capital=100000)
 
+    # ✅ NEW: OptionChain selector (mode can be 1 or 2)
+    # mode=1 => ONE best option (either CE or PE)
+    # mode=2 => best CE and best PE
+    selector = OptionChainSelector(
+        access_token=token,
+        client_id=client_id,
+        instrument_master=master,
+        strike_step_map=STRIKE_STEP,
+        mode=2,                    # change 1/2 as you want
+        max_steps_each_side=10,     # 10 steps each side near ATM
+        debug=True
+    )
+
     # ---------------- FUT IDS ----------------
     fut_secids = {}
     for idx in INDEXES:
@@ -93,21 +109,29 @@ def main():
             if action in ("A_ENTRY", "B_ENTRY"):
                 trade = momentum_engine.active_trade.get(secid)
                 if trade:
-                    paper_trader.on_entry(
-                        secid=secid,
-                        tag=tag,
-                        side=trade["side"],
-                        ltp=raw["ltp"],
-                        reason=action        # ✅ ADDED (ENTRY REASON)
-                    )
+                    # keep your flow (if your PaperTradeManager accepts reason, fine)
+                    try:
+                        paper_trader.on_entry(
+                            secid=secid,
+                            tag=tag,
+                            side=trade["side"],
+                            ltp=raw["ltp"],
+                            reason=action
+                        )
+                    except TypeError:
+                        paper_trader.on_entry(
+                            secid=secid,
+                            tag=tag,
+                            side=trade["side"],
+                            ltp=raw["ltp"]
+                        )
 
             # ---------------- EXIT ----------------
             elif action == "EXIT":
-                paper_trader.on_exit(
-                    secid,
-                    raw["ltp"],
-                    reason=action            # ✅ ADDED (EXIT REASON)
-                )
+                try:
+                    paper_trader.on_exit(secid, raw["ltp"], reason=action)
+                except TypeError:
+                    paper_trader.on_exit(secid, raw["ltp"])
 
         except Exception as e:
             print("❌ on_opt_depth error:", e)
@@ -164,31 +188,40 @@ def main():
         time.sleep(REST_POLL_INTERVAL_SEC)
 
     # --------------------------------------------------
-    # STEP 2: SELECT CE / PE ONCE
+    # STEP 2: SELECT OPTIONS (DYNAMIC) + SUBSCRIBE
     # --------------------------------------------------
-    print("\n🎯 Subscribing CE / PE options...")
+    print("\n🎯 Subscribing OPTIONS (dynamic via OptionChain)...")
+
     for idx in INDEXES:
-        ltp = fut_ltp[idx]
-        if ltp <= 0:
-            continue
+        try:
+            selection = selector.select_best(idx)
+            if not selection:
+                print(f"⚠️ [{idx}] No selection. Skipping subscribe.")
+                continue
 
-        step = STRIKE_STEP[idx]
-        atm, ce_strike, pe_strike = compute_itm_strikes(ltp, step)
+            subs = []
+            if "BEST" in selection:
+                info = selection["BEST"]
+                subs.append({"SecurityId": str(info["security_id"]), "tag": f"{idx}_{info['side']}"})
+                print(f"✅ [{idx}] BEST {info['side']} | strike:{info['strike']} | id:{info['security_id']} | score:{info['score']:.3f}")
 
-        expiry = master.get_nearest_option_expiry(idx)
-        ce = master.find_option_security_id(idx, expiry, ce_strike, "CE")
-        pe = master.find_option_security_id(idx, expiry, pe_strike, "PE")
+            else:
+                # mode=2
+                if "CE" in selection:
+                    ce = selection["CE"]
+                    subs.append({"SecurityId": str(ce["security_id"]), "tag": f"{idx}_CE"})
+                    print(f"✅ [{idx}] CE | strike:{ce['strike']} | id:{ce['security_id']} | score:{ce['score']:.3f}")
 
-        depth20.subscribe([
-            {"SecurityId": str(ce), "tag": f"{idx}_CE"},
-            {"SecurityId": str(pe), "tag": f"{idx}_PE"},
-        ])
+                if "PE" in selection:
+                    pe = selection["PE"]
+                    subs.append({"SecurityId": str(pe["security_id"]), "tag": f"{idx}_PE"})
+                    print(f"✅ [{idx}] PE | strike:{pe['strike']} | id:{pe['security_id']} | score:{pe['score']:.3f}")
 
-        print(
-            f"✅ [{idx}] FUT:{ltp:.2f} "
-            f"CE:{ce_strike}(id:{ce}) "
-            f"PE:{pe_strike}(id:{pe})"
-        )
+            if subs:
+                depth20.subscribe(subs)
+
+        except Exception as e:
+            print(f"❌ [{idx}] OptionChain select/subscribe error:", e)
 
     print("\n🔥 LIVE: Options Momentum Engine ACTIVE\n")
 
