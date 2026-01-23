@@ -8,6 +8,7 @@ class InstrumentMaster:
     - Nearest FUTIDX for index (NIFTY / BANKNIFTY / FINNIFTY)
     - Nearest OPTIDX expiry
     - Find option SecurityId by (index, expiry, strike, CE/PE)
+    - ✅ INDEX (spot) SecurityId for OptionChain REST
     """
 
     def __init__(self, csv_path: str):
@@ -44,8 +45,9 @@ class InstrumentMaster:
         self.df["SEM_STRIKE_PRICE"] = pd.to_numeric(self.df["SEM_STRIKE_PRICE"], errors="coerce")
 
         # Caches for speed
-        self._opt_cache = {}  # key: (index_upper) -> OPTIDX df
-        self._fut_cache = {}  # key: (index_upper) -> FUTIDX df
+        self._opt_cache = {}
+        self._fut_cache = {}
+        self._index_cache = {}   # ✅ NEW (safe cache)
 
     # ---------------------------------------------------
     # Internal: OPTIDX filtered dataframe for index
@@ -63,7 +65,12 @@ class InstrumentMaster:
             & (df["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.startswith(idx, na=False))
         ].copy()
 
-        opts = opts.dropna(subset=["SEM_EXPIRY_DATE", "SEM_STRIKE_PRICE", "SEM_SMST_SECURITY_ID", "SEM_OPTION_TYPE"])
+        opts = opts.dropna(subset=[
+            "SEM_EXPIRY_DATE",
+            "SEM_STRIKE_PRICE",
+            "SEM_SMST_SECURITY_ID",
+            "SEM_OPTION_TYPE"
+        ])
         self._opt_cache[idx] = opts
         return opts
 
@@ -88,7 +95,7 @@ class InstrumentMaster:
         return fut
 
     # ---------------------------------------------------
-    # ✅ FUT: Nearest (active) Index Future (current month / next expiry)
+    # ✅ FUT: Nearest active Index Future
     # ---------------------------------------------------
     def get_nearest_future(self, index_name: str):
         idx = str(index_name).upper().strip()
@@ -98,8 +105,7 @@ class InstrumentMaster:
         fut2 = fut[fut["SEM_EXPIRY_DATE"] >= now].copy()
 
         if fut2.empty:
-            # If no future expiry exists, this means CSV is outdated OR system time mismatch
-            raise Exception(f"❌ No ACTIVE FUT found for {idx} (expiry >= now). Check CSV freshness/time.")
+            raise Exception(f"❌ No ACTIVE FUT found for {idx}")
 
         row = fut2.sort_values("SEM_EXPIRY_DATE").iloc[0]
 
@@ -111,23 +117,20 @@ class InstrumentMaster:
         }
 
     # ---------------------------------------------------
-    # ✅ NEW: Direct helper (execution layer uses this)
-    # Returns string SecurityId
+    # Helper: FUT security id
     # ---------------------------------------------------
     def get_current_fut_security_id(self, index_name: str) -> str:
         fut = self.get_nearest_future(index_name)
         return str(fut["security_id"])
 
     # ---------------------------------------------------
-    # ✅ NEW: Direct helper for FUT segment (always NSE_FNO for derivatives feed)
-    # Keeps your execution layer clean
+    # FUT exchange segment
     # ---------------------------------------------------
     def get_fut_exchange_segment(self) -> str:
         return "NSE_FNO"
 
     # ---------------------------------------------------
-    # ✅ Nearest option expiry for index (OPTIDX)
-    # Returns pandas Timestamp
+    # Nearest option expiry
     # ---------------------------------------------------
     def get_nearest_option_expiry(self, index: str):
         opts = self._get_optidx_df(index)
@@ -136,13 +139,12 @@ class InstrumentMaster:
         opts2 = opts[opts["SEM_EXPIRY_DATE"] >= now]
 
         if opts2.empty:
-            raise Exception(f"❌ No OPTIDX expiry >= now for {index}. Check system time or CSV expiries.")
+            raise Exception(f"❌ No OPTIDX expiry >= now for {index}")
 
-        expiry = opts2["SEM_EXPIRY_DATE"].sort_values().iloc[0]
-        return expiry
+        return opts2["SEM_EXPIRY_DATE"].sort_values().iloc[0]
 
     # ---------------------------------------------------
-    # Find SecurityId for exact option (index, expiry_dt, strike, CE/PE)
+    # Find option SecurityId
     # ---------------------------------------------------
     def find_option_security_id(self, index: str, expiry_dt, strike, opt_type: str):
         idx = str(index).upper().strip()
@@ -153,29 +155,47 @@ class InstrumentMaster:
 
         exp = pd.to_datetime(expiry_dt, errors="coerce")
         if pd.isna(exp):
-            raise Exception(f"❌ Invalid expiry provided: {expiry_dt}")
+            raise Exception(f"❌ Invalid expiry: {expiry_dt}")
+
+        strike_f = float(strike)
         exp_date = exp.date()
 
-        try:
-            strike_f = float(strike)
-        except Exception:
-            raise Exception(f"❌ Invalid strike: {strike}")
-
         opts = self._get_optidx_df(idx)
-
         df = opts[
             (opts["SEM_EXPIRY_DATE"].dt.date == exp_date)
             & (opts["SEM_OPTION_TYPE"].astype(str).str.upper() == ot)
         ].copy()
 
         if df.empty:
-            raise Exception(f"❌ No OPTIDX rows for {idx} expiry={exp_date} type={ot}")
+            raise Exception(f"❌ No option rows for {idx} {exp_date} {ot}")
 
-        df["__strike_diff"] = (df["SEM_STRIKE_PRICE"].astype(float) - strike_f).abs()
-        df = df.sort_values("__strike_diff")
+        df["__strike_diff"] = (df["SEM_STRIKE_PRICE"] - strike_f).abs()
+        best = df.sort_values("__strike_diff").iloc[0]
 
-        best = df.iloc[0]
         if float(best["__strike_diff"]) > 0.001:
-            raise Exception(f"❌ No SecurityId found for {idx} {exp_date} {strike_f} {ot}")
+            raise Exception(f"❌ No exact strike match")
 
         return int(float(best["SEM_SMST_SECURITY_ID"]))
+
+    # ---------------------------------------------------
+    # ✅ NEW: INDEX (SPOT) security id for OptionChain REST
+    # ---------------------------------------------------
+    def get_index_security_id(self, index_name: str) -> int:
+        idx = str(index_name).upper().strip()
+
+        if idx in self._index_cache:
+            return self._index_cache[idx]
+
+        df = self.df[
+            (self.df["SEM_EXM_EXCH_ID"] == "NSE")
+            & (self.df["SEM_SEGMENT"] == "I")
+            & (self.df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == "INDEX")
+            & (self.df["SEM_TRADING_SYMBOL"].astype(str).str.upper() == idx)
+        ]
+
+        if df.empty:
+            raise Exception(f"❌ No INDEX security id found for {idx}")
+
+        secid = int(df.iloc[0]["SEM_SMST_SECURITY_ID"])
+        self._index_cache[idx] = secid
+        return secid
