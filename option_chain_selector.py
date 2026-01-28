@@ -8,16 +8,12 @@ class OptionChainSelector:
     Selects BEST CE / PE using Dhan Option Chain API.
 
     ✔ DOES NOT affect trading logic
-    ✔ ONLY adds explainable reasons + logs
+    ✔ ONLY selects instruments
+    ✔ BANKNIFTY 400 error FIXED (uses INDEX spot scrip)
+    ✔ Logs WHY an option was selected
     """
 
     BASE_URL = "https://api.dhan.co/v2/optionchain"
-
-    DEFAULT_UNDERLYING_MAP = {
-        "NIFTY": (13, "IDX_I"),
-        "BANKNIFTY": (25, "IDX_I"),
-        "FINNIFTY": (0, "IDX_I"),  # CSV preferred
-    }
 
     def __init__(
         self,
@@ -26,8 +22,8 @@ class OptionChainSelector:
         client_id: str,
         instrument_master,
         strike_step_map: Dict[str, int],
-        mode: int = 1,
-        max_steps_each_side: int = 10,
+        mode: int = 1,                 # 1 = one best, 2 = CE + PE
+        max_steps_each_side: int = 10, # ± strikes around ATM
         min_ltp: float = 1.0,
         debug: bool = True,
         timeout_sec: float = 8.0,
@@ -36,6 +32,7 @@ class OptionChainSelector:
         self.client_id = client_id.strip()
         self.im = instrument_master
         self.strike_step_map = strike_step_map
+
         self.mode = mode
         self.max_steps = max_steps_each_side
         self.min_ltp = min_ltp
@@ -52,6 +49,8 @@ class OptionChainSelector:
         })
 
     # --------------------------------------------------
+    # Rate limit: 1 call / 3 seconds (Dhan rule)
+    # --------------------------------------------------
     def _rate_limit(self):
         now = time.time()
         wait = 3.1 - (now - self._last_call_ts)
@@ -60,25 +59,7 @@ class OptionChainSelector:
         self._last_call_ts = time.time()
 
     # --------------------------------------------------
-    def _detect_underlying_scrip(self, index: str) -> Tuple[int, str]:
-        try:
-            df = self.im.df
-            cand = df[
-                (df["SEM_EXM_EXCH_ID"] == "NSE")
-                & (~df["SEM_INSTRUMENT_NAME"].isin(["OPTIDX", "FUTIDX"]))
-                & (df["SEM_TRADING_SYMBOL"].str.contains(index))
-            ]
-            if not cand.empty:
-                sid = int(cand.iloc[0]["SEM_SMST_SECURITY_ID"])
-                return sid, "IDX_I"
-        except Exception:
-            pass
-
-        sid, seg = self.DEFAULT_UNDERLYING_MAP.get(index, (0, "IDX_I"))
-        if sid <= 0:
-            raise RuntimeError(f"UnderlyingScrip missing for {index}")
-        return sid, seg
-
+    # 🔴 FIXED FUNCTION (BANKNIFTY BUG WAS HERE)
     # --------------------------------------------------
     def fetch_chain(self, index: str) -> dict:
         self._rate_limit()
@@ -86,21 +67,28 @@ class OptionChainSelector:
         expiry = self.im.get_nearest_option_expiry(index)
         expiry_str = expiry.strftime("%Y-%m-%d")
 
-        underlying_scrip, seg = self._detect_underlying_scrip(index)
+        # ✅ FIX: Always use INDEX (spot) security id
+        underlying_scrip = self.im.get_index_security_id(index)
+        seg = "IDX_I"
 
         payload = {
-            "UnderlyingScrip": underlying_scrip,
+            "UnderlyingScrip": int(underlying_scrip),
             "UnderlyingSeg": seg,
             "Expiry": expiry_str,
         }
 
         if self.debug:
-            print(f"⛓️ OPTIONCHAIN REQ | {index} | Underlying:{underlying_scrip} | Exp:{expiry_str}")
+            print(
+                f"⛓️ OPTIONCHAIN REQ | {index} | "
+                f"INDEX_SID:{underlying_scrip} | SEG:{seg} | EXP:{expiry_str}"
+            )
 
         r = self._session.post(self.BASE_URL, json=payload, timeout=self.timeout_sec)
         r.raise_for_status()
         return r.json()["data"]
 
+    # --------------------------------------------------
+    # Scoring with explanation (unchanged)
     # --------------------------------------------------
     def _score_with_reason(self, opt: dict) -> Tuple[float, Dict]:
         ltp = float(opt.get("last_price", 0))
@@ -140,6 +128,8 @@ class OptionChainSelector:
 
         return score, reason
 
+    # --------------------------------------------------
+    # Selection logic (unchanged)
     # --------------------------------------------------
     def select_best(self, index: str) -> Dict[str, Dict]:
         data = self.fetch_chain(index)
@@ -195,7 +185,8 @@ class OptionChainSelector:
 
         if self.mode == 1:
             pick = ce if ce and (not pe or ce["score"] >= pe["score"]) else pe
-            out["BEST"] = pick
+            if pick:
+                out["BEST"] = pick
         else:
             if ce:
                 out["CE"] = ce
@@ -204,7 +195,10 @@ class OptionChainSelector:
 
         if self.debug:
             for k, v in out.items():
-                print(f"🎯 [{index}] {k} SELECTED → {v['side']} {v['strike']} | score={v['score']}")
+                print(
+                    f"🎯 [{index}] {k} → {v['side']} {v['strike']} "
+                    f"| score={v['score']}"
+                )
                 print(f"    Reason: {v['reason']}")
 
         return out
