@@ -14,8 +14,10 @@ from depth_micro_features import DepthMicroFeatureBuilder
 from options_momentum_engine import OptionsMomentumEngine
 from paper_trade_manager import PaperTradeManager
 
-# ✅ NEW IMPORT
 from option_chain_selector import OptionChainSelector
+
+# ✅ NEW IMPORT
+from institutional_decision_engine import InstitutionalDecisionEngine
 
 
 # ---------------- CONFIG ----------------
@@ -42,11 +44,6 @@ def market_open():
     return MARKET_START <= now.time() <= MARKET_END
 
 
-def compute_itm_strikes(ltp: float, step: int):
-    atm = int(round(ltp / step) * step)
-    return atm, atm - step, atm + step
-
-
 def main():
     token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
     client_id = os.getenv("DHAN_CLIENT_ID", "").strip()
@@ -66,16 +63,16 @@ def main():
     momentum_engine = OptionsMomentumEngine()
     paper_trader = PaperTradeManager(capital=100000)
 
-    # ✅ NEW: OptionChain selector (mode can be 1 or 2)
-    # mode=1 => ONE best option (either CE or PE)
-    # mode=2 => best CE and best PE
+    # ✅ NEW: Institutional decision layer
+    decision_engine = InstitutionalDecisionEngine(debug=True)
+
     selector = OptionChainSelector(
         access_token=token,
         client_id=client_id,
         instrument_master=master,
         strike_step_map=STRIKE_STEP,
-        mode=2,                    # change 1/2 as you want
-        max_steps_each_side=10,     # 10 steps each side near ATM
+        mode=2,
+        max_steps_each_side=10,
         debug=True
     )
 
@@ -103,13 +100,29 @@ def main():
             # 🔁 LIVE MTM
             paper_trader.on_tick(secid, raw["ltp"])
 
+            # --------------------------------------------------
+            # 1️⃣ Momentum signal (UNCHANGED)
+            # --------------------------------------------------
             action = momentum_engine.on_tick(secid, raw)
 
-            # ---------------- ENTRY ----------------
+            # --------------------------------------------------
+            # 2️⃣ Institutional governance (NEW)
+            # --------------------------------------------------
+            decision_engine.on_signal(
+                secid=secid,
+                tag=tag,
+                ltp=raw["ltp"],
+                signal=action,
+                momentum_engine=momentum_engine,
+                paper_trader=paper_trader
+            )
+
+            # --------------------------------------------------
+            # 3️⃣ ORIGINAL execution flow (UNCHANGED)
+            # --------------------------------------------------
             if action in ("A_ENTRY", "B_ENTRY"):
                 trade = momentum_engine.active_trade.get(secid)
                 if trade:
-                    # keep your flow (if your PaperTradeManager accepts reason, fine)
                     try:
                         paper_trader.on_entry(
                             secid=secid,
@@ -126,7 +139,6 @@ def main():
                             ltp=raw["ltp"]
                         )
 
-            # ---------------- EXIT ----------------
             elif action == "EXIT":
                 try:
                     paper_trader.on_exit(secid, raw["ltp"], reason=action)
@@ -188,7 +200,7 @@ def main():
         time.sleep(REST_POLL_INTERVAL_SEC)
 
     # --------------------------------------------------
-    # STEP 2: SELECT OPTIONS (DYNAMIC) + SUBSCRIBE
+    # STEP 2: SELECT OPTIONS + SUBSCRIBE
     # --------------------------------------------------
     print("\n🎯 Subscribing OPTIONS (dynamic via OptionChain)...")
 
@@ -196,34 +208,23 @@ def main():
         try:
             selection = selector.select_best(idx)
             if not selection:
-                print(f"⚠️ [{idx}] No selection. Skipping subscribe.")
                 continue
 
             subs = []
-            if "BEST" in selection:
-                info = selection["BEST"]
-                subs.append({"SecurityId": str(info["security_id"]), "tag": f"{idx}_{info['side']}"})
-                print(f"✅ [{idx}] BEST {info['side']} | strike:{info['strike']} | id:{info['security_id']} | score:{info['score']:.3f}")
-
-            else:
-                # mode=2
-                if "CE" in selection:
-                    ce = selection["CE"]
-                    subs.append({"SecurityId": str(ce["security_id"]), "tag": f"{idx}_CE"})
-                    print(f"✅ [{idx}] CE | strike:{ce['strike']} | id:{ce['security_id']} | score:{ce['score']:.3f}")
-
-                if "PE" in selection:
-                    pe = selection["PE"]
-                    subs.append({"SecurityId": str(pe["security_id"]), "tag": f"{idx}_PE"})
-                    print(f"✅ [{idx}] PE | strike:{pe['strike']} | id:{pe['security_id']} | score:{pe['score']:.3f}")
+            if "CE" in selection:
+                ce = selection["CE"]
+                subs.append({"SecurityId": str(ce["security_id"]), "tag": f"{idx}_CE"})
+            if "PE" in selection:
+                pe = selection["PE"]
+                subs.append({"SecurityId": str(pe["security_id"]), "tag": f"{idx}_PE"})
 
             if subs:
                 depth20.subscribe(subs)
 
         except Exception as e:
-            print(f"❌ [{idx}] OptionChain select/subscribe error:", e)
+            print(f"❌ [{idx}] OptionChain error:", e)
 
-    print("\n🔥 LIVE: Options Momentum Engine ACTIVE\n")
+    print("\n🔥 LIVE: INSTITUTIONAL OPTIONS ENGINE ACTIVE\n")
 
     # --------------------------------------------------
     # RUN LOOP
@@ -231,7 +232,7 @@ def main():
     last_hb = 0.0
     while True:
         if not market_open():
-            print("🛑 Market closed. Sleeping to save cloud cost.")
+            print("🛑 Market closed. Sleeping.")
             time.sleep(60)
             continue
 
