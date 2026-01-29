@@ -11,7 +11,7 @@ class PaperTradeManager:
     ✔ 1 lot per entry (scalable later)
     ✔ Full-lot exit only
     ✔ Consolidated MTM logging
-    ✔ Open-position snapshot (entry, LTP, age, exit reason)
+    ✔ Open-position snapshot (entry, LTP, age) + exit reason in exit logs
     ✔ Clean, low-noise logs
     """
 
@@ -155,7 +155,7 @@ class PaperTradeManager:
             f"📊 PORTFOLIO | "
             f"Open:{len(self.positions)} | "
             f"Capital:{self.initial_capital:.2f} | "
-            f"CapitalDeployed:{used_margin:.2f} | "
+            f"PremiumDeployed:{used_margin:.2f} | "
             f"Free:{self.cash:.2f} | "
             f"Unrealized:{unrealized:+.2f} | "
             f"Realized:{self.realized_pnl:+.2f} | "
