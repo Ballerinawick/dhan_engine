@@ -219,7 +219,8 @@ class InstitutionalDecisionEngine:
                 f"⏱️ TIME_EXIT | {tag} | age={int(age)}s"
             )
             self._log(f"🧾 EXIT_ATTRIBUTION | TIME_EXIT | {tag}")
-            paper_trader.on_exit(secid, ltp, reason="TIME_EXIT")
+            exit_ltp = ctx.get("last_ltp", ltp)
+            paper_trader.on_exit(secid, exit_ltp, reason="TIME_EXIT")
             momentum_engine.active_trade.pop(secid, None)
             self.index_legs[index].discard(secid)
             return
@@ -232,7 +233,8 @@ class InstitutionalDecisionEngine:
                 f"🏁 EXHAUSTION_EXIT | {tag} | pnl={pnl:.2f}"
             )
             self._log(f"🧾 EXIT_ATTRIBUTION | TREND_HOLD | {tag}")
-            paper_trader.on_exit(secid, ltp, reason="EXHAUSTION")
+            exit_ltp = ctx.get("last_ltp", ltp)
+            paper_trader.on_exit(secid, exit_ltp, reason="EXHAUSTION")
             momentum_engine.active_trade.pop(secid, None)
             self.index_legs[index].discard(secid)
             return
