@@ -155,7 +155,7 @@ class PaperTradeManager:
             f"📊 PORTFOLIO | "
             f"Open:{len(self.positions)} | "
             f"Capital:{self.initial_capital:.2f} | "
-            f"Used:{used_margin:.2f} | "
+            f"CapitalDeployed:{used_margin:.2f} | "
             f"Free:{self.cash:.2f} | "
             f"Unrealized:{unrealized:+.2f} | "
             f"Realized:{self.realized_pnl:+.2f} | "
