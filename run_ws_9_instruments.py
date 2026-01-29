@@ -140,8 +140,9 @@ def main():
                         )
 
             elif action == "EXIT":
+                reason = momentum_engine.last_exit_reason.get(secid, action)
                 try:
-                    paper_trader.on_exit(secid, raw["ltp"], reason=action)
+                    paper_trader.on_exit(secid, raw["ltp"], reason=reason)
                 except TypeError:
                     paper_trader.on_exit(secid, raw["ltp"])
 
