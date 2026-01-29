@@ -33,6 +33,7 @@ class PaperTradeManager:
     TRANSACTION_CHARGE_PCT = 0.0
     TRANSACTION_CHARGE_FLAT = 0.0
     SLIPPAGE_BPS = 0.0
+    FEE_PER_TRADE = 0.0
 
     def __init__(self, capital=100000, log_interval_sec=5):
         self.initial_capital = float(capital)
@@ -56,6 +57,7 @@ class PaperTradeManager:
         self.total_hold_seconds = 0.0
         self.total_fees = 0.0
         self.fee_drag_per_trade = 0.0
+        self.fee_per_trade = float(self.FEE_PER_TRADE)
 
         # Daily counters
         self.current_day = datetime.now().date()
@@ -238,7 +240,8 @@ class PaperTradeManager:
                 unrealized += (entry - ltp) * qty
 
         net_pnl = self.realized_pnl + unrealized
-        net_pnl_after_fees = net_pnl - self.total_fees
+        fees_paid = self.exits_total * self.fee_per_trade
+        net_pnl_after_fees = net_pnl - fees_paid
         avg_hold_seconds = (
             self.total_hold_seconds / self.exits_total if self.exits_total else 0.0
         )
@@ -260,7 +263,7 @@ class PaperTradeManager:
             f"ExitsTaken:{self.exits_total} | "
             f"OpenedToday:{self.opened_today} | "
             f"ClosedToday:{self.closed_today} | "
-            f"FeesPaid:₹{self.total_fees:.2f} | "
+            f"FeesPaid:₹{fees_paid:.2f} | "
             f"NetPnL_AfterFees:₹{net_pnl_after_fees:+.2f} | "
             f"AvgHoldTime:{avg_hold_seconds:.1f}s | "
             f"ChurnRatio:{churn_ratio:.2f}"
