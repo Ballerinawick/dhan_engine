@@ -25,6 +25,8 @@ class InstitutionalDecisionEngine:
     COMPRESSION_PNL_RANGE = 0.15      # % of entry price
     EXHAUSTION_PROFIT_LOCK = 0.60     # lock profit if move done
     PROBE_COOLDOWN_SEC = 12          # per-index probe cooldown to prevent rapid re-entries
+    ACCELERATION_ENTRY_THRESHOLD = 0.01   # minimum accel for impulse candidate
+    IMPULSE_CONFIRM_SEC = 4               # continuous accel duration to confirm impulse
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -37,6 +39,17 @@ class InstitutionalDecisionEngine:
 
         # secid → pnl history
         self.pnl_track = defaultdict(list)
+        # secid → slope history (rolling)
+        self.slope_track = defaultdict(list)
+        # secid → acceleration state
+        self.accel_state = defaultdict(lambda: {
+            "last_slope": 0.0,
+            "current_slope": 0.0,
+            "acceleration_score": 0.0,
+            "last_slope_ts": 0.0,
+            "peak_acceleration": 0.0,
+            "last_acceleration": 0.0,
+        })
 
         self.last_action_ts = {}
         self.last_market_state = {}
@@ -52,6 +65,40 @@ class InstitutionalDecisionEngine:
     def _log(self, msg):
         if self.debug:
             print(msg)
+
+    def _update_acceleration(self, secid: int, now: float) -> float:
+        pts = self.pnl_track.get(secid, [])
+        if len(pts) >= 2:
+            dt = pts[-1][0] - pts[0][0]
+            dp = pts[-1][1] - pts[0][1]
+            current_slope = dp / max(dt, 1e-6)
+        else:
+            current_slope = 0.0
+
+        state = self.accel_state[secid]
+        last_slope = state.get("current_slope", 0.0)
+        last_slope_ts = state.get("last_slope_ts", 0.0) or now
+        dt_slope = max(now - last_slope_ts, 0.0)
+        if dt_slope > 0:
+            acceleration_score = (current_slope - last_slope) / max(dt_slope, 1e-6)
+        else:
+            acceleration_score = 0.0
+
+        state["last_slope"] = last_slope
+        state["current_slope"] = current_slope
+        state["acceleration_score"] = acceleration_score
+        state["last_slope_ts"] = now
+        state["last_acceleration"] = acceleration_score
+        if acceleration_score > state.get("peak_acceleration", 0.0):
+            state["peak_acceleration"] = acceleration_score
+
+        self.slope_track[secid].append((now, current_slope))
+        self.slope_track[secid] = [
+            x for x in self.slope_track[secid]
+            if now - x[0] <= self.DOMINANCE_WINDOW_SEC
+        ]
+
+        return acceleration_score
 
     # --------------------------------------------------
     def on_signal(
@@ -80,6 +127,8 @@ class InstitutionalDecisionEngine:
             active_trade_present = secid in momentum_engine.active_trade
             in_cooldown = False
             displaced = False
+            accel_state = self.accel_state.get(secid, {})
+            acceleration_score = accel_state.get("acceleration_score", 0.0)
             if legs_count == 0:
                 in_cooldown = (
                     probe["last_exit_ts"] > 0
@@ -128,6 +177,7 @@ class InstitutionalDecisionEngine:
                 return
 
             trade = momentum_engine.active_trade[secid]
+            impulse_candidate = acceleration_score > self.ACCELERATION_ENTRY_THRESHOLD
 
             self.trade_ctx[secid] = {
                 "index": index,
@@ -135,10 +185,14 @@ class InstitutionalDecisionEngine:
                 "entry": trade["entry"],
                 "ts": trade["ts"],
                 "last_ltp": ltp,
+                "trade_phase": "PROBE",
+                "impulse_candidate": impulse_candidate,
+                "impulse_confirm_start": None,
             }
 
             self.index_legs[index].add(secid)
             self.pnl_track[secid].clear()
+            self.slope_track[secid].clear()
 
             # Start/refresh probe tracking for the index once a new probe is accepted.
             # WHY: ensures single active probe cycle per index with cooldown.
@@ -148,7 +202,8 @@ class InstitutionalDecisionEngine:
                 probe["dominance_resolved"] = False
 
             self._log(
-                f"🏛️ ENTRY_ACCEPTED | {tag} | side={trade['side']} | entry={trade['entry']:.2f}"
+                f"🏛️ ENTRY_ACCEPTED | {tag} | side={trade['side']} | entry={trade['entry']:.2f} | "
+                f"trade_phase=PROBE | impulse_candidate={impulse_candidate} | accel={acceleration_score:.4f}"
             )
             if secid not in paper_trader.positions:
                 paper_trader.on_entry(
@@ -173,6 +228,8 @@ class InstitutionalDecisionEngine:
                     probe["active"] = False
                     probe["last_exit_ts"] = now
                 self.pnl_track.pop(secid, None)
+                self.slope_track.pop(secid, None)
+                self.accel_state.pop(secid, None)
                 self.last_action_ts.pop(secid, None)
             return
 
@@ -198,6 +255,22 @@ class InstitutionalDecisionEngine:
             x for x in self.pnl_track[secid]
             if now - x[0] <= self.DOMINANCE_WINDOW_SEC
         ]
+        acceleration_score = self._update_acceleration(secid, now)
+        current_slope = self.accel_state[secid]["current_slope"]
+        peak_acceleration = self.accel_state[secid]["peak_acceleration"]
+
+        if ctx["trade_phase"] == "PROBE" and ctx.get("impulse_candidate"):
+            if acceleration_score > 0 and current_slope >= 0:
+                if ctx["impulse_confirm_start"] is None:
+                    ctx["impulse_confirm_start"] = now
+                elif now - ctx["impulse_confirm_start"] >= self.IMPULSE_CONFIRM_SEC:
+                    ctx["trade_phase"] = "IMPULSE"
+                    self._log(
+                        f"🏛️ IMPULSE_CONFIRMED | {tag} | accel={acceleration_score:.4f} | "
+                        f"duration={now - ctx['impulse_confirm_start']:.2f}s"
+                    )
+            else:
+                ctx["impulse_confirm_start"] = None
 
         # ----------------------------------
         # 1️⃣ LEG DOMINANCE EXIT
@@ -226,11 +299,19 @@ class InstitutionalDecisionEngine:
                     loser = None
 
                 if loser:
+                    loser_ctx = self.trade_ctx.get(loser, {})
+                    loser_phase = loser_ctx.get("trade_phase", "PROBE")
+                    loser_accel = self.accel_state.get(loser, {}).get("acceleration_score", 0.0)
+                    if loser_phase == "IMPULSE" and loser_accel > 0:
+                        self._log(
+                            f"🏛️ IMPULSE_HOLD | {index} | skip LEG_DOMINANCE | "
+                            f"secid={loser} | accel={loser_accel:.4f}"
+                        )
+                        return
                     if now - self.last_action_ts.get(loser, 0) > self.COOLDOWN_SEC:
                         self._log(
                             f"🏛️ LEG_DOMINANCE | {index} | EXIT weaker leg {loser}"
                         )
-                        loser_ctx = self.trade_ctx.get(loser, {})
                         loser_ltp = loser_ctx.get("last_ltp", ltp)
                         paper_trader.on_exit(loser, loser_ltp, reason="LEG_DOMINANCE")
                         self._log(f"🧾 EXIT_ATTRIBUTION | PROBE_LOSS | {index} | secid={loser}")
@@ -260,6 +341,11 @@ class InstitutionalDecisionEngine:
         # ----------------------------------
         age = now - ctx["ts"]
         if age >= self.MAX_HOLD_SEC:
+            if ctx["trade_phase"] == "IMPULSE" and acceleration_score > 0:
+                self._log(
+                    f"🏛️ IMPULSE_HOLD | {tag} | skip TIME_EXIT | accel={acceleration_score:.4f}"
+                )
+                return
             self._log(
                 f"⏱️ TIME_EXIT | {tag} | age={int(age)}s"
             )
@@ -273,9 +359,14 @@ class InstitutionalDecisionEngine:
         # ----------------------------------
         # 4️⃣ EXHAUSTION / PROFIT PROTECT
         # ----------------------------------
-        if pnl > ctx["entry"] * self.EXHAUSTION_PROFIT_LOCK:
+        if (
+            pnl > ctx["entry"] * self.EXHAUSTION_PROFIT_LOCK
+            and peak_acceleration > 0
+            and acceleration_score < 0
+        ):
+            ctx["trade_phase"] = "EXHAUSTION"
             self._log(
-                f"🏁 EXHAUSTION_EXIT | {tag} | pnl={pnl:.2f}"
+                f"🏁 EXHAUSTION_EXIT | {tag} | pnl={pnl:.2f} | accel={acceleration_score:.4f}"
             )
             self._log(f"🧾 EXIT_ATTRIBUTION | TREND_HOLD | {tag}")
             exit_ltp = ctx.get("last_ltp", ltp)
