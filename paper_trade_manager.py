@@ -22,6 +22,18 @@ class PaperTradeManager:
         "FINNIFTY": 60,
     }
 
+    # ---------------- OBSERVABILITY FLAGS (DEFAULT OFF) ----------------
+    MIN_HOLD_SECONDS = None
+    MAX_OPEN_POSITIONS = None
+    MAX_INDEX_EXPOSURE = None
+    FINNIFTY_SCORE_MULTIPLIER = None
+
+    # ---------------- FEE MODEL (REPORTING ONLY) ----------------
+    BROKERAGE_PER_ORDER = 0.0
+    TRANSACTION_CHARGE_PCT = 0.0
+    TRANSACTION_CHARGE_FLAT = 0.0
+    SLIPPAGE_BPS = 0.0
+
     def __init__(self, capital=100000, log_interval_sec=5):
         self.initial_capital = float(capital)
         self.cash = float(capital)
@@ -31,6 +43,26 @@ class PaperTradeManager:
 
         self.last_log_ts = 0.0
         self.log_interval = log_interval_sec
+
+        # Metrics (reset on engine start)
+        self.entries_total = 0
+        self.exits_total = 0
+        self.entries_by_index = defaultdict(int)
+        self.exits_by_index = defaultdict(int)
+        self.probe_entries = 0
+        self.dominance_exits = 0
+        self.normal_exits = 0
+        self.max_concurrent_open = 0
+        self.total_hold_seconds = 0.0
+        self.total_fees = 0.0
+        self.fee_drag_per_trade = 0.0
+
+        # Daily counters
+        self.current_day = datetime.now().date()
+        self.opened_today = 0
+        self.closed_today = 0
+
+        self._log_enabled_flags()
 
     # --------------------------------------------------
     # INTERNAL HELPERS
@@ -44,6 +76,36 @@ class PaperTradeManager:
     def _fmt_duration(self, seconds: float) -> str:
         m, s = divmod(int(seconds), 60)
         return f"{m}m{s:02d}s"
+
+    def _calculate_order_fees(self, notional: float) -> float:
+        return (
+            self.BROKERAGE_PER_ORDER
+            + self.TRANSACTION_CHARGE_FLAT
+            + (notional * self.TRANSACTION_CHARGE_PCT)
+            + (notional * (self.SLIPPAGE_BPS / 10000.0))
+        )
+
+    def _maybe_reset_daily_counts(self, now_ts: float) -> None:
+        today = datetime.fromtimestamp(now_ts).date()
+        if today != self.current_day:
+            self.current_day = today
+            self.opened_today = 0
+            self.closed_today = 0
+
+    def _log_enabled_flags(self) -> None:
+        enabled_flags = []
+        if self.MIN_HOLD_SECONDS is not None:
+            enabled_flags.append(f"MIN_HOLD_SECONDS={self.MIN_HOLD_SECONDS}")
+        if self.MAX_OPEN_POSITIONS is not None:
+            enabled_flags.append(f"MAX_OPEN_POSITIONS={self.MAX_OPEN_POSITIONS}")
+        if self.MAX_INDEX_EXPOSURE is not None:
+            enabled_flags.append(f"MAX_INDEX_EXPOSURE={self.MAX_INDEX_EXPOSURE}")
+        if self.FINNIFTY_SCORE_MULTIPLIER is not None:
+            enabled_flags.append(
+                f"FINNIFTY_SCORE_MULTIPLIER={self.FINNIFTY_SCORE_MULTIPLIER}"
+            )
+        if enabled_flags:
+            print(f"🧭 TUNING FLAGS ENABLED | {' | '.join(enabled_flags)}")
 
     # --------------------------------------------------
     # ENTRY (LOT BASED)
@@ -69,6 +131,16 @@ class PaperTradeManager:
         now_ts = time.time()
         self.cash -= cost
 
+        self._maybe_reset_daily_counts(now_ts)
+        self.entries_total += 1
+        self.entries_by_index[index] += 1
+        if "PROBE" in reason.upper():
+            self.probe_entries += 1
+        self.opened_today += 1
+
+        order_fees = self._calculate_order_fees(cost)
+        self.total_fees += order_fees
+
         self.positions[secid] = {
             "tag": tag,
             "side": side,
@@ -80,6 +152,8 @@ class PaperTradeManager:
             "entry_ts": now_ts,
             "entry_reason": reason,
         }
+
+        self.max_concurrent_open = max(self.max_concurrent_open, len(self.positions))
 
         print(
             f"🟢 ENTRY | {tag} | {side} | "
@@ -106,7 +180,20 @@ class PaperTradeManager:
         self.cash += qty * ltp
         self.realized_pnl += pnl
 
-        hold_sec = time.time() - pos["entry_ts"]
+        now_ts = time.time()
+        hold_sec = now_ts - pos["entry_ts"]
+        self.total_hold_seconds += hold_sec
+        self.exits_total += 1
+        self.exits_by_index[self._extract_index(pos["tag"])] += 1
+        if "DOMINANCE" in reason.upper():
+            self.dominance_exits += 1
+        else:
+            self.normal_exits += 1
+        self._maybe_reset_daily_counts(now_ts)
+        self.closed_today += 1
+
+        order_fees = self._calculate_order_fees(qty * ltp)
+        self.total_fees += order_fees
 
         print(
             f"🔴 EXIT | {pos['tag']} | "
@@ -136,6 +223,7 @@ class PaperTradeManager:
         unrealized = 0.0
         used_margin = 0.0
         now = time.time()
+        self._maybe_reset_daily_counts(now)
 
         for p in self.positions.values():
             entry = p["entry"]
@@ -150,6 +238,14 @@ class PaperTradeManager:
                 unrealized += (entry - ltp) * qty
 
         net_pnl = self.realized_pnl + unrealized
+        net_pnl_after_fees = net_pnl - self.total_fees
+        avg_hold_seconds = (
+            self.total_hold_seconds / self.exits_total if self.exits_total else 0.0
+        )
+        churn_ratio = self.exits_total / self.entries_total if self.entries_total else 0.0
+        self.fee_drag_per_trade = (
+            self.total_fees / self.exits_total if self.exits_total else 0.0
+        )
 
         print(
             f"📊 PORTFOLIO | "
@@ -159,7 +255,15 @@ class PaperTradeManager:
             f"Free:{self.cash:.2f} | "
             f"Unrealized:{unrealized:+.2f} | "
             f"Realized:{self.realized_pnl:+.2f} | "
-            f"NetPnL:{net_pnl:+.2f}"
+            f"NetPnL:{net_pnl:+.2f} | "
+            f"EntriesTaken:{self.entries_total} | "
+            f"ExitsTaken:{self.exits_total} | "
+            f"OpenedToday:{self.opened_today} | "
+            f"ClosedToday:{self.closed_today} | "
+            f"FeesPaid:₹{self.total_fees:.2f} | "
+            f"NetPnL_AfterFees:₹{net_pnl_after_fees:+.2f} | "
+            f"AvgHoldTime:{avg_hold_seconds:.1f}s | "
+            f"ChurnRatio:{churn_ratio:.2f}"
         )
 
         if not self.positions:
