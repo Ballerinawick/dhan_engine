@@ -75,23 +75,59 @@ class InstitutionalDecisionEngine:
         # ENTRY GOVERNANCE
         # ----------------------------------
         if signal in ("A_ENTRY", "B_ENTRY"):
-            if secid not in momentum_engine.active_trade:
-                return
-
-            trade = momentum_engine.active_trade[secid]
-
-            # Guard against repeated probe re-entry during compression for the same index.
-            # WHY: prevents rapid CE/PE probe churn when price is still compressed.
             probe = self.probe_state[index]
-            if not self.index_legs.get(index):
-                in_cooldown = now - probe["last_exit_ts"] < self.PROBE_COOLDOWN_SEC
+            legs_count = len(self.index_legs.get(index, set()))
+            active_trade_present = secid in momentum_engine.active_trade
+            in_cooldown = False
+            displaced = False
+            if legs_count == 0:
+                in_cooldown = (
+                    probe["last_exit_ts"] > 0
+                    and now - probe["last_exit_ts"] < self.PROBE_COOLDOWN_SEC
+                )
                 displaced = (
                     probe["last_entry_price"] > 0
                     and abs(ltp - probe["last_entry_price"]) >= probe["last_entry_price"] * self.COMPRESSION_PNL_RANGE
                 )
-                if in_cooldown or (not probe["dominance_resolved"] and not displaced):
-                    momentum_engine.active_trade.pop(secid, None)
-                    return
+
+            decision = "ACCEPT_ENTRY"
+            reason = None
+            if not active_trade_present:
+                decision = "CANCEL_ENTRY"
+                reason = "NO_ACTIVE_TRADE"
+            else:
+                allow_fresh_probe = (
+                    not probe["active"]
+                    and legs_count == 0
+                    and probe["last_entry_price"] == 0
+                )
+                if legs_count == 0 and not allow_fresh_probe:
+                    if in_cooldown:
+                        decision = "CANCEL_ENTRY"
+                        reason = "PROBE_COOLDOWN"
+                    elif not probe["dominance_resolved"] and not displaced:
+                        decision = "CANCEL_ENTRY"
+                        reason = "PROBE_NOT_DISPLACED"
+
+            self._log(
+                "🧭 ENTRY_TRACE | "
+                f"secid={secid} | tag={tag} | signal={signal} | ltp={ltp:.2f} | "
+                f"active_trade={active_trade_present} | legs={legs_count} | "
+                f"probe.active={probe['active']} | probe.last_exit_ts={probe['last_exit_ts']:.2f} | "
+                f"probe.last_entry_price={probe['last_entry_price']:.2f} | "
+                f"probe.dominance_resolved={probe['dominance_resolved']} | "
+                f"in_cooldown={in_cooldown} | displaced={displaced} | "
+                f"decision={decision}{f' | reason={reason}' if reason else ''}"
+            )
+
+            if decision == "CANCEL_ENTRY":
+                self._log(
+                    f"🏛️ ENTRY_CANCELLED | {tag} | reason={reason}"
+                )
+                momentum_engine.active_trade.pop(secid, None)
+                return
+
+            trade = momentum_engine.active_trade[secid]
 
             self.trade_ctx[secid] = {
                 "index": index,
@@ -114,6 +150,15 @@ class InstitutionalDecisionEngine:
             self._log(
                 f"🏛️ ENTRY_ACCEPTED | {tag} | side={trade['side']} | entry={trade['entry']:.2f}"
             )
+            if secid not in paper_trader.positions:
+                paper_trader.on_entry(
+                    secid=secid,
+                    tag=tag,
+                    side=trade["side"],
+                    ltp=trade["entry"],
+                    lots=1,
+                    reason=signal
+                )
             return
 
         if signal == "EXIT":
