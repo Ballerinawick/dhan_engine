@@ -24,6 +24,7 @@ class InstitutionalDecisionEngine:
 
     COMPRESSION_PNL_RANGE = 0.15      # % of entry price
     EXHAUSTION_PROFIT_LOCK = 0.60     # lock profit if move done
+    PROBE_COOLDOWN_SEC = 12          # per-index probe cooldown to prevent rapid re-entries
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -39,6 +40,13 @@ class InstitutionalDecisionEngine:
 
         self.last_action_ts = {}
         self.last_market_state = {}
+        # per-index probe governance state (cooldown + displacement guard)
+        self.probe_state = defaultdict(lambda: {
+            "active": False,
+            "last_exit_ts": 0.0,
+            "last_entry_price": 0.0,
+            "dominance_resolved": False,
+        })
 
     # --------------------------------------------------
     def _log(self, msg):
@@ -72,15 +80,36 @@ class InstitutionalDecisionEngine:
 
             trade = momentum_engine.active_trade[secid]
 
+            # Guard against repeated probe re-entry during compression for the same index.
+            # WHY: prevents rapid CE/PE probe churn when price is still compressed.
+            probe = self.probe_state[index]
+            if not self.index_legs.get(index):
+                in_cooldown = now - probe["last_exit_ts"] < self.PROBE_COOLDOWN_SEC
+                displaced = (
+                    probe["last_entry_price"] > 0
+                    and abs(ltp - probe["last_entry_price"]) >= probe["last_entry_price"] * self.COMPRESSION_PNL_RANGE
+                )
+                if in_cooldown or (not probe["dominance_resolved"] and not displaced):
+                    momentum_engine.active_trade.pop(secid, None)
+                    return
+
             self.trade_ctx[secid] = {
                 "index": index,
                 "side": trade["side"],
                 "entry": trade["entry"],
                 "ts": trade["ts"],
+                "last_ltp": ltp,
             }
 
             self.index_legs[index].add(secid)
             self.pnl_track[secid].clear()
+
+            # Start/refresh probe tracking for the index once a new probe is accepted.
+            # WHY: ensures single active probe cycle per index with cooldown.
+            if not probe["active"]:
+                probe["active"] = True
+                probe["last_entry_price"] = trade["entry"]
+                probe["dominance_resolved"] = False
 
             self._log(
                 f"🏛️ ENTRY_ACCEPTED | {tag} | side={trade['side']} | entry={trade['entry']:.2f}"
@@ -95,6 +124,9 @@ class InstitutionalDecisionEngine:
                 if not self.index_legs[index]:
                     self.index_legs.pop(index, None)
                     self.last_market_state.pop(index, None)
+                    probe = self.probe_state[index]
+                    probe["active"] = False
+                    probe["last_exit_ts"] = now
                 self.pnl_track.pop(secid, None)
                 self.last_action_ts.pop(secid, None)
             return
@@ -111,6 +143,9 @@ class InstitutionalDecisionEngine:
             return
 
         pnl = (ltp - ctx["entry"]) if trade["side"] == "LONG" else (ctx["entry"] - ltp)
+        # Track last known LTP per leg for precise dominance exits.
+        # WHY: ensure LEG_DOMINANCE uses the leg's own last price, not shared tick LTP.
+        ctx["last_ltp"] = ltp
         self.pnl_track[secid].append((now, pnl))
 
         # keep last N seconds
@@ -150,10 +185,14 @@ class InstitutionalDecisionEngine:
                         self._log(
                             f"🏛️ LEG_DOMINANCE | {index} | EXIT weaker leg {loser}"
                         )
-                        paper_trader.on_exit(loser, ltp, reason="LEG_DOMINANCE")
+                        loser_ctx = self.trade_ctx.get(loser, {})
+                        loser_ltp = loser_ctx.get("last_ltp", ltp)
+                        paper_trader.on_exit(loser, loser_ltp, reason="LEG_DOMINANCE")
+                        self._log(f"🧾 EXIT_ATTRIBUTION | PROBE_LOSS | {index} | secid={loser}")
                         momentum_engine.active_trade.pop(loser, None)
                         self.index_legs[index].discard(loser)
                         self.last_action_ts[loser] = now
+                        self.probe_state[index]["dominance_resolved"] = True
                         return
 
         # ----------------------------------
@@ -179,6 +218,7 @@ class InstitutionalDecisionEngine:
             self._log(
                 f"⏱️ TIME_EXIT | {tag} | age={int(age)}s"
             )
+            self._log(f"🧾 EXIT_ATTRIBUTION | TIME_EXIT | {tag}")
             paper_trader.on_exit(secid, ltp, reason="TIME_EXIT")
             momentum_engine.active_trade.pop(secid, None)
             self.index_legs[index].discard(secid)
@@ -191,6 +231,7 @@ class InstitutionalDecisionEngine:
             self._log(
                 f"🏁 EXHAUSTION_EXIT | {tag} | pnl={pnl:.2f}"
             )
+            self._log(f"🧾 EXIT_ATTRIBUTION | TREND_HOLD | {tag}")
             paper_trader.on_exit(secid, ltp, reason="EXHAUSTION")
             momentum_engine.active_trade.pop(secid, None)
             self.index_legs[index].discard(secid)
