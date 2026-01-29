@@ -38,6 +38,7 @@ class InstitutionalDecisionEngine:
         self.pnl_track = defaultdict(list)
 
         self.last_action_ts = {}
+        self.last_market_state = {}
 
     # --------------------------------------------------
     def _log(self, msg):
@@ -86,6 +87,18 @@ class InstitutionalDecisionEngine:
             )
             return
 
+        if signal == "EXIT":
+            ctx = self.trade_ctx.pop(secid, None)
+            if ctx:
+                index = ctx["index"]
+                self.index_legs[index].discard(secid)
+                if not self.index_legs[index]:
+                    self.index_legs.pop(index, None)
+                    self.last_market_state.pop(index, None)
+                self.pnl_track.pop(secid, None)
+                self.last_action_ts.pop(secid, None)
+            return
+
         # ----------------------------------
         # TRACK ACTIVE TRADES
         # ----------------------------------
@@ -110,6 +123,8 @@ class InstitutionalDecisionEngine:
         # 1️⃣ LEG DOMINANCE EXIT
         # ----------------------------------
         legs = list(self.index_legs[index])
+        if len(legs) != 2:
+            self.last_market_state.pop(index, None)
         if len(legs) == 2:
             slopes = {}
             for s in legs:
@@ -147,13 +162,14 @@ class InstitutionalDecisionEngine:
         if len(legs) == 2:
             pnls = [abs(pnl) for _, pnl in self.pnl_track[secid][-1:]]
             if pnls and pnls[0] < ctx["entry"] * self.COMPRESSION_PNL_RANGE:
-                self._log(
-                    f"🏛️ COMPRESSION | {index} | CE+PE probing"
-                )
+                state = "COMPRESSION"
+                msg = f"🏛️ COMPRESSION | {index} | CE+PE probing"
             else:
-                self._log(
-                    f"🏛️ EXPANSION | {index} | directional bias forming"
-                )
+                state = "EXPANSION"
+                msg = f"🏛️ EXPANSION | {index} | directional bias forming"
+            if self.last_market_state.get(index) != state:
+                self._log(msg)
+                self.last_market_state[index] = state
 
         # ----------------------------------
         # 3️⃣ TIME-BASED RISK GOVERNOR

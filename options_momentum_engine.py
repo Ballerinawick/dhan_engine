@@ -282,14 +282,8 @@ class OptionsMomentumEngine:
 
             if price_speed > avg_range * B_SPEED:
                 if trap_up:
-                    self.active_trade[secid] = {
-                        "type": "B",
-                        "side": "SHORT",
-                        "entry": float(last["close"]),
-                        "ts": float(last["ts"]),
-                    }
-                    self.last_action_sec[secid] = cur_sec
-                    return "B_ENTRY"
+                    # LONG-ONLY enforcement: ignore SHORT trap entries
+                    pass
 
                 if trap_down:
                     self.active_trade[secid] = {
