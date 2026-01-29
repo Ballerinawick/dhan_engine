@@ -26,7 +26,7 @@ class InstitutionalDecisionEngine:
     EXHAUSTION_PROFIT_LOCK = 0.60     # lock profit if move done
     PROBE_COOLDOWN_SEC = 12          # per-index probe cooldown to prevent rapid re-entries
     ACCELERATION_ENTRY_THRESHOLD = 0.01   # minimum accel for impulse candidate
-    IMPULSE_CONFIRM_SEC = 4               # continuous accel duration to confirm impulse
+    IMPULSE_CONFIRM_SEC = 3               # continuous accel duration to confirm impulse
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -188,6 +188,7 @@ class InstitutionalDecisionEngine:
                 "trade_phase": "PROBE",
                 "impulse_candidate": impulse_candidate,
                 "impulse_confirm_start": None,
+                "accel_start_ts": None,
             }
 
             self.index_legs[index].add(secid)
@@ -255,21 +256,30 @@ class InstitutionalDecisionEngine:
             x for x in self.pnl_track[secid]
             if now - x[0] <= self.DOMINANCE_WINDOW_SEC
         ]
+        prev_accel = self.accel_state[secid].get("last_acceleration", 0.0)
         acceleration_score = self._update_acceleration(secid, now)
         current_slope = self.accel_state[secid]["current_slope"]
         peak_acceleration = self.accel_state[secid]["peak_acceleration"]
 
+        if prev_accel >= 0 and acceleration_score < 0:
+            self._log(
+                f"📉 ACCELERATION_DECAY | secid={secid} | accel={acceleration_score:.4f}"
+            )
+
         if ctx["trade_phase"] == "PROBE" and ctx.get("impulse_candidate"):
-            if acceleration_score > 0 and current_slope >= 0:
+            if acceleration_score > 0:
+                if ctx["accel_start_ts"] is None:
+                    ctx["accel_start_ts"] = now
                 if ctx["impulse_confirm_start"] is None:
-                    ctx["impulse_confirm_start"] = now
-                elif now - ctx["impulse_confirm_start"] >= self.IMPULSE_CONFIRM_SEC:
+                    ctx["impulse_confirm_start"] = ctx["accel_start_ts"]
+                if now - ctx["accel_start_ts"] >= self.IMPULSE_CONFIRM_SEC:
                     ctx["trade_phase"] = "IMPULSE"
                     self._log(
-                        f"🏛️ IMPULSE_CONFIRMED | {tag} | accel={acceleration_score:.4f} | "
-                        f"duration={now - ctx['impulse_confirm_start']:.2f}s"
+                        f"🏁 IMPULSE_CONFIRMED | secid={secid} | accel={acceleration_score:.4f} | "
+                        f"duration={now - ctx['accel_start_ts']:.2f}s"
                     )
             else:
+                ctx["accel_start_ts"] = None
                 ctx["impulse_confirm_start"] = None
 
         # ----------------------------------
@@ -279,6 +289,13 @@ class InstitutionalDecisionEngine:
         if len(legs) != 2:
             self.last_market_state.pop(index, None)
         if len(legs) == 2:
+            dominance_allowed = True
+            for s in legs:
+                leg_ctx = self.trade_ctx.get(s, {})
+                if leg_ctx.get("trade_phase") != "PROBE" or leg_ctx.get("impulse_candidate"):
+                    dominance_allowed = False
+                    break
+        if len(legs) == 2 and dominance_allowed:
             slopes = {}
             for s in legs:
                 pts = self.pnl_track.get(s, [])
@@ -302,10 +319,13 @@ class InstitutionalDecisionEngine:
                     loser_ctx = self.trade_ctx.get(loser, {})
                     loser_phase = loser_ctx.get("trade_phase", "PROBE")
                     loser_accel = self.accel_state.get(loser, {}).get("acceleration_score", 0.0)
-                    if loser_phase == "IMPULSE" and loser_accel > 0:
+                    if loser_phase == "IMPULSE" and loser_accel >= 0:
                         self._log(
                             f"🏛️ IMPULSE_HOLD | {index} | skip LEG_DOMINANCE | "
                             f"secid={loser} | accel={loser_accel:.4f}"
+                        )
+                        self._log(
+                            "🧯 IMPULSE_EXIT_BLOCKED | reason=ACCELERATION_ACTIVE"
                         )
                         return
                     if now - self.last_action_ts.get(loser, 0) > self.COOLDOWN_SEC:
@@ -341,9 +361,12 @@ class InstitutionalDecisionEngine:
         # ----------------------------------
         age = now - ctx["ts"]
         if age >= self.MAX_HOLD_SEC:
-            if ctx["trade_phase"] == "IMPULSE" and acceleration_score > 0:
+            if ctx["trade_phase"] == "IMPULSE" and acceleration_score >= 0:
                 self._log(
                     f"🏛️ IMPULSE_HOLD | {tag} | skip TIME_EXIT | accel={acceleration_score:.4f}"
+                )
+                self._log(
+                    "🧯 IMPULSE_EXIT_BLOCKED | reason=ACCELERATION_ACTIVE"
                 )
                 return
             self._log(
