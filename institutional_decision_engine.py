@@ -47,6 +47,9 @@ class InstitutionalDecisionEngine:
     CHURN_LOSS_WINDOW_SEC = 45            # rapid loss window for churn guard
     CHURN_COOLDOWN_SEC = 20               # cooldown after repeated losses
     CONTINUATION_RECENT_SEC = 12          # recent continuation window for time exits
+    HOLD_CONFIRM_SEC = 3                  # hold time for displacement confirmation
+    PENDING_MAX_SEC = 8                   # max seconds to wait for pending entry confirmation
+    BALANCE_LOOKBACK_SEC = 30             # balance price lookback for displacement check
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -76,6 +79,7 @@ class InstitutionalDecisionEngine:
             "time_above_zero_accel": 0.0,
             "last_accel_ts": 0.0,
             "accel_history": deque(maxlen=3),
+            "accel_history_ts": deque(maxlen=10),
         })
 
         self.last_action_ts = {}
@@ -454,6 +458,7 @@ class InstitutionalDecisionEngine:
         if acceleration_score > state.get("peak_acceleration", 0.0):
             state["peak_acceleration"] = acceleration_score
         state["accel_history"].append(acceleration_score)
+        state["accel_history_ts"].append((now, acceleration_score))
 
         self.slope_track[secid].append((now, current_slope))
         self.slope_track[secid] = [
@@ -552,6 +557,9 @@ class InstitutionalDecisionEngine:
                 trade["side"], ltp, secid, churn_tighten
             )
             if not structure_ok:
+                self._log(
+                    f"ENTRY_BLOCKED | tag={tag} | gate_failed=G1_STRUCTURE"
+                )
                 momentum_engine.active_trade.pop(secid, None)
                 return {"entry_allowed": False}
             accel_gate_blocked = False
@@ -606,34 +614,105 @@ class InstitutionalDecisionEngine:
             if accel_gate_blocked or cooldown_active:
                 momentum_engine.active_trade.pop(secid, None)
                 return {"entry_allowed": False}
+            accel_state_label = self._accel_state_label(accel_history)
+            recent_positive_accel = any(
+                score > 0
+                for ts, score in accel_state.get("accel_history_ts", [])
+                if now - ts <= self.IMPULSE_CONFIRM_SEC
+            )
+            if (
+                acceleration_score > 0
+                and now - accel_state.get("last_accel_ts", now) <= self.IMPULSE_CONFIRM_SEC
+            ):
+                recent_positive_accel = True
+            peak_accel_ok = accel_state.get("peak_acceleration", 0.0) >= self.ACCELERATION_ENTRY_THRESHOLD
+            if accel_state_label not in {"PEAKED", "DECAYING"} or not (recent_positive_accel or peak_accel_ok):
+                self._log(
+                    f"ENTRY_BLOCKED | tag={tag} | gate_failed=G2_IMPULSE"
+                )
+                momentum_engine.active_trade.pop(secid, None)
+                return {"entry_allowed": False}
+
+            balance_prices = [
+                price for ts, price in self.price_track.get(secid, [])
+                if now - ts <= self.BALANCE_LOOKBACK_SEC
+            ]
+            balance_price = sum(balance_prices) / len(balance_prices) if balance_prices else ltp
+            displacement = abs(ltp - balance_price) / max(balance_price, 1e-6)
+            if displacement < self.DISPLACEMENT_THRESHOLD_PCT:
+                self._log(
+                    f"ENTRY_BLOCKED | tag={tag} | gate_failed=G3_DISPLACEMENT | disp={displacement:.4f}"
+                )
+                momentum_engine.active_trade.pop(secid, None)
+                return {"entry_allowed": False}
+
             impulse_candidate = acceleration_score > self.ACCELERATION_ENTRY_THRESHOLD
 
-            self.trade_ctx[secid] = {
-                "index": index,
-                "tag": tag,
-                "side": trade["side"],
-                "secid": secid,
-                "type": trade.get("type", "UNKNOWN"),
-                "entry": trade["entry"],
-                "ts": trade["ts"],
-                "last_ltp": ltp,
-                "trade_phase": "PROBE",
-                "impulse_candidate": impulse_candidate,
-                "impulse_confirm_start": None,
-                "accel_start_ts": None,
-                "trade_mode": None,
-                "regime_decision_ts": None,
-                "speed_near_zero_seen": False,
-                "trend_extreme": trade["entry"],
-                "last_trend_extreme_ts": trade["ts"],
-                "no_progress_ticks": 0,
-                "accel_flip_ts": None,
-                "extreme_price_since_entry": trade["entry"],
-                "continuation_resets_count": 0,
-                "last_progress_ts": trade["ts"],
-                "stalled_duration": 0.0,
-                "time_exit_blocked_logged": False,
-            }
+            ctx = self.trade_ctx.get(secid)
+            if not ctx:
+                ctx = {
+                    "index": index,
+                    "tag": tag,
+                    "side": trade["side"],
+                    "secid": secid,
+                    "type": trade.get("type", "UNKNOWN"),
+                    "entry": trade["entry"],
+                    "ts": trade["ts"],
+                    "last_ltp": ltp,
+                    "trade_phase": "PROBE",
+                    "impulse_candidate": impulse_candidate,
+                    "impulse_confirm_start": None,
+                    "accel_start_ts": None,
+                    "trade_mode": None,
+                    "regime_decision_ts": None,
+                    "speed_near_zero_seen": False,
+                    "trend_extreme": trade["entry"],
+                    "last_trend_extreme_ts": trade["ts"],
+                    "no_progress_ticks": 0,
+                    "accel_flip_ts": None,
+                    "extreme_price_since_entry": trade["entry"],
+                    "continuation_resets_count": 0,
+                    "last_progress_ts": trade["ts"],
+                    "stalled_duration": 0.0,
+                    "time_exit_blocked_logged": False,
+                    "displacement_start_ts": None,
+                    "displacement_confirmed": False,
+                    "pending_entry_ts": None,
+                    "entry_committed": False,
+                }
+                self.trade_ctx[secid] = ctx
+
+            if ctx.get("pending_entry_ts") is None:
+                ctx["pending_entry_ts"] = now
+            pending_duration = now - ctx["pending_entry_ts"]
+            if pending_duration > self.PENDING_MAX_SEC:
+                self._log(
+                    f"ENTRY_BLOCKED | tag={tag} | gate_failed=G4_TIMEOUT"
+                )
+                momentum_engine.active_trade.pop(secid, None)
+                self.trade_ctx.pop(secid, None)
+                self.index_legs[index].discard(secid)
+                if not self.index_legs[index]:
+                    self.index_legs.pop(index, None)
+                self.pnl_track.pop(secid, None)
+                self.slope_track.pop(secid, None)
+                self.speed_track.pop(secid, None)
+                return {"entry_allowed": False}
+
+            if displacement >= self.DISPLACEMENT_THRESHOLD_PCT:
+                if ctx.get("displacement_start_ts") is None:
+                    ctx["displacement_start_ts"] = now
+            else:
+                if ctx.get("displacement_start_ts") is not None:
+                    ctx["displacement_start_ts"] = None
+                return {"entry_allowed": False}
+
+            hold_sec = now - ctx.get("displacement_start_ts", now)
+            if hold_sec < self.HOLD_CONFIRM_SEC:
+                self._log(
+                    f"ENTRY_WAIT | tag={tag} | gate=G4_HOLD | hold={hold_sec:.1f}s"
+                )
+                return {"entry_allowed": False}
 
             self.index_legs[index].add(secid)
             self.pnl_track[secid].clear()
@@ -654,7 +733,8 @@ class InstitutionalDecisionEngine:
                 f"🧭 ENTRY_STEERING_DECISION | symbol={tag} | accel_state={accel_state_label} | "
                 f"structure_state={structure_state} | mode={entry_mode} | reason=ACCEL_DECAY_STRUCTURE_OK"
             )
-            if secid not in paper_trader.positions:
+            if secid not in paper_trader.positions and not ctx.get("entry_committed"):
+                hold_sec = now - ctx.get("displacement_start_ts", now)
                 paper_trader.on_entry(
                     secid=secid,
                     tag=tag,
@@ -662,6 +742,16 @@ class InstitutionalDecisionEngine:
                     ltp=trade["entry"],
                     lots=1,
                     reason=f"STRUCT_{structure_reason}"
+                )
+                ctx["entry_committed"] = True
+                ctx["displacement_confirmed"] = True
+                self._log(
+                    "ENTRY_COMMITTED | tag={tag} | gates=G1,G2,G3,G4 | "
+                    "displacement={displacement:.4f} | hold_sec={hold_sec:.1f}".format(
+                        tag=tag,
+                        displacement=displacement,
+                        hold_sec=hold_sec,
+                    )
                 )
             return {"entry_allowed": True}
 
