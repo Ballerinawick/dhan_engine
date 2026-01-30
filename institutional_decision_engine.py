@@ -27,6 +27,9 @@ class InstitutionalDecisionEngine:
     PROBE_COOLDOWN_SEC = 12          # per-index probe cooldown to prevent rapid re-entries
     ACCELERATION_ENTRY_THRESHOLD = 0.01   # minimum accel for impulse candidate
     IMPULSE_CONFIRM_SEC = 3               # continuous accel duration to confirm impulse
+    DECAY_TICKS = 3                       # consecutive negative accel ticks to allow exit
+    MIN_SPEED_THRESHOLD_PCT = 0.02        # speed near zero threshold (% of entry)
+    EXTENSION_FAIL_PNL_PCT = 0.15         # pnl growth threshold to confirm stall
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -41,6 +44,8 @@ class InstitutionalDecisionEngine:
         self.pnl_track = defaultdict(list)
         # secid → slope history (rolling)
         self.slope_track = defaultdict(list)
+        # secid → speed history (rolling)
+        self.speed_track = defaultdict(list)
         # secid → acceleration state
         self.accel_state = defaultdict(lambda: {
             "last_slope": 0.0,
@@ -49,6 +54,7 @@ class InstitutionalDecisionEngine:
             "last_slope_ts": 0.0,
             "peak_acceleration": 0.0,
             "last_acceleration": 0.0,
+            "negative_ticks": 0,
         })
 
         self.last_action_ts = {}
@@ -99,6 +105,28 @@ class InstitutionalDecisionEngine:
         ]
 
         return acceleration_score
+
+    # --------------------------------------------------
+    def _update_speed(self, secid: int, now: float) -> float:
+        pts = self.pnl_track.get(secid, [])
+        if len(pts) >= 2:
+            prev_ts, prev_pnl = pts[-2]
+            dt = now - prev_ts
+            dp = pts[-1][1] - prev_pnl
+            speed = dp / max(dt, 1e-6)
+        else:
+            speed = 0.0
+
+        self.speed_track[secid].append((now, speed))
+        self.speed_track[secid] = [
+            x for x in self.speed_track[secid]
+            if now - x[0] <= self.DOMINANCE_WINDOW_SEC
+        ]
+
+        self._log(
+            f"⚙️ SPEED_TRACK | secid={secid} | speed={speed:.4f}"
+        )
+        return speed
 
     # --------------------------------------------------
     def on_signal(
@@ -194,6 +222,7 @@ class InstitutionalDecisionEngine:
             self.index_legs[index].add(secid)
             self.pnl_track[secid].clear()
             self.slope_track[secid].clear()
+            self.speed_track[secid].clear()
 
             # Start/refresh probe tracking for the index once a new probe is accepted.
             # WHY: ensures single active probe cycle per index with cooldown.
@@ -230,6 +259,7 @@ class InstitutionalDecisionEngine:
                     probe["last_exit_ts"] = now
                 self.pnl_track.pop(secid, None)
                 self.slope_track.pop(secid, None)
+                self.speed_track.pop(secid, None)
                 self.accel_state.pop(secid, None)
                 self.last_action_ts.pop(secid, None)
             return
@@ -256,10 +286,15 @@ class InstitutionalDecisionEngine:
             x for x in self.pnl_track[secid]
             if now - x[0] <= self.DOMINANCE_WINDOW_SEC
         ]
+        speed = self._update_speed(secid, now)
         prev_accel = self.accel_state[secid].get("last_acceleration", 0.0)
         acceleration_score = self._update_acceleration(secid, now)
         current_slope = self.accel_state[secid]["current_slope"]
         peak_acceleration = self.accel_state[secid]["peak_acceleration"]
+        if acceleration_score < 0:
+            self.accel_state[secid]["negative_ticks"] += 1
+        else:
+            self.accel_state[secid]["negative_ticks"] = 0
 
         if prev_accel >= 0 and acceleration_score < 0:
             self._log(
@@ -382,12 +417,38 @@ class InstitutionalDecisionEngine:
         # ----------------------------------
         # 4️⃣ EXHAUSTION / PROFIT PROTECT
         # ----------------------------------
+        recent_speeds = [
+            v for _, v in self.speed_track.get(secid, [])[-self.DECAY_TICKS:]
+        ]
+        speed_declining = (
+            len(recent_speeds) >= self.DECAY_TICKS
+            and all(
+                recent_speeds[i] >= recent_speeds[i + 1]
+                for i in range(len(recent_speeds) - 1)
+            )
+        )
+        min_speed_threshold = ctx["entry"] * self.MIN_SPEED_THRESHOLD_PCT
+        speed_near_zero = abs(speed) <= min_speed_threshold
+        if len(self.pnl_track[secid]) >= 2:
+            window_growth = pnl - self.pnl_track[secid][0][1]
+        else:
+            window_growth = 0.0
+        extension_failed = window_growth < ctx["entry"] * self.EXTENSION_FAIL_PNL_PCT
+        accel_exit_gate = (
+            self.accel_state[secid]["negative_ticks"] >= self.DECAY_TICKS
+            and (speed_near_zero or speed_declining)
+            and extension_failed
+        )
         if (
             pnl > ctx["entry"] * self.EXHAUSTION_PROFIT_LOCK
             and peak_acceleration > 0
-            and acceleration_score < 0
+            and accel_exit_gate
         ):
             ctx["trade_phase"] = "EXHAUSTION"
+            self._log(
+                "🏁 SMART_EXIT | "
+                f"secid={secid} | reason=LOSS_OF_ACCELERATION"
+            )
             self._log(
                 f"🏁 EXHAUSTION_EXIT | {tag} | pnl={pnl:.2f} | accel={acceleration_score:.4f}"
             )
