@@ -26,10 +26,14 @@ class InstitutionalDecisionEngine:
     EXHAUSTION_PROFIT_LOCK = 0.60     # lock profit if move done
     PROBE_COOLDOWN_SEC = 12          # per-index probe cooldown to prevent rapid re-entries
     ACCELERATION_ENTRY_THRESHOLD = 0.01   # minimum accel for impulse candidate
+    HIGH_ACCEL_THRESHOLD = 0.02           # high peak accel to classify trend regime
     IMPULSE_CONFIRM_SEC = 3               # continuous accel duration to confirm impulse
     DECAY_TICKS = 3                       # consecutive negative accel ticks to allow exit
     MIN_SPEED_THRESHOLD_PCT = 0.02        # speed near zero threshold (% of entry)
     EXTENSION_FAIL_PNL_PCT = 0.15         # pnl growth threshold to confirm stall
+    DISPLACEMENT_THRESHOLD_PCT = 0.15     # displacement needed for trend regime
+    REGIME_DECISION_MIN_SEC = 10          # earliest regime decision window
+    REGIME_DECISION_MAX_SEC = 25          # latest regime decision window
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -217,6 +221,9 @@ class InstitutionalDecisionEngine:
                 "impulse_candidate": impulse_candidate,
                 "impulse_confirm_start": None,
                 "accel_start_ts": None,
+                "trade_mode": None,
+                "regime_decision_ts": None,
+                "speed_near_zero_seen": False,
             }
 
             self.index_legs[index].add(secid)
@@ -301,6 +308,11 @@ class InstitutionalDecisionEngine:
                 f"📉 ACCELERATION_DECAY | secid={secid} | accel={acceleration_score:.4f}"
             )
 
+        min_speed_threshold = ctx["entry"] * self.MIN_SPEED_THRESHOLD_PCT
+        speed_near_zero = abs(speed) <= min_speed_threshold
+        if speed_near_zero:
+            ctx["speed_near_zero_seen"] = True
+
         if ctx["trade_phase"] == "PROBE" and ctx.get("impulse_candidate"):
             if acceleration_score > 0:
                 if ctx["accel_start_ts"] is None:
@@ -316,6 +328,50 @@ class InstitutionalDecisionEngine:
             else:
                 ctx["accel_start_ts"] = None
                 ctx["impulse_confirm_start"] = None
+
+        # ----------------------------------
+        # REGIME DECISION (SCALP vs TREND)
+        # ----------------------------------
+        if ctx.get("trade_mode") is None:
+            age_since_entry = now - ctx["ts"]
+            within_window = (
+                self.REGIME_DECISION_MIN_SEC
+                <= age_since_entry
+                <= self.REGIME_DECISION_MAX_SEC
+            )
+            decision_timeout = age_since_entry > self.REGIME_DECISION_MAX_SEC
+            if within_window or decision_timeout:
+                accel_positive_duration = 0.0
+                if acceleration_score > 0 and ctx.get("accel_start_ts") is not None:
+                    accel_positive_duration = now - ctx["accel_start_ts"]
+                displacement = abs(ltp - ctx["entry"])
+                displacement_threshold = ctx["entry"] * self.DISPLACEMENT_THRESHOLD_PCT
+                regime_trend = (
+                    peak_acceleration >= self.HIGH_ACCEL_THRESHOLD
+                    and accel_positive_duration >= self.IMPULSE_CONFIRM_SEC
+                    and displacement >= displacement_threshold
+                    and not ctx.get("speed_near_zero_seen", False)
+                )
+                if regime_trend:
+                    ctx["trade_mode"] = "TREND"
+                    reason = "HIGH_PEAK_ACCEL"
+                else:
+                    ctx["trade_mode"] = "SCALP"
+                    if peak_acceleration < self.HIGH_ACCEL_THRESHOLD:
+                        reason = "LOW_ACCEL"
+                    elif accel_positive_duration < self.IMPULSE_CONFIRM_SEC:
+                        reason = "NO_IMPULSE_CONFIRM"
+                    elif displacement < displacement_threshold:
+                        reason = "LOW_DISPLACEMENT"
+                    elif ctx.get("speed_near_zero_seen", False):
+                        reason = "SPEED_REVERT"
+                    else:
+                        reason = "LOW_ACCEL"
+                ctx["regime_decision_ts"] = now
+                self._log(
+                    "🎚️ REGIME_DECISION | "
+                    f"secid={secid} | mode={ctx['trade_mode']} | reason={reason}"
+                )
 
         # ----------------------------------
         # 1️⃣ LEG DOMINANCE EXIT
@@ -354,6 +410,16 @@ class InstitutionalDecisionEngine:
                     loser_ctx = self.trade_ctx.get(loser, {})
                     loser_phase = loser_ctx.get("trade_phase", "PROBE")
                     loser_accel = self.accel_state.get(loser, {}).get("acceleration_score", 0.0)
+                    loser_mode = loser_ctx.get("trade_mode")
+                    if loser_mode == "TREND" and loser_accel >= 0:
+                        self._log(
+                            f"🏛️ TREND_HOLD | {index} | skip LEG_DOMINANCE | "
+                            f"secid={loser} | accel={loser_accel:.4f}"
+                        )
+                        self._log(
+                            "🧯 IMPULSE_EXIT_BLOCKED | reason=ACCELERATION_ACTIVE"
+                        )
+                        return
                     if loser_phase == "IMPULSE" and loser_accel >= 0:
                         self._log(
                             f"🏛️ IMPULSE_HOLD | {index} | skip LEG_DOMINANCE | "
@@ -396,6 +462,14 @@ class InstitutionalDecisionEngine:
         # ----------------------------------
         age = now - ctx["ts"]
         if age >= self.MAX_HOLD_SEC:
+            if ctx.get("trade_mode") == "TREND" and acceleration_score >= 0:
+                self._log(
+                    f"🏛️ TREND_HOLD | {tag} | skip TIME_EXIT | accel={acceleration_score:.4f}"
+                )
+                self._log(
+                    "🧯 IMPULSE_EXIT_BLOCKED | reason=ACCELERATION_ACTIVE"
+                )
+                return
             if ctx["trade_phase"] == "IMPULSE" and acceleration_score >= 0:
                 self._log(
                     f"🏛️ IMPULSE_HOLD | {tag} | skip TIME_EXIT | accel={acceleration_score:.4f}"
@@ -427,8 +501,6 @@ class InstitutionalDecisionEngine:
                 for i in range(len(recent_speeds) - 1)
             )
         )
-        min_speed_threshold = ctx["entry"] * self.MIN_SPEED_THRESHOLD_PCT
-        speed_near_zero = abs(speed) <= min_speed_threshold
         if len(self.pnl_track[secid]) >= 2:
             window_growth = pnl - self.pnl_track[secid][0][1]
         else:
@@ -439,12 +511,37 @@ class InstitutionalDecisionEngine:
             and (speed_near_zero or speed_declining)
             and extension_failed
         )
+        trend_exit_gate = (
+            self.accel_state[secid]["negative_ticks"] >= self.DECAY_TICKS
+            and (speed_near_zero or speed_declining or extension_failed)
+        )
+        if ctx.get("trade_mode") == "TREND" and trend_exit_gate:
+            ctx["trade_phase"] = "EXHAUSTION"
+            self._log(
+                f"📉 LOSS_OF_ACCELERATION | secid={secid} | accel={acceleration_score:.4f} | speed={speed:.4f}"
+            )
+            self._log(
+                "🏁 SMART_EXIT | "
+                f"secid={secid} | reason=LOSS_OF_ACCELERATION"
+            )
+            self._log(
+                f"🏁 EXHAUSTION_EXIT | {tag} | pnl={pnl:.2f} | accel={acceleration_score:.4f}"
+            )
+            self._log(f"🧾 EXIT_ATTRIBUTION | TREND_HOLD | {tag}")
+            exit_ltp = ctx.get("last_ltp", ltp)
+            paper_trader.on_exit(secid, exit_ltp, reason="EXHAUSTION")
+            momentum_engine.active_trade.pop(secid, None)
+            self.index_legs[index].discard(secid)
+            return
         if (
             pnl > ctx["entry"] * self.EXHAUSTION_PROFIT_LOCK
             and peak_acceleration > 0
             and accel_exit_gate
         ):
             ctx["trade_phase"] = "EXHAUSTION"
+            self._log(
+                f"📉 LOSS_OF_ACCELERATION | secid={secid} | accel={acceleration_score:.4f} | speed={speed:.4f}"
+            )
             self._log(
                 "🏁 SMART_EXIT | "
                 f"secid={secid} | reason=LOSS_OF_ACCELERATION"
