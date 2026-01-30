@@ -267,6 +267,65 @@ class InstitutionalDecisionEngine:
             return False
         return True
 
+    def _update_continuation_state(self, ctx, struct, ltp: float, now: float, tag: str) -> bool:
+        if not struct:
+            ctx["stalled_duration"] = now - ctx.get("last_progress_ts", ctx["ts"])
+            return False
+        side = ctx["side"]
+        entry_ts = ctx["ts"]
+        new_extreme = False
+        if side == "LONG":
+            last_high = struct.get("last_high")
+            if last_high and last_high["ts"] >= entry_ts:
+                threshold = max(ctx.get("extreme_price_since_entry", ctx["entry"]), last_high["price"])
+                if ltp > threshold:
+                    new_extreme = True
+        else:
+            last_low = struct.get("last_low")
+            if last_low and last_low["ts"] >= entry_ts:
+                threshold = min(ctx.get("extreme_price_since_entry", ctx["entry"]), last_low["price"])
+                if ltp < threshold:
+                    new_extreme = True
+
+        if new_extreme:
+            ctx["extreme_price_since_entry"] = ltp
+            ctx["last_progress_ts"] = now
+            ctx["continuation_resets_count"] = ctx.get("continuation_resets_count", 0) + 1
+            ctx["stalled_duration"] = 0.0
+            if not ctx.get("continuation_confirm_logged"):
+                self._log(
+                    f"🧭 CONTINUATION_CONFIRMED | symbol={tag} | direction={side} | "
+                    f"new_extreme={ltp:.2f} | hold_extended=true"
+                )
+                ctx["continuation_confirm_logged"] = True
+            return True
+
+        ctx["stalled_duration"] = now - ctx.get("last_progress_ts", ctx["ts"])
+        return False
+
+    def _log_final_exit(self, ctx, tag: str, exit_ltp: float, now: float, reason: str, paper_trader) -> None:
+        pnl_value = 0.0
+        pos = paper_trader.positions.get(ctx["secid"]) if hasattr(paper_trader, "positions") else None
+        if pos:
+            entry = pos.get("entry", ctx["entry"])
+            qty = pos.get("qty", 1)
+            if ctx["side"] == "LONG":
+                pnl_value = (exit_ltp - entry) * qty
+            else:
+                pnl_value = (entry - exit_ltp) * qty
+        hold_sec = int(now - ctx["ts"])
+        if reason == "STRUCTURAL_TURN":
+            exit_reason = "STRUCT_BREAK"
+        elif reason == "TIME_EXIT":
+            exit_reason = "TIME_EXIT"
+        else:
+            exit_reason = reason or "OTHER"
+        self._log(
+            f"🔴 EXIT | symbol={tag} | PnL=₹{pnl_value:.2f} | Hold={hold_sec}s | "
+            f"continuation_resets={ctx.get('continuation_resets_count', 0)} | "
+            f"exit_reason={exit_reason}"
+        )
+
     def _hold_limits(self, struct_state, churn_tighten):
         if struct_state == "SIDEWAYS":
             min_hold, max_hold = 30, 60
@@ -424,6 +483,7 @@ class InstitutionalDecisionEngine:
 
             self.trade_ctx[secid] = {
                 "index": index,
+                "tag": tag,
                 "side": trade["side"],
                 "secid": secid,
                 "type": trade.get("type", "UNKNOWN"),
@@ -441,6 +501,12 @@ class InstitutionalDecisionEngine:
                 "last_trend_extreme_ts": trade["ts"],
                 "no_progress_ticks": 0,
                 "accel_flip_ts": None,
+                "extreme_price_since_entry": trade["entry"],
+                "continuation_resets_count": 0,
+                "last_progress_ts": trade["ts"],
+                "stalled_duration": 0.0,
+                "continuation_confirm_logged": False,
+                "time_exit_blocked_logged": False,
             }
 
             self.index_legs[index].add(secid)
@@ -612,6 +678,7 @@ class InstitutionalDecisionEngine:
                 self.last_turn_log[secid] = True
             self._log(f"🚪 EXIT_TURN | {tag} | reason=STRUCTURAL_TURN")
             exit_ltp = ctx.get("last_ltp", ltp)
+            self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
             paper_trader.on_exit(secid, exit_ltp, reason="STRUCTURAL_TURN")
             momentum_engine.active_trade.pop(secid, None)
             self._finalize_exit(secid, index, now)
@@ -675,6 +742,14 @@ class InstitutionalDecisionEngine:
                     if now - self.last_action_ts.get(loser, 0) > self.COOLDOWN_SEC:
                         self._log(f"🚪 EXIT_TURN | {index} | reason=STRUCTURAL_TURN")
                         loser_ltp = loser_ctx.get("last_ltp", ltp)
+                        self._log_final_exit(
+                            loser_ctx,
+                            loser_ctx.get("tag", index),
+                            loser_ltp,
+                            now,
+                            "STRUCTURAL_TURN",
+                            paper_trader,
+                        )
                         paper_trader.on_exit(loser, loser_ltp, reason="STRUCTURAL_TURN")
                         momentum_engine.active_trade.pop(loser, None)
                         self._finalize_exit(loser, index, now)
@@ -703,11 +778,31 @@ class InstitutionalDecisionEngine:
         min_hold, max_hold = self._hold_limits(struct_state, churn_tighten)
         if age < min_hold:
             return
-        if age >= max_hold and self._time_exit_allowed(ctx, struct_state, speed_near_zero):
+        continuation_reset = self._update_continuation_state(ctx, struct, ltp, now, tag)
+        compression_ok = bool(struct and struct.get("compression", False))
+        accel_expanding = acceleration_score > 0
+        stalled_duration = ctx.get("stalled_duration", now - ctx["ts"])
+        continuation_clear = (not continuation_reset) and stalled_duration >= max_hold
+        base_time_exit = self._time_exit_allowed(ctx, struct_state, speed_near_zero)
+        time_exit_ok = (
+            base_time_exit
+            and compression_ok
+            and not accel_expanding
+            and continuation_clear
+        )
+        if age >= max_hold and base_time_exit and not continuation_clear:
+            if not ctx.get("time_exit_blocked_logged"):
+                self._log(
+                    f"🛑 TIME_EXIT_BLOCKED | symbol={tag} | reason=STRUCTURAL_PROGRESS | "
+                    f"resets={ctx.get('continuation_resets_count', 0)}"
+                )
+                ctx["time_exit_blocked_logged"] = True
+        if age >= max_hold and time_exit_ok:
             self._log(
                 f"⏱️ EXIT_TIME | {tag} | age={int(age)}s | state={struct_state}"
             )
             exit_ltp = ctx.get("last_ltp", ltp)
+            self._log_final_exit(ctx, tag, exit_ltp, now, "TIME_EXIT", paper_trader)
             paper_trader.on_exit(secid, exit_ltp, reason="TIME_EXIT")
             momentum_engine.active_trade.pop(secid, None)
             self._finalize_exit(secid, index, now)
@@ -751,6 +846,7 @@ class InstitutionalDecisionEngine:
             if turn_confirmed:
                 self._log(f"🚪 EXIT_TURN | {tag} | reason=STRUCTURAL_TURN")
                 exit_ltp = ctx.get("last_ltp", ltp)
+                self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
                 paper_trader.on_exit(secid, exit_ltp, reason="STRUCTURAL_TURN")
                 momentum_engine.active_trade.pop(secid, None)
                 self._finalize_exit(secid, index, now)
@@ -770,6 +866,7 @@ class InstitutionalDecisionEngine:
             if turn_confirmed:
                 self._log(f"🚪 EXIT_TURN | {tag} | reason=STRUCTURAL_TURN")
                 exit_ltp = ctx.get("last_ltp", ltp)
+                self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
                 paper_trader.on_exit(secid, exit_ltp, reason="STRUCTURAL_TURN")
                 momentum_engine.active_trade.pop(secid, None)
                 self._finalize_exit(secid, index, now)
