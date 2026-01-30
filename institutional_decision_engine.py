@@ -37,6 +37,7 @@ class InstitutionalDecisionEngine:
 
     def __init__(self, debug=True):
         self.debug = debug
+        self.debug_metrics = False
 
         # secid → trade meta
         self.trade_ctx = {}
@@ -127,9 +128,10 @@ class InstitutionalDecisionEngine:
             if now - x[0] <= self.DOMINANCE_WINDOW_SEC
         ]
 
-        self._log(
-            f"⚙️ SPEED_TRACK | secid={secid} | speed={speed:.4f}"
-        )
+        if self.debug_metrics:
+            self._log(
+                f"⚙️ SPEED_TRACK | secid={secid} | speed={speed:.4f}"
+            )
         return speed
 
     # --------------------------------------------------
@@ -190,21 +192,23 @@ class InstitutionalDecisionEngine:
                         decision = "CANCEL_ENTRY"
                         reason = "PROBE_NOT_DISPLACED"
 
-            self._log(
-                "🧭 ENTRY_TRACE | "
-                f"secid={secid} | tag={tag} | signal={signal} | ltp={ltp:.2f} | "
-                f"active_trade={active_trade_present} | legs={legs_count} | "
-                f"probe.active={probe['active']} | probe.last_exit_ts={probe['last_exit_ts']:.2f} | "
-                f"probe.last_entry_price={probe['last_entry_price']:.2f} | "
-                f"probe.dominance_resolved={probe['dominance_resolved']} | "
-                f"in_cooldown={in_cooldown} | displaced={displaced} | "
-                f"decision={decision}{f' | reason={reason}' if reason else ''}"
-            )
+            if self.debug_metrics:
+                self._log(
+                    "🧭 ENTRY_TRACE | "
+                    f"secid={secid} | tag={tag} | signal={signal} | ltp={ltp:.2f} | "
+                    f"active_trade={active_trade_present} | legs={legs_count} | "
+                    f"probe.active={probe['active']} | probe.last_exit_ts={probe['last_exit_ts']:.2f} | "
+                    f"probe.last_entry_price={probe['last_entry_price']:.2f} | "
+                    f"probe.dominance_resolved={probe['dominance_resolved']} | "
+                    f"in_cooldown={in_cooldown} | displaced={displaced} | "
+                    f"decision={decision}{f' | reason={reason}' if reason else ''}"
+                )
 
             if decision == "CANCEL_ENTRY":
-                self._log(
-                    f"🏛️ ENTRY_CANCELLED | {tag} | reason={reason}"
-                )
+                if self.debug_metrics:
+                    self._log(
+                        f"🏛️ ENTRY_CANCELLED | {tag} | reason={reason}"
+                    )
                 momentum_engine.active_trade.pop(secid, None)
                 return
 
@@ -304,9 +308,10 @@ class InstitutionalDecisionEngine:
             self.accel_state[secid]["negative_ticks"] = 0
 
         if prev_accel >= 0 and acceleration_score < 0:
-            self._log(
-                f"📉 ACCELERATION_DECAY | secid={secid} | accel={acceleration_score:.4f}"
-            )
+            if self.debug_metrics:
+                self._log(
+                    f"📉 ACCELERATION_DECAY | secid={secid} | accel={acceleration_score:.4f}"
+                )
 
         min_speed_threshold = ctx["entry"] * self.MIN_SPEED_THRESHOLD_PCT
         speed_near_zero = abs(speed) <= min_speed_threshold
@@ -321,10 +326,11 @@ class InstitutionalDecisionEngine:
                     ctx["impulse_confirm_start"] = ctx["accel_start_ts"]
                 if now - ctx["accel_start_ts"] >= self.IMPULSE_CONFIRM_SEC:
                     ctx["trade_phase"] = "IMPULSE"
-                    self._log(
-                        f"🏁 IMPULSE_CONFIRMED | secid={secid} | accel={acceleration_score:.4f} | "
-                        f"duration={now - ctx['accel_start_ts']:.2f}s"
-                    )
+                    if self.debug_metrics:
+                        self._log(
+                            f"🏁 IMPULSE_CONFIRMED | secid={secid} | accel={acceleration_score:.4f} | "
+                            f"duration={now - ctx['accel_start_ts']:.2f}s"
+                        )
             else:
                 ctx["accel_start_ts"] = None
                 ctx["impulse_confirm_start"] = None
@@ -454,7 +460,8 @@ class InstitutionalDecisionEngine:
                 state = "EXPANSION"
                 msg = f"🏛️ EXPANSION | {index} | directional bias forming"
             if self.last_market_state.get(index) != state:
-                self._log(msg)
+                if self.debug_metrics:
+                    self._log(msg)
                 self.last_market_state[index] = state
 
         # ----------------------------------
@@ -517,9 +524,10 @@ class InstitutionalDecisionEngine:
         )
         if ctx.get("trade_mode") == "TREND" and trend_exit_gate:
             ctx["trade_phase"] = "EXHAUSTION"
-            self._log(
-                f"📉 LOSS_OF_ACCELERATION | secid={secid} | accel={acceleration_score:.4f} | speed={speed:.4f}"
-            )
+            if self.debug_metrics:
+                self._log(
+                    f"📉 LOSS_OF_ACCELERATION | secid={secid} | accel={acceleration_score:.4f} | speed={speed:.4f}"
+                )
             self._log(
                 "🏁 SMART_EXIT | "
                 f"secid={secid} | reason=LOSS_OF_ACCELERATION"
@@ -539,9 +547,10 @@ class InstitutionalDecisionEngine:
             and accel_exit_gate
         ):
             ctx["trade_phase"] = "EXHAUSTION"
-            self._log(
-                f"📉 LOSS_OF_ACCELERATION | secid={secid} | accel={acceleration_score:.4f} | speed={speed:.4f}"
-            )
+            if self.debug_metrics:
+                self._log(
+                    f"📉 LOSS_OF_ACCELERATION | secid={secid} | accel={acceleration_score:.4f} | speed={speed:.4f}"
+                )
             self._log(
                 "🏁 SMART_EXIT | "
                 f"secid={secid} | reason=LOSS_OF_ACCELERATION"
