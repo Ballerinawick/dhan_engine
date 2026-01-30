@@ -58,6 +58,8 @@ class PaperTradeManager:
         self.total_fees = 0.0
         self.fee_drag_per_trade = 0.0
         self.fee_per_trade = float(self.FEE_PER_TRADE)
+        self.open_positions_dirty = False
+        self.recent_trade_pnls = []
 
         # Daily counters
         self.current_day = datetime.now().date()
@@ -156,6 +158,7 @@ class PaperTradeManager:
         }
 
         self.max_concurrent_open = max(self.max_concurrent_open, len(self.positions))
+        self.open_positions_dirty = True
 
         print(
             f"🟢 ENTRY | {tag} | {side} | "
@@ -196,6 +199,11 @@ class PaperTradeManager:
 
         order_fees = self._calculate_order_fees(qty * ltp)
         self.total_fees += order_fees
+        self.open_positions_dirty = True
+
+        self.recent_trade_pnls.append(pnl)
+        if len(self.recent_trade_pnls) > 10:
+            self.recent_trade_pnls = self.recent_trade_pnls[-10:]
 
         print(
             f"🔴 EXIT | {pos['tag']} | "
@@ -205,6 +213,19 @@ class PaperTradeManager:
             f"Hold:{self._fmt_duration(hold_sec)} | "
             f"Reason:{reason}"
         )
+        if self.exits_total % 10 == 0 and self.recent_trade_pnls:
+            avg_pnl = sum(self.recent_trade_pnls) / len(self.recent_trade_pnls)
+            fees_per_trade = self.fee_per_trade * 2
+            net_after_fees = avg_pnl - fees_per_trade
+            verdict = "OK" if net_after_fees >= 0 else "WARNING"
+            print(
+                "🧮 CHURN_HEALTH | "
+                f"Trades:{len(self.recent_trade_pnls)} | "
+                f"AvgPnLPerTrade:₹{avg_pnl:+.2f} | "
+                f"FeesPerTrade:₹{fees_per_trade:.2f} | "
+                f"NetAfterFees:₹{net_after_fees:+.2f} | "
+                f"Verdict:{verdict}"
+            )
 
     # --------------------------------------------------
     # TICK UPDATE (NO PER-SYMBOL LOG)
@@ -240,7 +261,7 @@ class PaperTradeManager:
                 unrealized += (entry - ltp) * qty
 
         net_pnl = self.realized_pnl + unrealized
-        fees_paid = self.exits_total * self.fee_per_trade
+        fees_paid = (self.entries_total + self.exits_total) * self.fee_per_trade
         net_pnl_after_fees = net_pnl - fees_paid
         avg_hold_seconds = (
             self.total_hold_seconds / self.exits_total if self.exits_total else 0.0
@@ -263,13 +284,13 @@ class PaperTradeManager:
             f"ExitsTaken:{self.exits_total} | "
             f"OpenedToday:{self.opened_today} | "
             f"ClosedToday:{self.closed_today} | "
-            f"FeesPaid:₹{fees_paid:.2f} | "
-            f"NetPnL_AfterFees:₹{net_pnl_after_fees:+.2f} | "
             f"AvgHoldTime:{avg_hold_seconds:.1f}s | "
-            f"ChurnRatio:{churn_ratio:.2f}"
+            f"ChurnRatio:{churn_ratio:.2f} | "
+            f"FeesPaid:₹{fees_paid:.2f} | "
+            f"NetPnL_AfterFees:₹{net_pnl_after_fees:+.2f}"
         )
 
-        if not self.positions:
+        if not self.positions or not self.open_positions_dirty:
             return
 
         print("📌 OPEN POSITIONS:")
@@ -284,3 +305,7 @@ class PaperTradeManager:
                 f"Hold:{hold} | "
                 f"PnL:{pnl:+.2f}"
             )
+        self.open_positions_dirty = False
+
+    def note_regime_change(self, secid, tag, mode, reason):
+        self.open_positions_dirty = True
