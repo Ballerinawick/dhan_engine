@@ -161,7 +161,7 @@ class PaperTradeManager:
         self.open_positions_dirty = True
 
         print(
-            f"🟢 ENTRY | {tag} | {side} | "
+            f"✅ ENTRY_COMMITTED | {tag} | {side} | "
             f"Lots:{lots} | Qty:{qty} | Entry:{ltp:.2f} | Reason:{reason}"
         )
 
@@ -205,27 +205,16 @@ class PaperTradeManager:
         if len(self.recent_trade_pnls) > 10:
             self.recent_trade_pnls = self.recent_trade_pnls[-10:]
 
+        exit_tag = "EXIT_TIME" if "TIME" in reason.upper() else "EXIT_TURN"
+        icon = "⏱️" if exit_tag == "EXIT_TIME" else "🚪"
         print(
-            f"🔴 EXIT | {pos['tag']} | "
+            f"{icon} {exit_tag} | {pos['tag']} | "
             f"Lots:{pos['lots']} | "
             f"Exit:{ltp:.2f} | "
             f"PnL:{pnl:+.2f} | "
             f"Hold:{self._fmt_duration(hold_sec)} | "
             f"Reason:{reason}"
         )
-        if self.exits_total % 10 == 0 and self.recent_trade_pnls:
-            avg_pnl = sum(self.recent_trade_pnls) / len(self.recent_trade_pnls)
-            fees_per_trade = self.fee_per_trade * 2
-            net_after_fees = avg_pnl - fees_per_trade
-            verdict = "OK" if net_after_fees >= 0 else "WARNING"
-            print(
-                "🧮 CHURN_HEALTH | "
-                f"Trades:{len(self.recent_trade_pnls)} | "
-                f"AvgPnLPerTrade:₹{avg_pnl:+.2f} | "
-                f"FeesPerTrade:₹{fees_per_trade:.2f} | "
-                f"NetAfterFees:₹{net_after_fees:+.2f} | "
-                f"Verdict:{verdict}"
-            )
 
     # --------------------------------------------------
     # TICK UPDATE (NO PER-SYMBOL LOG)
@@ -292,19 +281,6 @@ class PaperTradeManager:
 
         if not self.positions or not self.open_positions_dirty:
             return
-
-        print("📌 OPEN POSITIONS:")
-        for p in self.positions.values():
-            hold = self._fmt_duration(now - p["entry_ts"])
-            pnl = (p["ltp"] - p["entry"]) * p["qty"]
-
-            print(
-                f"  - {p['tag']} | "
-                f"Entry:{p['entry']:.2f} | "
-                f"LTP:{p['ltp']:.2f} | "
-                f"Hold:{hold} | "
-                f"PnL:{pnl:+.2f}"
-            )
         self.open_positions_dirty = False
 
     def note_regime_change(self, secid, tag, mode, reason):

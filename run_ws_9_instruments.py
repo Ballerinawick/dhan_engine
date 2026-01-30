@@ -108,7 +108,7 @@ def main():
             # --------------------------------------------------
             # 2️⃣ Institutional governance (NEW)
             # --------------------------------------------------
-            decision_engine.on_signal(
+            decision = decision_engine.on_signal(
                 secid=secid,
                 tag=tag,
                 ltp=raw["ltp"],
@@ -140,7 +140,11 @@ def main():
                         )
 
             elif action == "EXIT":
+                if decision and decision.get("exit_allowed") is False:
+                    return
                 reason = momentum_engine.last_exit_reason.get(secid, action)
+                if decision and decision.get("exit_reason"):
+                    reason = decision["exit_reason"]
                 try:
                     paper_trader.on_exit(secid, raw["ltp"], reason=reason)
                 except TypeError:
