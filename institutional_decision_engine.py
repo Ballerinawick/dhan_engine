@@ -44,6 +44,9 @@ class InstitutionalDecisionEngine:
     TURN_ACCEL_CONFIRM_SEC = 3            # accel flip confirmation window
     TURN_DISPLACEMENT_PCT = 0.12          # displacement to confirm turn
     TURN_STRICT_MULTIPLIER = 1.35         # tighten turn confirmation under churn
+    CHURN_LOSS_WINDOW_SEC = 45            # rapid loss window for churn guard
+    CHURN_COOLDOWN_SEC = 20               # cooldown after repeated losses
+    CONTINUATION_RECENT_SEC = 12          # recent continuation window for time exits
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -72,12 +75,20 @@ class InstitutionalDecisionEngine:
             "negative_ticks": 0,
             "time_above_zero_accel": 0.0,
             "last_accel_ts": 0.0,
+            "accel_history": deque(maxlen=3),
         })
 
         self.last_action_ts = {}
         self.last_market_state = {}
         self.price_track = defaultdict(deque)
         self.last_turn_log = {}
+        self.entry_churn_state = defaultdict(lambda: {
+            "loss_count": 0,
+            "last_loss_ts": 0.0,
+            "cooldown_until": 0.0,
+            "side": None,
+            "last_regime_state": None,
+        })
         # per-index probe governance state (cooldown + displacement guard)
         self.probe_state = defaultdict(lambda: {
             "active": False,
@@ -260,6 +271,13 @@ class InstitutionalDecisionEngine:
         )
         return turn, reason
 
+    def _accel_state_label(self, accel_history):
+        if len(accel_history) < 2:
+            return "PEAKED"
+        if accel_history[-2] > accel_history[-1]:
+            return "DECAYING"
+        return "PEAKED"
+
     def _time_exit_allowed(self, ctx, struct_state, speed_near_zero):
         if struct_state != "SIDEWAYS":
             return False
@@ -292,12 +310,6 @@ class InstitutionalDecisionEngine:
             ctx["last_progress_ts"] = now
             ctx["continuation_resets_count"] = ctx.get("continuation_resets_count", 0) + 1
             ctx["stalled_duration"] = 0.0
-            if not ctx.get("continuation_confirm_logged"):
-                self._log(
-                    f"🧭 CONTINUATION_CONFIRMED | symbol={tag} | direction={side} | "
-                    f"new_extreme={ltp:.2f} | hold_extended=true"
-                )
-                ctx["continuation_confirm_logged"] = True
             return True
 
         ctx["stalled_duration"] = now - ctx.get("last_progress_ts", ctx["ts"])
@@ -315,19 +327,41 @@ class InstitutionalDecisionEngine:
                 pnl_value = (entry - exit_ltp) * qty
         hold_sec = int(now - ctx["ts"])
         if reason == "STRUCTURAL_TURN":
-            exit_reason = "STRUCT_BREAK"
+            exit_type = "TURN"
         elif reason == "TIME_EXIT":
-            exit_reason = "TIME_EXIT"
+            exit_type = "TIME"
         else:
-            exit_reason = reason or "OTHER"
+            exit_type = "FAILSAFE"
+        accel_history = self.accel_state.get(ctx["secid"], {}).get("accel_history", [])
+        accel_state = self._accel_state_label(accel_history)
         self._log(
-            f"🔴 EXIT | symbol={tag} | PnL=₹{pnl_value:.2f} | Hold={hold_sec}s | "
-            f"continuation_resets={ctx.get('continuation_resets_count', 0)} | "
-            f"exit_reason={exit_reason}"
+            f"🧭 EXIT_STEERING_DECISION | symbol={tag} | exit_type={exit_type} | "
+            f"accel_state_at_exit={accel_state} | hold_duration={hold_sec}s"
         )
 
-    def _hold_limits(self, struct_state, churn_tighten):
-        if struct_state == "SIDEWAYS":
+        if pnl_value < 0:
+            churn = self.entry_churn_state[tag]
+            rapid = now - churn.get("last_loss_ts", 0.0) <= self.CHURN_LOSS_WINDOW_SEC
+            same_side = churn.get("side") == ctx.get("side")
+            if rapid and same_side:
+                churn["loss_count"] += 1
+            else:
+                churn["loss_count"] = 1
+            churn["last_loss_ts"] = now
+            churn["side"] = ctx.get("side")
+            if churn["loss_count"] >= 2:
+                churn["cooldown_until"] = now + self.CHURN_COOLDOWN_SEC
+        else:
+            churn = self.entry_churn_state[tag]
+            churn["loss_count"] = 0
+            churn["side"] = None
+
+    def _hold_limits(self, struct_state, churn_tighten, trade_mode=None):
+        if trade_mode == "TREND":
+            min_hold, max_hold = 90, 180
+        elif trade_mode == "SCALP":
+            min_hold, max_hold = 20, 60
+        elif struct_state == "SIDEWAYS":
             min_hold, max_hold = 30, 60
         elif struct_state == "TREND":
             min_hold, max_hold = 90, 180
@@ -380,6 +414,7 @@ class InstitutionalDecisionEngine:
         state["last_acceleration"] = acceleration_score
         if acceleration_score > state.get("peak_acceleration", 0.0):
             state["peak_acceleration"] = acceleration_score
+        state["accel_history"].append(acceleration_score)
 
         self.slope_track[secid].append((now, current_slope))
         self.slope_track[secid] = [
@@ -439,6 +474,7 @@ class InstitutionalDecisionEngine:
             displaced = False
             accel_state = self.accel_state.get(secid, {})
             acceleration_score = accel_state.get("acceleration_score", 0.0)
+            accel_history = accel_state.get("accel_history", [])
             if legs_count == 0:
                 in_cooldown = (
                     probe["last_exit_ts"] > 0
@@ -479,6 +515,58 @@ class InstitutionalDecisionEngine:
             if not structure_ok:
                 momentum_engine.active_trade.pop(secid, None)
                 return {"entry_allowed": False}
+            accel_gate_blocked = False
+            accel_peaked = False
+            struct = self._structure_snapshot(secid)
+            structure_intact = True
+            if struct:
+                last_high = struct.get("last_high")
+                prev_high = struct.get("prev_high")
+                last_low = struct.get("last_low")
+                prev_low = struct.get("prev_low")
+                if trade["side"] == "LONG":
+                    structure_intact = not (last_low and prev_low and last_low["price"] < prev_low["price"])
+                else:
+                    structure_intact = not (last_high and prev_high and last_high["price"] > prev_high["price"])
+            structure_expanding = bool(struct and not struct.get("compression", False) and structure_intact)
+            temp_ctx = {"entry": trade["entry"]}
+            structure_state = self._structure_state(temp_ctx, struct)
+            if len(accel_history) >= 3:
+                accel_now, accel_prev, accel_prev2 = accel_history[-1], accel_history[-2], accel_history[-3]
+                accel_peaked = accel_prev > accel_now
+                if accel_now > accel_prev and accel_prev > accel_prev2:
+                    accel_gate_blocked = True
+                if accel_peaked and structure_expanding:
+                    accel_gate_blocked = False
+
+            churn = self.entry_churn_state[tag]
+            cooldown_active = churn.get("cooldown_until", 0.0) > now
+            if cooldown_active:
+                structure_break = False
+                if struct:
+                    last_high = struct.get("last_high")
+                    prev_high = struct.get("prev_high")
+                    last_low = struct.get("last_low")
+                    prev_low = struct.get("prev_low")
+                    structure_break = (
+                        bool(last_high and prev_high and last_high["price"] > prev_high["price"])
+                        or bool(last_low and prev_low and last_low["price"] < prev_low["price"])
+                    )
+                regime_state = "COMPRESSION" if struct and struct.get("compression") else "EXPANSION"
+                if churn.get("last_regime_state") and churn["last_regime_state"] != regime_state:
+                    churn["cooldown_until"] = 0.0
+                    churn["loss_count"] = 0
+                    churn["side"] = None
+                    cooldown_active = False
+                elif structure_break:
+                    churn["cooldown_until"] = 0.0
+                    churn["loss_count"] = 0
+                    churn["side"] = None
+                    cooldown_active = False
+
+            if accel_gate_blocked or cooldown_active:
+                momentum_engine.active_trade.pop(secid, None)
+                return {"entry_allowed": False}
             impulse_candidate = acceleration_score > self.ACCELERATION_ENTRY_THRESHOLD
 
             self.trade_ctx[secid] = {
@@ -505,7 +593,6 @@ class InstitutionalDecisionEngine:
                 "continuation_resets_count": 0,
                 "last_progress_ts": trade["ts"],
                 "stalled_duration": 0.0,
-                "continuation_confirm_logged": False,
                 "time_exit_blocked_logged": False,
             }
 
@@ -521,9 +608,12 @@ class InstitutionalDecisionEngine:
                 probe["last_entry_price"] = trade["entry"]
                 probe["dominance_resolved"] = False
 
+            churn["last_regime_state"] = "COMPRESSION" if struct and struct.get("compression") else "EXPANSION"
+            accel_state_label = self._accel_state_label(accel_history)
+            entry_mode = "FLOW" if structure_state == "TREND" and accel_peaked else "SCALP"
             self._log(
-                f"✅ ENTRY_COMMITTED | {tag} | side={trade['side']} | entry={trade['entry']:.2f} | "
-                f"struct={structure_reason} | churn_tight={churn_tighten}"
+                f"🧭 ENTRY_STEERING_DECISION | symbol={tag} | accel_state={accel_state_label} | "
+                f"structure_state={structure_state} | mode={entry_mode} | reason=ACCEL_DECAY_STRUCTURE_OK"
             )
             if secid not in paper_trader.positions:
                 paper_trader.on_entry(
@@ -548,9 +638,6 @@ class InstitutionalDecisionEngine:
                 self.accel_state.get(secid, {}).get("acceleration_score", 0.0),
                 churn_tighten,
             )
-            if turn_confirmed and not self.last_turn_log.get(secid):
-                self._log(f"🔁 TURN_CONFIRMED | {tag} | {reason}")
-                self.last_turn_log[secid] = True
             if not turn_confirmed:
                 momentum_engine.active_trade[secid] = {
                     "type": ctx.get("type", "STEER"),
@@ -561,6 +648,8 @@ class InstitutionalDecisionEngine:
                 return {"exit_allowed": False}
             ctx = self.trade_ctx.get(secid)
             if ctx:
+                exit_ltp = ctx.get("last_ltp", ltp)
+                self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
                 self._finalize_exit(secid, ctx["index"], now)
             return {"exit_allowed": True, "exit_reason": "STRUCTURAL_TURN"}
 
@@ -590,6 +679,7 @@ class InstitutionalDecisionEngine:
         acceleration_score = self._update_acceleration(secid, now)
         peak_acceleration = self.accel_state[secid]["peak_acceleration"]
         accel_state = self.accel_state[secid]
+        accel_history = accel_state.get("accel_history", [])
         last_accel_ts = accel_state.get("last_accel_ts", now)
         accel_dt = max(now - last_accel_ts, 0.0)
         if acceleration_score > 0:
@@ -622,49 +712,33 @@ class InstitutionalDecisionEngine:
         # REGIME DECISION (SCALP vs TREND)
         # ----------------------------------
         if ctx.get("trade_mode") is None:
-            age_since_entry = now - ctx["ts"]
-            within_window = (
-                self.REGIME_DECISION_MIN_SEC
-                <= age_since_entry
-                <= self.REGIME_DECISION_MAX_SEC
+            accel_positive_duration = 0.0
+            if acceleration_score > 0 and ctx.get("accel_start_ts") is not None:
+                accel_positive_duration = now - ctx["accel_start_ts"]
+            displacement = abs(ltp - ctx["entry"])
+            displacement_threshold = ctx["entry"] * self.DISPLACEMENT_THRESHOLD_PCT
+            continuation_score = ctx.get("continuation_resets_count", 0)
+            regime_trend = (
+                peak_acceleration >= self.HIGH_ACCEL_THRESHOLD
+                and accel_positive_duration >= self.IMPULSE_CONFIRM_SEC
+                and displacement >= displacement_threshold
+                and continuation_score >= 2
+                and not ctx.get("speed_near_zero_seen", False)
             )
-            decision_timeout = age_since_entry > self.REGIME_DECISION_MAX_SEC
-            if within_window or decision_timeout:
-                accel_positive_duration = 0.0
-                if acceleration_score > 0 and ctx.get("accel_start_ts") is not None:
-                    accel_positive_duration = now - ctx["accel_start_ts"]
-                displacement = abs(ltp - ctx["entry"])
-                displacement_threshold = ctx["entry"] * self.DISPLACEMENT_THRESHOLD_PCT
-                regime_trend = (
-                    peak_acceleration >= self.HIGH_ACCEL_THRESHOLD
-                    and accel_positive_duration >= self.IMPULSE_CONFIRM_SEC
-                    and displacement >= displacement_threshold
-                    and not ctx.get("speed_near_zero_seen", False)
+            if regime_trend:
+                ctx["trade_mode"] = "TREND"
+                reason = "CONTINUATION_CONFIRMED"
+            else:
+                ctx["trade_mode"] = "SCALP"
+                reason = "WEAK_CONTINUATION"
+            ctx["regime_decision_ts"] = now
+            if hasattr(paper_trader, "note_regime_change"):
+                paper_trader.note_regime_change(
+                    secid=secid,
+                    tag=tag,
+                    mode=ctx["trade_mode"],
+                    reason=reason,
                 )
-                if regime_trend:
-                    ctx["trade_mode"] = "TREND"
-                    reason = "HIGH_PEAK_ACCEL"
-                else:
-                    ctx["trade_mode"] = "SCALP"
-                    if peak_acceleration < self.HIGH_ACCEL_THRESHOLD:
-                        reason = "LOW_ACCEL"
-                    elif accel_positive_duration < self.IMPULSE_CONFIRM_SEC:
-                        reason = "NO_IMPULSE_CONFIRM"
-                    elif displacement < displacement_threshold:
-                        reason = "LOW_DISPLACEMENT"
-                    elif ctx.get("speed_near_zero_seen", False):
-                        reason = "SPEED_REVERT"
-                    else:
-                        reason = "LOW_ACCEL"
-                ctx["regime_decision_ts"] = now
-                pass
-                if hasattr(paper_trader, "note_regime_change"):
-                    paper_trader.note_regime_change(
-                        secid=secid,
-                        tag=tag,
-                        mode=ctx["trade_mode"],
-                        reason=reason,
-                    )
 
         # ----------------------------------
         # 0️⃣ STRUCTURAL TURN EXIT (HIGHEST PRIORITY)
@@ -673,10 +747,6 @@ class InstitutionalDecisionEngine:
             ctx, ctx["side"], ltp, now, acceleration_score, churn_tighten
         )
         if turn_confirmed:
-            if not self.last_turn_log.get(secid):
-                self._log(f"🔁 TURN_CONFIRMED | {tag} | {turn_reason}")
-                self.last_turn_log[secid] = True
-            self._log(f"🚪 EXIT_TURN | {tag} | reason=STRUCTURAL_TURN")
             exit_ltp = ctx.get("last_ltp", ltp)
             self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
             paper_trader.on_exit(secid, exit_ltp, reason="STRUCTURAL_TURN")
@@ -734,13 +804,9 @@ class InstitutionalDecisionEngine:
                         loser_accel,
                         churn_tighten,
                     )
-                    if turn_confirmed and not self.last_turn_log.get(loser):
-                        self._log(f"🔁 TURN_CONFIRMED | {index} | {reason}")
-                        self.last_turn_log[loser] = True
                     if not turn_confirmed:
                         return
                     if now - self.last_action_ts.get(loser, 0) > self.COOLDOWN_SEC:
-                        self._log(f"🚪 EXIT_TURN | {index} | reason=STRUCTURAL_TURN")
                         loser_ltp = loser_ctx.get("last_ltp", ltp)
                         self._log_final_exit(
                             loser_ctx,
@@ -775,32 +841,60 @@ class InstitutionalDecisionEngine:
         age = now - ctx["ts"]
         struct = self._structure_snapshot(secid)
         struct_state = self._structure_state(ctx, struct)
-        min_hold, max_hold = self._hold_limits(struct_state, churn_tighten)
+        min_hold, max_hold = self._hold_limits(struct_state, churn_tighten, ctx.get("trade_mode"))
         if age < min_hold:
             return
         continuation_reset = self._update_continuation_state(ctx, struct, ltp, now, tag)
+        if (
+            continuation_reset
+            and ctx.get("trade_mode") == "SCALP"
+            and struct_state == "TREND"
+            and ctx.get("continuation_resets_count", 0) >= 2
+        ):
+            previous_mode = ctx.get("trade_mode")
+            ctx["trade_mode"] = "TREND"
+            if hasattr(paper_trader, "note_regime_change"):
+                paper_trader.note_regime_change(
+                    secid=secid,
+                    tag=tag,
+                    mode=ctx["trade_mode"],
+                    reason="STRUCTURE_CONTINUATION",
+                )
+            from_label = "FLOW" if previous_mode == "TREND" else "SCALP"
+            to_label = "FLOW" if ctx["trade_mode"] == "TREND" else "SCALP"
+            self._log(
+                f"🧭 HOLD_MODE_SWITCH | symbol={tag} | from={from_label} | to={to_label} | "
+                f"cause=CONTINUATION"
+            )
         compression_ok = bool(struct and struct.get("compression", False))
         accel_expanding = acceleration_score > 0
         stalled_duration = ctx.get("stalled_duration", now - ctx["ts"])
         continuation_clear = (not continuation_reset) and stalled_duration >= max_hold
+        accel_decay_confirmed = accel_state.get("negative_ticks", 0) >= self.DECAY_TICKS
+        no_recent_continuation = (now - ctx.get("last_progress_ts", ctx["ts"])) >= self.CONTINUATION_RECENT_SEC
         base_time_exit = self._time_exit_allowed(ctx, struct_state, speed_near_zero)
         time_exit_ok = (
             base_time_exit
             and compression_ok
             and not accel_expanding
             and continuation_clear
+            and accel_decay_confirmed
+            and no_recent_continuation
         )
-        if age >= max_hold and base_time_exit and not continuation_clear:
-            if not ctx.get("time_exit_blocked_logged"):
-                self._log(
-                    f"🛑 TIME_EXIT_BLOCKED | symbol={tag} | reason=STRUCTURAL_PROGRESS | "
-                    f"resets={ctx.get('continuation_resets_count', 0)}"
-                )
-                ctx["time_exit_blocked_logged"] = True
+        accel_flip = False
+        if len(accel_history) >= 2:
+            accel_flip = accel_history[-2] > 0 >= accel_history[-1] or accel_history[-2] < 0 <= accel_history[-1]
+        structure_stall = stalled_duration >= self.TURN_FAIL_SEC or ctx.get("no_progress_ticks", 0) >= self.TURN_FAIL_BARS
+        compression_after_expansion = bool(struct and struct.get("compression", False) and ctx.get("continuation_resets_count", 0) > 0)
+        exit_turn_signal = accel_flip or structure_stall or compression_after_expansion
+        if exit_turn_signal:
+            exit_ltp = ctx.get("last_ltp", ltp)
+            self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
+            paper_trader.on_exit(secid, exit_ltp, reason="STRUCTURAL_TURN")
+            momentum_engine.active_trade.pop(secid, None)
+            self._finalize_exit(secid, index, now)
+            return
         if age >= max_hold and time_exit_ok:
-            self._log(
-                f"⏱️ EXIT_TIME | {tag} | age={int(age)}s | state={struct_state}"
-            )
             exit_ltp = ctx.get("last_ltp", ltp)
             self._log_final_exit(ctx, tag, exit_ltp, now, "TIME_EXIT", paper_trader)
             paper_trader.on_exit(secid, exit_ltp, reason="TIME_EXIT")
@@ -840,11 +934,7 @@ class InstitutionalDecisionEngine:
             turn_confirmed, reason = self._turn_confirmed(
                 ctx, ctx["side"], ltp, now, acceleration_score, churn_tighten
             )
-            if turn_confirmed and not self.last_turn_log.get(secid):
-                self._log(f"🔁 TURN_CONFIRMED | {tag} | {reason}")
-                self.last_turn_log[secid] = True
             if turn_confirmed:
-                self._log(f"🚪 EXIT_TURN | {tag} | reason=STRUCTURAL_TURN")
                 exit_ltp = ctx.get("last_ltp", ltp)
                 self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
                 paper_trader.on_exit(secid, exit_ltp, reason="STRUCTURAL_TURN")
@@ -860,11 +950,7 @@ class InstitutionalDecisionEngine:
             turn_confirmed, reason = self._turn_confirmed(
                 ctx, ctx["side"], ltp, now, acceleration_score, churn_tighten
             )
-            if turn_confirmed and not self.last_turn_log.get(secid):
-                self._log(f"🔁 TURN_CONFIRMED | {tag} | {reason}")
-                self.last_turn_log[secid] = True
             if turn_confirmed:
-                self._log(f"🚪 EXIT_TURN | {tag} | reason=STRUCTURAL_TURN")
                 exit_ltp = ctx.get("last_ltp", ltp)
                 self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
                 paper_trader.on_exit(secid, exit_ltp, reason="STRUCTURAL_TURN")
