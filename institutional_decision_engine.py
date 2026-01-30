@@ -315,7 +315,22 @@ class InstitutionalDecisionEngine:
         ctx["stalled_duration"] = now - ctx.get("last_progress_ts", ctx["ts"])
         return False
 
-    def _log_final_exit(self, ctx, tag: str, exit_ltp: float, now: float, reason: str, paper_trader) -> None:
+    def _log_final_exit(
+        self,
+        ctx,
+        tag: str,
+        exit_ltp: float,
+        now: float,
+        reason: str,
+        paper_trader,
+        *,
+        churn_tighten: bool = False,
+        turn_armed=None,
+        accel_now=None,
+        accel_prev=None,
+        stalled_duration=None,
+        age=None,
+    ) -> None:
         pnl_value = 0.0
         pos = paper_trader.positions.get(ctx["secid"]) if hasattr(paper_trader, "positions") else None
         if pos:
@@ -326,6 +341,8 @@ class InstitutionalDecisionEngine:
             else:
                 pnl_value = (entry - exit_ltp) * qty
         hold_sec = int(now - ctx["ts"])
+        if age is None:
+            age = now - ctx["ts"]
         if reason == "STRUCTURAL_TURN":
             exit_type = "TURN"
         elif reason == "TIME_EXIT":
@@ -334,8 +351,23 @@ class InstitutionalDecisionEngine:
             exit_type = "FAILSAFE"
         accel_history = self.accel_state.get(ctx["secid"], {}).get("accel_history", [])
         accel_state = self._accel_state_label(accel_history)
+        if accel_now is None:
+            accel_now = accel_history[-1] if accel_history else 0.0
+        if accel_prev is None:
+            accel_prev = accel_history[-2] if len(accel_history) >= 2 else 0.0
+        if stalled_duration is None:
+            stalled_duration = ctx.get("stalled_duration", now - ctx["ts"])
+        trade_mode = ctx.get("trade_mode")
+        if turn_armed is None:
+            struct = self._structure_snapshot(ctx["secid"])
+            struct_state = self._structure_state(ctx, struct)
+            _, max_hold = self._hold_limits(struct_state, churn_tighten, trade_mode)
+            turn_armed = age >= self._turn_arm_delay(trade_mode, max_hold)
         self._log(
             f"🧭 EXIT_STEERING_DECISION | symbol={tag} | exit_type={exit_type} | "
+            f"trade_mode={trade_mode} | age={int(age)}s | turn_armed={bool(turn_armed)} | "
+            f"accel_now={accel_now:.5f} | accel_prev={accel_prev:.5f} | "
+            f"stalled_duration={stalled_duration:.1f}s | "
             f"accel_state_at_exit={accel_state} | hold_duration={hold_sec}s"
         )
 
@@ -371,6 +403,13 @@ class InstitutionalDecisionEngine:
             min_hold *= 1.1
             max_hold *= 1.2
         return min_hold, max_hold
+
+    def _turn_arm_delay(self, trade_mode, max_hold):
+        if trade_mode == "SCALP":
+            return max(45.0, 0.6 * max_hold)
+        if trade_mode == "TREND":
+            return max(90.0, 0.5 * max_hold)
+        return max(60.0, 0.5 * max_hold)
 
     def _finalize_exit(self, secid: int, index: str, now: float) -> None:
         self.trade_ctx.pop(secid, None)
@@ -649,7 +688,20 @@ class InstitutionalDecisionEngine:
             ctx = self.trade_ctx.get(secid)
             if ctx:
                 exit_ltp = ctx.get("last_ltp", ltp)
-                self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
+                accel_history = self.accel_state.get(secid, {}).get("accel_history", [])
+                self._log_final_exit(
+                    ctx,
+                    tag,
+                    exit_ltp,
+                    now,
+                    "STRUCTURAL_TURN",
+                    paper_trader,
+                    churn_tighten=churn_tighten,
+                    accel_now=accel_history[-1] if accel_history else 0.0,
+                    accel_prev=accel_history[-2] if len(accel_history) >= 2 else 0.0,
+                    stalled_duration=ctx.get("stalled_duration", now - ctx["ts"]),
+                    age=now - ctx["ts"],
+                )
                 self._finalize_exit(secid, ctx["index"], now)
             return {"exit_allowed": True, "exit_reason": "STRUCTURAL_TURN"}
 
@@ -748,7 +800,19 @@ class InstitutionalDecisionEngine:
         )
         if turn_confirmed:
             exit_ltp = ctx.get("last_ltp", ltp)
-            self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
+            self._log_final_exit(
+                ctx,
+                tag,
+                exit_ltp,
+                now,
+                "STRUCTURAL_TURN",
+                paper_trader,
+                churn_tighten=churn_tighten,
+                accel_now=accel_history[-1] if accel_history else 0.0,
+                accel_prev=accel_history[-2] if len(accel_history) >= 2 else 0.0,
+                stalled_duration=ctx.get("stalled_duration", now - ctx["ts"]),
+                age=now - ctx["ts"],
+            )
             paper_trader.on_exit(secid, exit_ltp, reason="STRUCTURAL_TURN")
             momentum_engine.active_trade.pop(secid, None)
             self._finalize_exit(secid, index, now)
@@ -808,6 +872,7 @@ class InstitutionalDecisionEngine:
                         return
                     if now - self.last_action_ts.get(loser, 0) > self.COOLDOWN_SEC:
                         loser_ltp = loser_ctx.get("last_ltp", ltp)
+                        loser_accel_history = self.accel_state.get(loser, {}).get("accel_history", [])
                         self._log_final_exit(
                             loser_ctx,
                             loser_ctx.get("tag", index),
@@ -815,6 +880,11 @@ class InstitutionalDecisionEngine:
                             now,
                             "STRUCTURAL_TURN",
                             paper_trader,
+                            churn_tighten=churn_tighten,
+                            accel_now=loser_accel_history[-1] if loser_accel_history else 0.0,
+                            accel_prev=loser_accel_history[-2] if len(loser_accel_history) >= 2 else 0.0,
+                            stalled_duration=loser_ctx.get("stalled_duration", now - loser_ctx.get("ts", now)),
+                            age=now - loser_ctx.get("ts", now),
                         )
                         paper_trader.on_exit(loser, loser_ltp, reason="STRUCTURAL_TURN")
                         momentum_engine.active_trade.pop(loser, None)
@@ -844,6 +914,8 @@ class InstitutionalDecisionEngine:
         min_hold, max_hold = self._hold_limits(struct_state, churn_tighten, ctx.get("trade_mode"))
         if age < min_hold:
             return
+        turn_arm_sec = self._turn_arm_delay(ctx.get("trade_mode"), max_hold)
+        turn_armed = age >= turn_arm_sec
         continuation_reset = self._update_continuation_state(ctx, struct, ltp, now, tag)
         if (
             continuation_reset
@@ -881,22 +953,67 @@ class InstitutionalDecisionEngine:
             and accel_decay_confirmed
             and no_recent_continuation
         )
-        accel_flip = False
-        if len(accel_history) >= 2:
-            accel_flip = accel_history[-2] > 0 >= accel_history[-1] or accel_history[-2] < 0 <= accel_history[-1]
+        accel_confirm_sec = self.TURN_ACCEL_CONFIRM_SEC * (self.TURN_STRICT_MULTIPLIER if churn_tighten else 1.0)
+        accel_flip_confirmed = False
+        accel_flip_ts = ctx.get("accel_flip_ts")
+        if accel_flip_ts is not None:
+            accel_flip_confirmed = now - accel_flip_ts >= accel_confirm_sec
         structure_stall = stalled_duration >= self.TURN_FAIL_SEC or ctx.get("no_progress_ticks", 0) >= self.TURN_FAIL_BARS
-        compression_after_expansion = bool(struct and struct.get("compression", False) and ctx.get("continuation_resets_count", 0) > 0)
-        exit_turn_signal = accel_flip or structure_stall or compression_after_expansion
+        displacement_pct = self.TURN_DISPLACEMENT_PCT * (self.TURN_STRICT_MULTIPLIER if churn_tighten else 1.0)
+        last_extreme = ctx.get("trend_extreme", ctx["entry"])
+        if ctx.get("side") == "LONG":
+            displacement_against_extreme = (last_extreme - ltp) >= ctx["entry"] * displacement_pct
+        else:
+            displacement_against_extreme = (ltp - last_extreme) >= ctx["entry"] * displacement_pct
+        compression_after_expansion = bool(
+            struct
+            and struct.get("compression", False)
+            and ctx.get("trade_mode") == "TREND"
+            and ctx.get("continuation_resets_count", 0) >= 2
+            and accel_state.get("negative_ticks", 0) >= self.DECAY_TICKS
+        )
+        exit_turn_signal = (
+            turn_armed
+            and accel_flip_confirmed
+            and structure_stall
+            and displacement_against_extreme
+        ) or (turn_armed and compression_after_expansion)
         if exit_turn_signal:
             exit_ltp = ctx.get("last_ltp", ltp)
-            self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
+            self._log_final_exit(
+                ctx,
+                tag,
+                exit_ltp,
+                now,
+                "STRUCTURAL_TURN",
+                paper_trader,
+                churn_tighten=churn_tighten,
+                turn_armed=turn_armed,
+                accel_now=accel_history[-1] if accel_history else 0.0,
+                accel_prev=accel_history[-2] if len(accel_history) >= 2 else 0.0,
+                stalled_duration=stalled_duration,
+                age=age,
+            )
             paper_trader.on_exit(secid, exit_ltp, reason="STRUCTURAL_TURN")
             momentum_engine.active_trade.pop(secid, None)
             self._finalize_exit(secid, index, now)
             return
         if age >= max_hold and time_exit_ok:
             exit_ltp = ctx.get("last_ltp", ltp)
-            self._log_final_exit(ctx, tag, exit_ltp, now, "TIME_EXIT", paper_trader)
+            self._log_final_exit(
+                ctx,
+                tag,
+                exit_ltp,
+                now,
+                "TIME_EXIT",
+                paper_trader,
+                churn_tighten=churn_tighten,
+                turn_armed=turn_armed,
+                accel_now=accel_history[-1] if accel_history else 0.0,
+                accel_prev=accel_history[-2] if len(accel_history) >= 2 else 0.0,
+                stalled_duration=stalled_duration,
+                age=age,
+            )
             paper_trader.on_exit(secid, exit_ltp, reason="TIME_EXIT")
             momentum_engine.active_trade.pop(secid, None)
             self._finalize_exit(secid, index, now)
@@ -936,7 +1053,19 @@ class InstitutionalDecisionEngine:
             )
             if turn_confirmed:
                 exit_ltp = ctx.get("last_ltp", ltp)
-                self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
+                self._log_final_exit(
+                    ctx,
+                    tag,
+                    exit_ltp,
+                    now,
+                    "STRUCTURAL_TURN",
+                    paper_trader,
+                    churn_tighten=churn_tighten,
+                    accel_now=accel_history[-1] if accel_history else 0.0,
+                    accel_prev=accel_history[-2] if len(accel_history) >= 2 else 0.0,
+                    stalled_duration=ctx.get("stalled_duration", now - ctx["ts"]),
+                    age=now - ctx["ts"],
+                )
                 paper_trader.on_exit(secid, exit_ltp, reason="STRUCTURAL_TURN")
                 momentum_engine.active_trade.pop(secid, None)
                 self._finalize_exit(secid, index, now)
@@ -952,7 +1081,19 @@ class InstitutionalDecisionEngine:
             )
             if turn_confirmed:
                 exit_ltp = ctx.get("last_ltp", ltp)
-                self._log_final_exit(ctx, tag, exit_ltp, now, "STRUCTURAL_TURN", paper_trader)
+                self._log_final_exit(
+                    ctx,
+                    tag,
+                    exit_ltp,
+                    now,
+                    "STRUCTURAL_TURN",
+                    paper_trader,
+                    churn_tighten=churn_tighten,
+                    accel_now=accel_history[-1] if accel_history else 0.0,
+                    accel_prev=accel_history[-2] if len(accel_history) >= 2 else 0.0,
+                    stalled_duration=ctx.get("stalled_duration", now - ctx["ts"]),
+                    age=now - ctx["ts"],
+                )
                 paper_trader.on_exit(secid, exit_ltp, reason="STRUCTURAL_TURN")
                 momentum_engine.active_trade.pop(secid, None)
                 self._finalize_exit(secid, index, now)
