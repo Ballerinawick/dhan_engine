@@ -16,6 +16,7 @@ from paper_trade_manager import PaperTradeManager
 from option_chain_selector import OptionChainSelector
 from institutional_decision_engine import InstitutionalDecisionEngine
 
+
 # ---------------- CONFIG ----------------
 CSV_FILE = os.getenv("CSV_FILE", "api-scrip-master.csv")
 
@@ -59,7 +60,7 @@ def main():
     momentum_engine = OptionsMomentumEngine()
     paper_trader = PaperTradeManager(capital=100000)
 
-    # ✅ SINGLE AUTHORITY FOR ENTRY
+    # ✅ Institutional decision layer (SOLE ENTRY AUTHORITY)
     decision_engine = InstitutionalDecisionEngine(debug=True)
 
     selector = OptionChainSelector(
@@ -80,7 +81,9 @@ def main():
 
     fut_ltp = {k: 0.0 for k in INDEXES}
 
-    # ---------------- OPTION DEPTH CALLBACK ----------------
+    # ==================================================
+    # OPTION DEPTH CALLBACK (UPDATED – SAFE)
+    # ==================================================
     def on_opt_depth(secid: int, tag: str, bid, ask):
         try:
             if not market_open():
@@ -93,13 +96,13 @@ def main():
             raw["secid"] = secid
             raw["tag"] = tag
 
-            # MTM update
+            # 🔁 MTM update
             paper_trader.on_tick(secid, raw["ltp"])
 
-            # 1️⃣ Momentum signal
+            # 1️⃣ Momentum signal ONLY (no execution)
             action = momentum_engine.on_tick(secid, raw)
 
-            # 2️⃣ Institutional governance (ENTRY + EXIT DECISION)
+            # 2️⃣ Institutional governance (ENTRY + veto EXIT)
             decision = decision_engine.on_signal(
                 secid=secid,
                 tag=tag,
@@ -109,16 +112,16 @@ def main():
                 paper_trader=paper_trader
             )
 
-            # 3️⃣ EXIT EXECUTION ONLY
+            # 3️⃣ EXIT execution ONLY (entry already handled)
             if action == "EXIT":
                 if decision and decision.get("exit_allowed") is False:
                     return
 
                 reason = momentum_engine.last_exit_reason.get(secid, action)
-                if decision and decision.get("exit_reason"):
-                    reason = decision["exit_reason"]
-
-                paper_trader.on_exit(secid, raw["ltp"], reason=reason)
+                try:
+                    paper_trader.on_exit(secid, raw["ltp"], reason=reason)
+                except TypeError:
+                    paper_trader.on_exit(secid, raw["ltp"])
 
         except Exception as e:
             print("❌ on_opt_depth error:", e)
@@ -132,13 +135,14 @@ def main():
         on_depth=on_opt_depth,
         debug=False
     )
+
     depth20.connect()
     print("✅ 20Depth WS started")
 
     # --------------------------------------------------
     # STEP 1: ONE-SHOT FUT LTP (REST)
     # --------------------------------------------------
-    print("\n⏳ Fetching initial FUT LTP (one-shot)...")
+    print("\n⏳ Fetching initial FUT LTP...")
     t0 = time.time()
     last_heartbeat = 0.0
 
@@ -156,7 +160,10 @@ def main():
             print("⚠️ FUT LTP timeout, proceeding.")
             break
 
-        ltp_map = ltp_rest.fetch_ltp_map({"NSE_FNO": list(fut_secids.values())})
+        ltp_map = ltp_rest.fetch_ltp_map({
+            "NSE_FNO": list(fut_secids.values())
+        })
+
         if not ltp_map:
             time.sleep(REST_POLL_INTERVAL_SEC)
             continue
@@ -166,7 +173,7 @@ def main():
                 fut_ltp[idx] = float(ltp_map[secid] or 0.0)
 
         if all(fut_ltp[i] > 0 for i in INDEXES):
-            print("✅ Initial FUT LTP captured. REST stopped.")
+            print("✅ Initial FUT LTP captured.")
             break
 
         time.sleep(REST_POLL_INTERVAL_SEC)
@@ -174,21 +181,27 @@ def main():
     # --------------------------------------------------
     # STEP 2: SELECT OPTIONS + SUBSCRIBE
     # --------------------------------------------------
-    print("\n🎯 Subscribing OPTIONS (dynamic via OptionChain)...")
+    print("\n🎯 Subscribing OPTIONS...")
 
     for idx in INDEXES:
-        selection = selector.select_best(idx)
-        if not selection:
-            continue
+        try:
+            selection = selector.select_best(idx)
+            if not selection:
+                continue
 
-        subs = []
-        if "CE" in selection:
-            subs.append({"SecurityId": str(selection["CE"]["security_id"]), "tag": f"{idx}_CE"})
-        if "PE" in selection:
-            subs.append({"SecurityId": str(selection["PE"]["security_id"]), "tag": f"{idx}_PE"})
+            subs = []
+            if "CE" in selection:
+                ce = selection["CE"]
+                subs.append({"SecurityId": str(ce["security_id"]), "tag": f"{idx}_CE"})
+            if "PE" in selection:
+                pe = selection["PE"]
+                subs.append({"SecurityId": str(pe["security_id"]), "tag": f"{idx}_PE"})
 
-        if subs:
-            depth20.subscribe(subs)
+            if subs:
+                depth20.subscribe(subs)
+
+        except Exception as e:
+            print(f"❌ [{idx}] OptionChain error:", e)
 
     print("\n🔥 LIVE: INSTITUTIONAL OPTIONS ENGINE ACTIVE\n")
 
