@@ -48,7 +48,7 @@ def main():
     if not token or not client_id:
         raise RuntimeError("Missing DHAN_ACCESS_TOKEN / DHAN_CLIENT_ID")
 
-    # ---------- CORE OBJECTS ----------
+    # -------- Core objects --------
     master = InstrumentMaster(CSV_FILE)
 
     ltp_rest = DhanLtpRestEngine(
@@ -61,7 +61,7 @@ def main():
     momentum_engine = OptionsMomentumEngine()
     paper_trader = PaperTradeManager(capital=100000)
 
-    # ✅ Institutional layer (SOLE authority)
+    # 🔑 Institutional authority
     decision_engine = InstitutionalDecisionEngine(debug=True)
 
     selector = OptionChainSelector(
@@ -74,7 +74,7 @@ def main():
         debug=True
     )
 
-    # ---------- FUT IDS ----------
+    # -------- FUT security IDs --------
     fut_secids = {}
     for idx in INDEXES:
         fut = master.get_nearest_future(idx)
@@ -83,7 +83,7 @@ def main():
     fut_ltp = {k: 0.0 for k in INDEXES}
 
     # ==================================================
-    # OPTION DEPTH CALLBACK (THIS IS CORRECT PLACE)
+    # OPTION DEPTH CALLBACK (THIS IS WHAT YOU ASKED)
     # ==================================================
     def on_opt_depth(secid: int, tag: str, bid, ask):
         try:
@@ -97,13 +97,13 @@ def main():
             raw["secid"] = secid
             raw["tag"] = tag
 
-            # 0️⃣ MTM update (safe)
+            # 0) MTM update (safe)
             paper_trader.on_tick(secid, raw["ltp"])
 
-            # 1️⃣ Momentum signal ONLY
+            # 1) Momentum signal
             action = momentum_engine.on_tick(secid, raw)
 
-            # 2️⃣ Institutional engine decides ENTRY + EXIT
+            # 2) Institutional decision layer
             decision = decision_engine.on_signal(
                 secid=secid,
                 tag=tag,
@@ -113,15 +113,12 @@ def main():
                 paper_trader=paper_trader
             )
 
-            # 3️⃣ EXIT only if allowed
+            # 3) Exit ONLY if allowed
             if action == "EXIT":
                 if decision and decision.get("exit_allowed") is False:
                     return
 
                 reason = momentum_engine.last_exit_reason.get(secid, action)
-                if decision and decision.get("exit_reason"):
-                    reason = decision["exit_reason"]
-
                 paper_trader.on_exit(secid, raw["ltp"], reason=reason)
 
         except Exception as e:
@@ -136,48 +133,47 @@ def main():
         on_depth=on_opt_depth,
         debug=False
     )
+
     depth20.connect()
     print("✅ 20Depth WS started")
 
-    # ================= FUT LTP (ONE-SHOT) =================
+    # ================= FUT LTP (ONE SHOT) =================
     print("\n⏳ Fetching initial FUT LTP...")
     t0 = time.time()
-    last_heartbeat = 0.0
+    last_hb = 0.0
 
     while True:
         now = time.time()
 
-        if now - last_heartbeat >= HEARTBEAT_SEC:
-            last_heartbeat = now
+        if now - last_hb >= HEARTBEAT_SEC:
+            last_hb = now
             print(
                 f"🫀 {datetime.now(IST).strftime('%H:%M:%S')} HEARTBEAT | "
                 + " | ".join([f"{k}:{fut_ltp[k]:.2f}" for k in INDEXES])
             )
 
-        if (now - t0) > REST_MAX_WAIT_SEC:
-            print("⚠️ FUT LTP timeout, proceeding.")
+        if now - t0 > REST_MAX_WAIT_SEC:
+            print("⚠️ FUT LTP timeout")
             break
 
         ltp_map = ltp_rest.fetch_ltp_map({
             "NSE_FNO": list(fut_secids.values())
         })
 
-        if not ltp_map:
-            time.sleep(REST_POLL_INTERVAL_SEC)
-            continue
+        if ltp_map:
+            for idx, secid in fut_secids.items():
+                if secid in ltp_map:
+                    fut_ltp[idx] = float(ltp_map[secid] or 0.0)
 
-        for idx, secid in fut_secids.items():
-            if secid in ltp_map:
-                fut_ltp[idx] = float(ltp_map[secid] or 0.0)
-
-        if all(fut_ltp[i] > 0 for i in INDEXES):
-            print("✅ Initial FUT LTP captured.")
-            break
+            if all(fut_ltp[i] > 0 for i in INDEXES):
+                print("✅ Initial FUT LTP captured.")
+                break
 
         time.sleep(REST_POLL_INTERVAL_SEC)
 
-    # ================= OPTION SUBSCRIBE =================
+    # ================= OPTION SUBSCRIPTION =================
     print("\n🎯 Subscribing OPTIONS...")
+
     for idx in INDEXES:
         try:
             selection = selector.select_best(idx)
