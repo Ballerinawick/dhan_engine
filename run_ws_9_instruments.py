@@ -14,7 +14,6 @@ from depth_micro_features import DepthMicroFeatureBuilder
 from options_momentum_engine import OptionsMomentumEngine
 from paper_trade_manager import PaperTradeManager
 from option_chain_selector import OptionChainSelector
-
 from institutional_decision_engine import InstitutionalDecisionEngine
 
 
@@ -35,7 +34,6 @@ MARKET_START = dtime(9, 10)
 MARKET_END = dtime(15, 35)
 
 
-# ================= MARKET CHECK =================
 def market_open():
     now = datetime.now(IST)
     if now.weekday() >= 5:
@@ -63,7 +61,7 @@ def main():
     momentum_engine = OptionsMomentumEngine()
     paper_trader = PaperTradeManager(capital=100000)
 
-    # 🔐 Institutional decision layer (SOLE authority)
+    # ✅ Institutional layer (SOLE authority)
     decision_engine = InstitutionalDecisionEngine(debug=True)
 
     selector = OptionChainSelector(
@@ -99,13 +97,13 @@ def main():
             raw["secid"] = secid
             raw["tag"] = tag
 
-            # 0️⃣ MTM update
+            # 0️⃣ MTM update (safe)
             paper_trader.on_tick(secid, raw["ltp"])
 
-            # 1️⃣ Momentum engine → SIGNAL ONLY
+            # 1️⃣ Momentum signal ONLY
             action = momentum_engine.on_tick(secid, raw)
 
-            # 2️⃣ Institutional engine → ENTRY + EXIT authority
+            # 2️⃣ Institutional engine decides ENTRY + EXIT
             decision = decision_engine.on_signal(
                 secid=secid,
                 tag=tag,
@@ -115,7 +113,7 @@ def main():
                 paper_trader=paper_trader
             )
 
-            # 3️⃣ EXIT execution (only if allowed)
+            # 3️⃣ EXIT only if allowed
             if action == "EXIT":
                 if decision and decision.get("exit_allowed") is False:
                     return
@@ -153,7 +151,7 @@ def main():
             last_heartbeat = now
             print(
                 f"🫀 {datetime.now(IST).strftime('%H:%M:%S')} HEARTBEAT | "
-                + " | ".join([f\"{k}:{fut_ltp[k]:.2f}\" for k in INDEXES])
+                + " | ".join([f"{k}:{fut_ltp[k]:.2f}" for k in INDEXES])
             )
 
         if (now - t0) > REST_MAX_WAIT_SEC:
@@ -178,9 +176,8 @@ def main():
 
         time.sleep(REST_POLL_INTERVAL_SEC)
 
-    # ================= OPTION SUBSCRIPTION =================
+    # ================= OPTION SUBSCRIBE =================
     print("\n🎯 Subscribing OPTIONS...")
-
     for idx in INDEXES:
         try:
             selection = selector.select_best(idx)
@@ -189,11 +186,15 @@ def main():
 
             subs = []
             if "CE" in selection:
-                ce = selection["CE"]
-                subs.append({"SecurityId": str(ce["security_id"]), "tag": f"{idx}_CE"})
+                subs.append({
+                    "SecurityId": str(selection["CE"]["security_id"]),
+                    "tag": f"{idx}_CE"
+                })
             if "PE" in selection:
-                pe = selection["PE"]
-                subs.append({"SecurityId": str(pe["security_id"]), "tag": f"{idx}_PE"})
+                subs.append({
+                    "SecurityId": str(selection["PE"]["security_id"]),
+                    "tag": f"{idx}_PE"
+                })
 
             if subs:
                 depth20.subscribe(subs)
