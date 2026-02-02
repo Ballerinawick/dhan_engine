@@ -4,63 +4,44 @@ from collections import defaultdict, deque
 
 class InstitutionalDecisionEngine:
     """
-    INSTITUTIONAL DECISION ENGINE (FINAL – FAST ENTRY SAFE)
+    INSTITUTIONAL DECISION ENGINE (OPTIONS-SAFE)
 
-    ✔ Momentum engine controls timing
-    ✔ Structure gate only BEFORE entry
-    ✔ Displacement + hold validated AFTER entry
-    ✔ Quick kill if no follow-through
-    ✔ All institutional exits preserved
+    Gate-1: Structure filter BEFORE entry (lightweight)
+    Gate-2: Enter immediately (do NOT delay momentum)
+    Gate-3: Post-entry follow-through = move from entry (options-safe)
+    Gate-4: Hold confirm for N seconds
 
-    USE THIS VERSION ONLY
+    ✅ Fix: removes impossible 15% displacement rule that was killing every entry
     """
 
     # ---------------- CONFIG ----------------
-    DOMINANCE_WINDOW_SEC = 8
-    DOMINANCE_RATIO = 1.8
-    COOLDOWN_SEC = 5
-
-    DISPLACEMENT_THRESHOLD_PCT = 0.15
-    HOLD_CONFIRM_SEC = 3
-    POST_ENTRY_VALIDATE_MAX_SEC = 6
-
     STRUCTURE_LOOKBACK_SEC = 45
     STRUCTURE_MIN_POINTS = 6
     STRUCTURE_NEAR_EXTREME_PCT = 0.05
     STRUCTURE_SWING_MARGIN_PCT = 0.01
     STRUCTURE_COMPRESSION_PCT = 0.12
 
-    BALANCE_LOOKBACK_SEC = 30
+    # ✅ OPTIONS-SAFE post-entry validation
+    FOLLOW_THROUGH_PCT = 0.03          # 3% move from entry
+    HOLD_CONFIRM_SEC = 1.5             # hold at least 1.5 sec
+    POST_ENTRY_VALIDATE_MAX_SEC = 8.0  # total window
 
     def __init__(self, debug=True):
         self.debug = debug
-
         self.trade_ctx = {}
         self.index_legs = defaultdict(set)
-
-        self.pnl_track = defaultdict(list)
-        self.speed_track = defaultdict(list)
-        self.slope_track = defaultdict(list)
-
         self.price_track = defaultdict(deque)
 
-    # --------------------------------------------------
     def _log(self, msg):
         if self.debug:
             print(msg)
 
-    # --------------------------------------------------
     def _update_price_history(self, secid, now, ltp):
         q = self.price_track[secid]
         q.append((now, ltp))
         while q and now - q[0][0] > self.STRUCTURE_LOOKBACK_SEC:
             q.popleft()
 
-    def _balance_price(self, secid, now, fallback):
-        pts = [p for ts, p in self.price_track[secid] if now - ts <= self.BALANCE_LOOKBACK_SEC]
-        return sum(pts) / len(pts) if pts else fallback
-
-    # --------------------------------------------------
     def _extract_swings(self, prices):
         swings = []
         for i in range(1, len(prices) - 1):
@@ -83,7 +64,7 @@ class InstitutionalDecisionEngine:
         rng = hi - lo
         last = vals[-1]
 
-        compression = rng <= last * self.STRUCTURE_COMPRESSION_PCT
+        compression = rng <= max(last, 1e-9) * self.STRUCTURE_COMPRESSION_PCT
         swings = self._extract_swings(prices)
 
         highs = [s for s in swings if s[0] == "HIGH"]
@@ -98,53 +79,44 @@ class InstitutionalDecisionEngine:
             "prev_low": lows[-2] if len(lows) > 1 else None,
         }
 
-    # --------------------------------------------------
     def _entry_structure_ok(self, side, ltp, secid):
         struct = self._structure_snapshot(secid)
         if not struct:
             return False, "NO_STRUCTURE"
 
         rng = struct["range"]
-        lh, ph = struct["last_high"], struct["prev_high"]
         ll, pl = struct["last_low"], struct["prev_low"]
 
-        if side == "LONG":
-            near_low = ll and ltp <= ll[2] * (1 + self.STRUCTURE_NEAR_EXTREME_PCT)
-            higher_low = ll and pl and ll[2] >= pl[2] * (1 + self.STRUCTURE_SWING_MARGIN_PCT)
-            failed = ll and pl and ll[2] < pl[2] and ltp > ll[2] + rng * 0.4
-            ok = near_low and (higher_low or failed or struct["compression"])
-            return ok, "HL_OR_FAIL"
-        return False, "SIDE_BLOCKED"
+        # LONG-only system
+        if side != "LONG":
+            return False, "SIDE_BLOCKED"
+
+        near_low = ll and ltp <= ll[2] * (1 + self.STRUCTURE_NEAR_EXTREME_PCT)
+        higher_low = ll and pl and ll[2] >= pl[2] * (1 + self.STRUCTURE_SWING_MARGIN_PCT)
+        failed = ll and pl and ll[2] < pl[2] and ltp > ll[2] + rng * 0.4
+
+        ok = near_low and (higher_low or failed or struct["compression"])
+        return ok, "HL_OR_FAIL"
 
     # ==================================================
     # MAIN HOOK
     # ==================================================
-    def on_signal(
-        self,
-        *,
-        secid,
-        tag,
-        ltp,
-        signal,
-        momentum_engine,
-        paper_trader
-    ):
+    def on_signal(self, *, secid, tag, ltp, signal, momentum_engine, paper_trader):
         now = time.time()
         index = tag.split("_")[0]
         self._update_price_history(secid, now, ltp)
 
         # ================= ENTRY =================
         if signal in ("A_ENTRY", "B_ENTRY"):
-
             trade = momentum_engine.active_trade.get(secid)
             if not trade:
                 return {"entry_allowed": False}
 
-            side = trade["side"]
-
+            side = trade.get("side", "LONG")
             ok, reason = self._entry_structure_ok(side, ltp, secid)
+
             if not ok:
-                self._log(f"ENTRY_BLOCKED | {tag} | G1_STRUCTURE")
+                self._log(f"ENTRY_BLOCKED | {tag} | gate=G1_STRUCTURE | reason={reason}")
                 momentum_engine.active_trade.pop(secid, None)
                 return {"entry_allowed": False}
 
@@ -155,69 +127,75 @@ class InstitutionalDecisionEngine:
                     "index": index,
                     "tag": tag,
                     "side": side,
-                    "entry": trade["entry"],
-                    "ts": trade["ts"],
+                    "entry": float(trade.get("entry", ltp)),
+                    "ts": float(trade.get("ts", now)),
                     "entry_committed": False,
-                    "post_validate_until": None,
-                    "disp_start": None,
-                    "disp_confirmed": False,
+                    "validate_until": None,
+                    "ft_start": None,
+                    "ft_confirmed": False,
                 }
                 self.trade_ctx[secid] = ctx
 
-            if secid not in paper_trader.positions:
+            # ✅ Commit entry here (SOLE AUTHORITY)
+            if secid not in paper_trader.positions and not ctx["entry_committed"]:
                 paper_trader.on_entry(
                     secid=secid,
                     tag=tag,
                     side=side,
-                    ltp=trade["entry"],
+                    ltp=ctx["entry"],
                     lots=1,
                     reason=f"STRUCT_{reason}"
                 )
 
                 ctx["entry_committed"] = True
-                ctx["post_validate_until"] = now + self.POST_ENTRY_VALIDATE_MAX_SEC
+                ctx["validate_until"] = now + self.POST_ENTRY_VALIDATE_MAX_SEC
+                ctx["ft_start"] = None
+                ctx["ft_confirmed"] = False
+
                 self.index_legs[index].add(secid)
 
-                self._log(f"ENTRY_COMMITTED_FAST | {tag}")
+                self._log(
+                    f"ENTRY_COMMITTED_FAST | {tag} | "
+                    f"post_validate={self.POST_ENTRY_VALIDATE_MAX_SEC}s | "
+                    f"ft_pct={self.FOLLOW_THROUGH_PCT:.2f}"
+                )
 
             return {"entry_allowed": True}
 
-        # ================= EXIT FROM MOMENTUM =================
+        # ================= EXIT =================
         if signal == "EXIT":
-            ctx = self.trade_ctx.get(secid)
-            if not ctx:
-                return {"exit_allowed": True}
-
             return {"exit_allowed": True}
 
-        # ================= POST ENTRY VALIDATION =================
+        # ================= POST-ENTRY VALIDATION =================
         if secid not in paper_trader.positions:
             return
 
         ctx = self.trade_ctx.get(secid)
-        if not ctx or ctx["disp_confirmed"]:
+        if not ctx or ctx.get("ft_confirmed"):
             return
 
-        bal = self._balance_price(secid, now, ltp)
-        disp = abs(ltp - bal) / max(bal, 1e-6)
+        entry = ctx["entry"]
+        move_pct = abs(ltp - entry) / max(entry, 1e-9)
 
-        if disp >= self.DISPLACEMENT_THRESHOLD_PCT:
-            if ctx["disp_start"] is None:
-                ctx["disp_start"] = now
+        # start/stop follow-through hold timer
+        if move_pct >= self.FOLLOW_THROUGH_PCT:
+            if ctx["ft_start"] is None:
+                ctx["ft_start"] = now
         else:
-            ctx["disp_start"] = None
+            ctx["ft_start"] = None
 
-        if ctx["disp_start"]:
-            hold = now - ctx["disp_start"]
+        if ctx["ft_start"] is not None:
+            hold = now - ctx["ft_start"]
             if hold >= self.HOLD_CONFIRM_SEC:
-                ctx["disp_confirmed"] = True
-                self._log(f"POST_ENTRY_CONFIRMED | {tag}")
+                ctx["ft_confirmed"] = True
+                self._log(f"POST_ENTRY_CONFIRMED | {tag} | move_pct={move_pct:.4f} | hold={hold:.2f}s")
                 return
 
-        if now > ctx["post_validate_until"]:
-            paper_trader.on_exit(secid, ltp, reason="ENTRY_INVALIDATED")
+        if now > ctx["validate_until"]:
+            # quick kill
+            paper_trader.on_exit(secid, ltp, reason=f"ENTRY_INVALIDATED_NO_FT(move={move_pct:.4f})")
             momentum_engine.active_trade.pop(secid, None)
             self.trade_ctx.pop(secid, None)
             self.index_legs[index].discard(secid)
-            self._log(f"POST_ENTRY_KILL | {tag}")
+            self._log(f"POST_ENTRY_KILL | {tag} | move_pct={move_pct:.4f}")
             return
