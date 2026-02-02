@@ -4,10 +4,14 @@ from collections import defaultdict, deque
 
 class InstitutionalDecisionEngine:
     """
-    INSTITUTIONAL DECISION ENGINE
-    - ONE SIDE ONLY per index
-    - DUAL LEG (TREND + SCALP on same side)
-    - MODE-AWARE exits preserved
+    INSTITUTIONAL DECISION ENGINE (OPTION A)
+
+    CORE IDEAS:
+    ✅ Structural entry (already present)
+    ✅ SCALP → TREND upgrade
+    ✅ Dynamic exits only
+    ✅ ONE SIDE ONLY (CE or PE)
+    ✅ Flip allowed ONLY after dynamic exit
     """
 
     # ---------------- CONFIG ----------------
@@ -25,20 +29,13 @@ class InstitutionalDecisionEngine:
     MODE_DEFAULT = "SCALP"
     MODE_UPGRADE_CONFIRM_TICKS = 3
 
-    MAX_SCALPS_PER_TREND = 6
-    SCALP_COOLDOWN_SEC = 10
-
     def __init__(self, debug=True):
         self.debug = debug
 
-        self.trade_ctx = {}               # secid -> ctx
-        self.index_legs = defaultdict(set)
+        self.trade_ctx = {}              # secid -> ctx
         self.price_track = defaultdict(deque)
 
-        # 🔒 NEW STATE
-        self.index_side_lock = {}         # index -> "CE" / "PE"
-        self.scalp_count = defaultdict(int)
-        self.last_scalp_time = defaultdict(float)
+        self.active_side = {}            # secid -> "CE" or "PE"
 
     # --------------------------------------------------
     def _log(self, msg):
@@ -52,26 +49,35 @@ class InstitutionalDecisionEngine:
             q.popleft()
 
     def _balance_price(self, secid, now, fallback):
-        pts = [p for ts, p in self.price_track[secid] if now - ts <= self.BALANCE_LOOKBACK_SEC]
-        return (sum(pts) / len(pts)) if pts else float(fallback)
+        pts = [p for ts, p in self.price_track[secid]
+               if now - ts <= self.BALANCE_LOOKBACK_SEC]
+        return sum(pts) / len(pts) if pts else float(fallback)
 
     # --------------------------------------------------
-    def _ctx(self, secid, tag, side, entry, ts):
-        index = tag.split("_")[0]
+    def _structure_ok(self, ltp, secid):
+        prices = list(self.price_track[secid])
+        if len(prices) < self.STRUCTURE_MIN_POINTS:
+            return False
+
+        vals = [p for _, p in prices]
+        hi, lo = max(vals), min(vals)
+        rng = hi - lo
+
+        return rng <= max(vals[-1], 1e-6) * self.STRUCTURE_COMPRESSION_PCT
+
+    # --------------------------------------------------
+    def _ctx(self, secid, tag, entry, ts):
         ctx = self.trade_ctx.get(secid)
         if not ctx:
             ctx = {
-                "secid": secid,
-                "index": index,
                 "tag": tag,
-                "side": side,
                 "entry": float(entry),
-                "ts": float(ts),
+                "ts": ts,
                 "mode": self.MODE_DEFAULT,
                 "accept_count": 0,
-                "post_validate_until": None,
+                "post_validate_until": ts + self.POST_ENTRY_VALIDATE_MAX_SEC,
                 "disp_start": None,
-                "disp_confirmed": False,
+                "disp_confirmed": False
             }
             self.trade_ctx[secid] = ctx
         return ctx
@@ -81,29 +87,25 @@ class InstitutionalDecisionEngine:
         now = time.time()
         self._update_price_history(secid, now, ltp)
 
-        index = tag.split("_")[0]
         side = "CE" if "CE" in tag else "PE"
 
-        # ==================================================
-        # 1️⃣ ENTRY CONTROL — ONE SIDE ONLY
-        # ==================================================
+        # =============================
+        # ENTRY (SOLE AUTHORITY)
+        # =============================
         if signal in ("A_ENTRY", "B_ENTRY"):
-            # Side lock check
-            locked = self.index_side_lock.get(index)
-            if locked and locked != side:
-                self._log(f"🚫 ENTRY_BLOCKED | {tag} | reason=SIDE_LOCK({locked})")
-                return {"entry_allowed": False}
-
             trade = momentum_engine.active_trade.get(secid)
             if not trade:
                 return {"entry_allowed": False}
 
-            ctx = self._ctx(secid, tag, trade.get("side", "LONG"), trade.get("entry", ltp), now)
+            # ONE SIDE LOCK
+            locked = self.active_side.get(secid)
+            if locked and locked != side:
+                self._log(f"⛔ SIDE_BLOCK | {tag} | active={locked}")
+                return {"entry_allowed": False}
 
-            # 🔒 Lock side on first entry
-            self.index_side_lock[index] = side
+            if not self._structure_ok(ltp, secid):
+                return {"entry_allowed": False}
 
-            # TREND entry
             if secid not in paper_trader.positions:
                 paper_trader.on_entry(
                     secid=secid,
@@ -111,19 +113,19 @@ class InstitutionalDecisionEngine:
                     side="LONG",
                     ltp=trade.get("entry", ltp),
                     lots=1,
-                    reason=f"{signal}|STRUCT"
+                    reason=f"{signal}|STRUCT_OK"
                 )
 
-                ctx["post_validate_until"] = now + self.POST_ENTRY_VALIDATE_MAX_SEC
-                self.index_legs[index].add(secid)
+                self.active_side[secid] = side
+                self._ctx(secid, tag, trade.get("entry", ltp), now)
 
-                self._log(f"✅ ENTRY_COMMITTED | {tag} | mode={ctx['mode']} | side={side}")
+                self._log(f"✅ ENTRY_COMMITTED | {tag} | side={side}")
 
             return {"entry_allowed": True}
 
-        # ==================================================
-        # 2️⃣ EXIT CONTROL — TREND PROTECTION
-        # ==================================================
+        # =============================
+        # EXIT (DYNAMIC ONLY)
+        # =============================
         if signal == "EXIT":
             ctx = self.trade_ctx.get(secid)
             if not ctx:
@@ -131,22 +133,27 @@ class InstitutionalDecisionEngine:
 
             reason = momentum_engine.last_exit_reason.get(secid, "EXIT")
 
-            # TREND exit protection
-            if ctx["mode"] == "TREND":
-                if reason in ("ENTRY_REJECTED_CONFIRM", "ENTRY_INVALIDATED"):
-                    self._log(f"🛑 EXIT_VETO | {tag} | TREND | reason={reason}")
-                    return {"exit_allowed": False}
+            # TREND PROTECTION
+            if ctx["mode"] == "TREND" and reason in (
+                "ENTRY_REJECTED_CONFIRM",
+                "ENTRY_INVALIDATED",
+                "ENTRY_INVALIDATED_NO_DISPLACEMENT"
+            ):
+                self._log(f"🛑 EXIT_VETO | {tag} | TREND")
+                return {"exit_allowed": False}
 
-            # TRUE EXIT → unlock side
-            self.index_side_lock.pop(ctx["index"], None)
-            self.scalp_count.pop(ctx["index"], None)
-            self.last_scalp_time.pop(ctx["index"], None)
+            # TRUE EXIT → RESET SIDE LOCK
+            self.active_side.pop(secid, None)
+            self.trade_ctx.pop(secid, None)
 
-            return {"exit_allowed": True}
+            return {
+                "exit_allowed": True,
+                "exit_reason": "DYNAMIC"
+            }
 
-        # ==================================================
-        # 3️⃣ POST ENTRY MODE UPGRADE
-        # ==================================================
+        # =============================
+        # POST-ENTRY VALIDATION
+        # =============================
         if secid not in paper_trader.positions:
             return
 
@@ -157,19 +164,27 @@ class InstitutionalDecisionEngine:
         ctx["accept_count"] += 1
         if ctx["mode"] == "SCALP" and ctx["accept_count"] >= self.MODE_UPGRADE_CONFIRM_TICKS:
             ctx["mode"] = "TREND"
-            self._log(f"🧭 MODE_UPGRADE | {tag} | SCALP → TREND")
+            self._log(f"🧭 MODE_UPGRADE | {tag} | SCALP→TREND")
 
-        # ==================================================
-        # 4️⃣ MULTI-SCALP (ONLY IF TREND IS GREEN)
-        # ==================================================
-        pnl = paper_trader.get_unrealized_pnl(secid, ltp)
-        if ctx["mode"] == "TREND" and pnl > 0:
-            if self.scalp_count[index] < self.MAX_SCALPS_PER_TREND:
-                if now - self.last_scalp_time[index] >= self.SCALP_COOLDOWN_SEC:
-                    if momentum_engine.is_fast_momentum(secid):
-                        self.scalp_count[index] += 1
-                        self.last_scalp_time[index] = now
-                        self._log(f"⚡ SCALP_ALLOWED | {tag} | count={self.scalp_count[index]}")
-                        return {"entry_allowed": True, "entry_mode": "SCALP"}
+        if ctx["mode"] == "TREND":
+            return
 
-        return
+        bal = self._balance_price(secid, now, ltp)
+        disp = abs(ltp - bal) / max(bal, 1e-6)
+
+        if disp >= self.DISPLACEMENT_THRESHOLD_PCT:
+            if ctx["disp_start"] is None:
+                ctx["disp_start"] = now
+        else:
+            ctx["disp_start"] = None
+
+        if ctx["disp_start"] and now - ctx["disp_start"] >= self.HOLD_CONFIRM_SEC:
+            ctx["disp_confirmed"] = True
+            return
+
+        if now > ctx["post_validate_until"]:
+            paper_trader.on_exit(secid, ltp, reason="ENTRY_INVALIDATED")
+            momentum_engine.active_trade.pop(secid, None)
+            self.trade_ctx.pop(secid, None)
+            self.active_side.pop(secid, None)
+            self._log(f"❌ POST_ENTRY_KILL | {tag}")
