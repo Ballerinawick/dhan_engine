@@ -11,7 +11,6 @@ class PaperTradeManager:
     ✔ 1 lot per entry (scalable later)
     ✔ Full-lot exit only
     ✔ Consolidated MTM logging
-    ✔ Open-position snapshot (entry, LTP, age) + exit reason in exit logs
     ✔ Clean, low-noise logs
     """
 
@@ -45,7 +44,7 @@ class PaperTradeManager:
         self.last_log_ts = 0.0
         self.log_interval = log_interval_sec
 
-        # Metrics (reset on engine start)
+        # Metrics
         self.entries_total = 0
         self.exits_total = 0
         self.entries_by_index = defaultdict(int)
@@ -105,9 +104,7 @@ class PaperTradeManager:
         if self.MAX_INDEX_EXPOSURE is not None:
             enabled_flags.append(f"MAX_INDEX_EXPOSURE={self.MAX_INDEX_EXPOSURE}")
         if self.FINNIFTY_SCORE_MULTIPLIER is not None:
-            enabled_flags.append(
-                f"FINNIFTY_SCORE_MULTIPLIER={self.FINNIFTY_SCORE_MULTIPLIER}"
-            )
+            enabled_flags.append(f"FINNIFTY_SCORE_MULTIPLIER={self.FINNIFTY_SCORE_MULTIPLIER}")
         if enabled_flags:
             print(f"🧭 TUNING FLAGS ENABLED | {' | '.join(enabled_flags)}")
 
@@ -119,7 +116,7 @@ class PaperTradeManager:
             return  # already open
 
         if side == "SHORT":
-            return
+            return  # current system LONG-only
 
         index = self._extract_index(tag)
         if not index:
@@ -138,7 +135,7 @@ class PaperTradeManager:
         self._maybe_reset_daily_counts(now_ts)
         self.entries_total += 1
         self.entries_by_index[index] += 1
-        if "PROBE" in reason.upper():
+        if "PROBE" in str(reason).upper():
             self.probe_entries += 1
         self.opened_today += 1
 
@@ -151,8 +148,8 @@ class PaperTradeManager:
             "lots": lots,
             "lot_size": lot_size,
             "qty": qty,
-            "entry": ltp,
-            "ltp": ltp,
+            "entry": float(ltp),
+            "ltp": float(ltp),
             "entry_ts": now_ts,
             "entry_reason": reason,
         }
@@ -188,12 +185,17 @@ class PaperTradeManager:
         now_ts = time.time()
         hold_sec = now_ts - pos["entry_ts"]
         self.total_hold_seconds += hold_sec
+
         self.exits_total += 1
-        self.exits_by_index[self._extract_index(pos["tag"])] += 1
-        if "DOMINANCE" in reason.upper():
+        idx = self._extract_index(pos["tag"])
+        if idx:
+            self.exits_by_index[idx] += 1
+
+        if "DOMINANCE" in str(reason).upper():
             self.dominance_exits += 1
         else:
             self.normal_exits += 1
+
         self._maybe_reset_daily_counts(now_ts)
         self.closed_today += 1
 
@@ -205,7 +207,7 @@ class PaperTradeManager:
         if len(self.recent_trade_pnls) > 10:
             self.recent_trade_pnls = self.recent_trade_pnls[-10:]
 
-        exit_tag = "EXIT_TIME" if "TIME" in reason.upper() else "EXIT_TURN"
+        exit_tag = "EXIT_TIME" if "TIME" in str(reason).upper() else "EXIT_TURN"
         icon = "⏱️" if exit_tag == "EXIT_TIME" else "🚪"
         print(
             f"{icon} {exit_tag} | {pos['tag']} | "
@@ -221,7 +223,7 @@ class PaperTradeManager:
     # --------------------------------------------------
     def on_tick(self, secid, ltp):
         if secid in self.positions:
-            self.positions[secid]["ltp"] = ltp
+            self.positions[secid]["ltp"] = float(ltp)
 
         now = time.time()
         if now - self.last_log_ts >= self.log_interval:
@@ -229,7 +231,7 @@ class PaperTradeManager:
             self._log_consolidated()
 
     # --------------------------------------------------
-    # CONSOLIDATED PORTFOLIO + OPEN SNAPSHOT
+    # CONSOLIDATED PORTFOLIO
     # --------------------------------------------------
     def _log_consolidated(self):
         unrealized = 0.0
@@ -241,7 +243,6 @@ class PaperTradeManager:
             entry = p["entry"]
             ltp = p["ltp"]
             qty = p["qty"]
-
             used_margin += entry * qty
 
             if p["side"] == "LONG":
@@ -252,13 +253,10 @@ class PaperTradeManager:
         net_pnl = self.realized_pnl + unrealized
         fees_paid = (self.entries_total + self.exits_total) * self.fee_per_trade
         net_pnl_after_fees = net_pnl - fees_paid
-        avg_hold_seconds = (
-            self.total_hold_seconds / self.exits_total if self.exits_total else 0.0
-        )
-        churn_ratio = self.exits_total / self.entries_total if self.entries_total else 0.0
-        self.fee_drag_per_trade = (
-            self.total_fees / self.exits_total if self.exits_total else 0.0
-        )
+
+        avg_hold_seconds = (self.total_hold_seconds / self.exits_total) if self.exits_total else 0.0
+        churn_ratio = (self.exits_total / self.entries_total) if self.entries_total else 0.0
+        self.fee_drag_per_trade = (self.total_fees / self.exits_total) if self.exits_total else 0.0
 
         print(
             f"📊 PORTFOLIO | "
@@ -283,5 +281,11 @@ class PaperTradeManager:
             return
         self.open_positions_dirty = False
 
+    # --------------------------------------------------
+    # OPTIONAL: Regime change hook used by decision engine
+    # --------------------------------------------------
     def note_regime_change(self, secid, tag, mode, reason):
+        # Keep it lightweight: just marks portfolio snapshot as dirty.
         self.open_positions_dirty = True
+        # If you want a log, uncomment:
+        # print(f"🧭 REGIME | {tag} | mode={mode} | reason={reason}")
