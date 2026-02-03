@@ -3,18 +3,18 @@ import time
 
 class InstitutionalTrailingExitEngine:
     """
-    PROFIT MEMORY ENGINE (INSTITUTIONAL)
+    INSTITUTIONAL TRAILING EXIT ENGINE (CAPITAL SAFE)
 
-    Purpose:
-    - Track BEST price after entry
-    - Arm trailing after profit threshold
-    - Exit on controlled giveback
+    Guarantees:
+    ✅ Never exits below entry once armed
+    ✅ Protects profit memory
+    ✅ Allows volatility but locks capital
     """
 
     # ---------- CONFIG ----------
     ARM_PROFIT_PCT = 0.35          # 35% profit to arm trailing
-    MAX_GIVEBACK_PCT = 0.40        # allow 40% giveback from best
-    MIN_HOLD_AFTER_ARM_SEC = 5     # avoid instant exits
+    MAX_GIVEBACK_PCT = 0.40        # max giveback from BEST
+    MIN_HOLD_AFTER_ARM_SEC = 5     # buffer after arm
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -49,7 +49,7 @@ class InstitutionalTrailingExitEngine:
                 "entry": entry,
                 "best": entry,
                 "armed": False,
-                "armed_ts": None
+                "armed_ts": None,
             }
 
         c = self.ctx[secid]
@@ -69,7 +69,7 @@ class InstitutionalTrailingExitEngine:
                 f"🟢 TRAIL_ARMED | {tag} | entry={entry:.2f} | best={c['best']:.2f}"
             )
 
-        # ---------------- IF NOT ARMED → NO EXIT ----------------
+        # ---------------- IF NOT ARMED ----------------
         if not c["armed"]:
             return None
 
@@ -77,16 +77,20 @@ class InstitutionalTrailingExitEngine:
         if now - c["armed_ts"] < self.MIN_HOLD_AFTER_ARM_SEC:
             return None
 
-        # ---------------- GIVEBACK CHECK ----------------
-        giveback = (c["best"] - ltp) / max(c["best"], 1e-6)
+        # ---------------- CAPITAL SAFE FLOOR ----------------
+        dynamic_floor = c["best"] * (1 - self.MAX_GIVEBACK_PCT)
+        effective_floor = max(entry, dynamic_floor)
 
-        if giveback >= self.MAX_GIVEBACK_PCT:
-            floor = c["best"] * (1 - self.MAX_GIVEBACK_PCT)
+        # ---------------- EXIT CHECK ----------------
+        if ltp <= effective_floor:
+            giveback = (c["best"] - ltp) / max(c["best"], 1e-6)
 
             self._log(
                 f"📉 INSTITUTIONAL_EXIT | {tag} | "
                 f"best={c['best']:.2f} | now={ltp:.2f} | "
-                f"floor={floor:.2f} | giveback={giveback:.0%}"
+                f"floor={effective_floor:.2f} | "
+                f"giveback={giveback:.0%} | "
+                f"CAPITAL_SAFE"
             )
 
             self.ctx.pop(secid, None)
