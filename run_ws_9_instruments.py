@@ -15,6 +15,7 @@ from options_momentum_engine import OptionsMomentumEngine
 from paper_trade_manager import PaperTradeManager
 from option_chain_selector import OptionChainSelector
 from institutional_decision_engine import InstitutionalDecisionEngine
+from institutional_trailing_exit_engine import InstitutionalTrailingExitEngine
 
 
 # ================= CONFIG =================
@@ -61,8 +62,9 @@ def main():
     momentum_engine = OptionsMomentumEngine()
     paper_trader = PaperTradeManager(capital=100000)
 
-    # 🔑 Institutional authority
+    # 🔑 Institutional engines
     decision_engine = InstitutionalDecisionEngine(debug=True)
+    trailing_exit_engine = InstitutionalTrailingExitEngine(debug=True)
 
     selector = OptionChainSelector(
         access_token=token,
@@ -83,7 +85,7 @@ def main():
     fut_ltp = {k: 0.0 for k in INDEXES}
 
     # ==================================================
-    # OPTION DEPTH CALLBACK (THIS IS WHAT YOU ASKED)
+    # OPTION DEPTH CALLBACK (INSTITUTIONAL FLOW)
     # ==================================================
     def on_opt_depth(secid: int, tag: str, bid, ask):
         try:
@@ -97,13 +99,13 @@ def main():
             raw["secid"] = secid
             raw["tag"] = tag
 
-            # 0) MTM update (safe)
+            # 0️⃣ MTM update
             paper_trader.on_tick(secid, raw["ltp"])
 
-            # 1) Momentum signal
+            # 1️⃣ Momentum signal
             action = momentum_engine.on_tick(secid, raw)
 
-            # 2) Institutional decision layer
+            # 2️⃣ Institutional decision layer
             decision = decision_engine.on_signal(
                 secid=secid,
                 tag=tag,
@@ -113,12 +115,33 @@ def main():
                 paper_trader=paper_trader
             )
 
-            # 3) Exit ONLY if allowed
+            # 3️⃣ Trailing exit (PROFIT PROTECT)
+            trail = trailing_exit_engine.on_tick(
+                secid=secid,
+                tag=tag,
+                ltp=raw["ltp"],
+                paper_trader=paper_trader,
+                momentum_engine=momentum_engine
+            )
+
+            if trail and trail.get("exit"):
+                paper_trader.on_exit(
+                    secid,
+                    raw["ltp"],
+                    reason=trail["reason"]
+                )
+                return
+
+            # 4️⃣ Momentum / Decision exit
             if action == "EXIT":
                 if decision and decision.get("exit_allowed") is False:
                     return
 
-                reason = momentum_engine.last_exit_reason.get(secid, action)
+                reason = decision.get(
+                    "exit_reason",
+                    momentum_engine.last_exit_reason.get(secid, action)
+                )
+
                 paper_trader.on_exit(secid, raw["ltp"], reason=reason)
 
         except Exception as e:
@@ -137,7 +160,7 @@ def main():
     depth20.connect()
     print("✅ 20Depth WS started")
 
-    # ================= FUT LTP (ONE SHOT) =================
+    # ================= FUT LTP =================
     print("\n⏳ Fetching initial FUT LTP...")
     t0 = time.time()
     last_hb = 0.0
