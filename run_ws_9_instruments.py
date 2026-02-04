@@ -16,6 +16,7 @@ from paper_trade_manager import PaperTradeManager
 from option_chain_selector import OptionChainSelector
 from institutional_decision_engine import InstitutionalDecisionEngine
 from institutional_trailing_exit_engine import InstitutionalTrailingExitEngine
+from structure_exit_engine import StructureExitEngine
 
 
 # ================= CONFIG =================
@@ -65,6 +66,7 @@ def main():
     # 🔑 Institutional engines
     decision_engine = InstitutionalDecisionEngine(debug=True)
     trailing_exit_engine = InstitutionalTrailingExitEngine(debug=True)
+    structure_exit_engine = StructureExitEngine(debug=True)
 
     selector = OptionChainSelector(
         access_token=token,
@@ -115,7 +117,20 @@ def main():
                 paper_trader=paper_trader
             )
 
-            # 3️⃣ Trailing exit (PROFIT PROTECT)
+            # 3️⃣ Structure Exit (SCALP vs TREND)
+            struct = structure_exit_engine.on_tick(
+                secid=secid,
+                tag=tag,
+                ltp=raw["ltp"],
+                paper_trader=paper_trader,
+                decision_engine=decision_engine
+            )
+            if struct and struct.get("exit"):
+                print(f"📉 EXIT_OVERRIDE | {tag} | reason={struct['reason']}")
+                paper_trader.on_exit(secid, raw["ltp"], reason=struct["reason"])
+                return
+
+            # 4️⃣ Trailing exit (PROFIT PROTECT)
             trail = trailing_exit_engine.on_tick(
                 secid=secid,
                 tag=tag,
@@ -123,16 +138,12 @@ def main():
                 paper_trader=paper_trader,
                 momentum_engine=momentum_engine
             )
-
             if trail and trail.get("exit"):
-                paper_trader.on_exit(
-                    secid,
-                    raw["ltp"],
-                    reason=trail["reason"]
-                )
+                print(f"📉 EXIT_OVERRIDE | {tag} | reason={trail['reason']}")
+                paper_trader.on_exit(secid, raw["ltp"], reason=trail["reason"])
                 return
 
-            # 4️⃣ Momentum / Decision exit
+            # 5️⃣ Momentum / Decision exit
             if action == "EXIT":
                 if decision and decision.get("exit_allowed") is False:
                     return
@@ -141,7 +152,6 @@ def main():
                     "exit_reason",
                     momentum_engine.last_exit_reason.get(secid, action)
                 )
-
                 paper_trader.on_exit(secid, raw["ltp"], reason=reason)
 
         except Exception as e:
