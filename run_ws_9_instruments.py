@@ -104,10 +104,43 @@ def main():
             # 0️⃣ MTM update
             paper_trader.on_tick(secid, raw["ltp"])
 
+            # -------------- unified exit (CRITICAL FIX) --------------
+            def force_exit(reason: str):
+                # 1) decision engine must see EXIT to release locks/ctx safely
+                try:
+                    decision = decision_engine.on_signal(
+                        secid=secid,
+                        tag=tag,
+                        ltp=raw["ltp"],
+                        signal="EXIT",
+                        momentum_engine=momentum_engine,
+                        paper_trader=paper_trader
+                    )
+                    if decision and decision.get("exit_allowed") is False:
+                        return False
+                except Exception as e:
+                    print("❌ force_exit: decision_engine EXIT error:", e)
+
+                # 2) close paper position
+                paper_trader.on_exit(secid, raw["ltp"], reason=reason)
+
+                # 3) CRITICAL: clear momentum trade state so entries can happen again
+                try:
+                    momentum_engine.last_exit_reason[secid] = reason
+                except Exception:
+                    pass
+                try:
+                    momentum_engine.active_trade.pop(secid, None)
+                except Exception:
+                    pass
+
+                return True
+            # ---------------------------------------------------------
+
             # 1️⃣ Momentum signal
             action = momentum_engine.on_tick(secid, raw)
 
-            # 2️⃣ Institutional decision layer
+            # 2️⃣ Institutional decision layer (ENTRY gating etc)
             decision = decision_engine.on_signal(
                 secid=secid,
                 tag=tag,
@@ -127,7 +160,7 @@ def main():
             )
             if struct and struct.get("exit"):
                 print(f"📉 EXIT_OVERRIDE | {tag} | reason={struct['reason']}")
-                paper_trader.on_exit(secid, raw["ltp"], reason=struct["reason"])
+                force_exit(struct["reason"])
                 return
 
             # 4️⃣ Trailing exit (PROFIT PROTECT)
@@ -140,11 +173,12 @@ def main():
             )
             if trail and trail.get("exit"):
                 print(f"📉 EXIT_OVERRIDE | {tag} | reason={trail['reason']}")
-                paper_trader.on_exit(secid, raw["ltp"], reason=trail["reason"])
+                force_exit(trail["reason"])
                 return
 
             # 5️⃣ Momentum / Decision exit
             if action == "EXIT":
+                # if decision vetoes, do nothing
                 if decision and decision.get("exit_allowed") is False:
                     return
 
@@ -152,7 +186,8 @@ def main():
                     "exit_reason",
                     momentum_engine.last_exit_reason.get(secid, action)
                 )
-                paper_trader.on_exit(secid, raw["ltp"], reason=reason)
+                force_exit(reason)
+                return
 
         except Exception as e:
             print("❌ on_opt_depth error:", e)
