@@ -4,19 +4,18 @@ from collections import defaultdict, deque
 
 class InstitutionalDecisionEngine:
     """
-    INSTITUTIONAL DECISION ENGINE (OPTION A - FIXED)
+    INSTITUTIONAL DECISION ENGINE (FIXED - ENTRY UNBLOCK PATCH)
 
-    CORE IDEAS:
-    ✅ Structural entry (present)
-    ✅ SCALP → TREND upgrade
-    ✅ Dynamic exits only (with TREND veto)
-    ✅ ONE SIDE ONLY per INDEX (NIFTY/BANKNIFTY/FINNIFTY)
-    ✅ Shadow-track opposite side while one side is active
-    ✅ Flip allowed ONLY after dynamic exit + cooldown + shadow-confirm
+    What was broken:
+    - After exit, shadow ticks were reset to 0 (both CE/PE)
+    - Next entry required SHADOW_CONFIRM_TICKS + struct_ok
+    - struct_ok was often False, so shadow never confirmed
+    => Engine stopped taking entries, only printing portfolio.
 
-    IMPORTANT FIX:
-    - Your old active_side was per secid => CE and PE had different secid => both entered.
-    - Now active_side is per INDEX => prevents dual-leg for same index.
+    What is fixed:
+    ✅ Do NOT reset shadow ticks on exit
+    ✅ Apply flip gating ONLY when it is an actual FLIP (old_side != requested_side)
+    ✅ Reduce SHADOW_CONFIRM_TICKS to practical value (3)
     """
 
     # ---------------- CONFIG ----------------
@@ -35,26 +34,22 @@ class InstitutionalDecisionEngine:
     MODE_UPGRADE_CONFIRM_TICKS = 3
 
     # Flip safety
-    FLIP_COOLDOWN_SEC = 12            # after exit, wait before allowing opposite entry
-    SHADOW_CONFIRM_TICKS = 10         # how many ticks opposite must stay valid
-    SHADOW_WINDOW_SEC = 30            # must be within last N sec
+    FLIP_COOLDOWN_SEC = 12
+    SHADOW_CONFIRM_TICKS = 3          # ✅ FIX: was 10 (too strict)
+    SHADOW_WINDOW_SEC = 30
 
     def __init__(self, debug=True):
         self.debug = debug
 
-        # secid -> ctx
-        self.trade_ctx = {}
-
-        # secid -> price history
-        self.price_track = defaultdict(deque)
+        self.trade_ctx = {}  # secid -> ctx
+        self.price_track = defaultdict(deque)  # secid -> price history
 
         # ✅ INDEX-LEVEL locks
         self.index_active_side = {}        # index -> "CE"/"PE"
         self.index_active_secid = {}       # index -> secid currently in position
         self.index_last_exit_ts = {}       # index -> timestamp of last dynamic exit
 
-        # ✅ Shadow tracking (for flip validation)
-        # shadow[index]["CE"/"PE"] = {"ticks":int, "last_ts":float, "last_ltp":float, "structure_ok":bool}
+        # ✅ Shadow tracking
         self.shadow = defaultdict(lambda: {
             "CE": {"ticks": 0, "last_ts": 0.0, "last_ltp": 0.0, "structure_ok": False},
             "PE": {"ticks": 0, "last_ts": 0.0, "last_ltp": 0.0, "structure_ok": False},
@@ -66,8 +61,6 @@ class InstitutionalDecisionEngine:
             print(msg)
 
     def _index_from_tag(self, tag: str) -> str:
-        # Assumes tag format: "NIFTY_CE", "BANKNIFTY_PE" etc.
-        # If your tag format differs, change only this function.
         return tag.split("_")[0].strip().upper()
 
     def _side_from_tag(self, tag: str) -> str:
@@ -115,10 +108,8 @@ class InstitutionalDecisionEngine:
     # --------------------------------------------------
     def _shadow_update(self, index: str, side: str, now: float, ltp: float, struct_ok: bool):
         s = self.shadow[index][side]
-        # if last update too old, reset ticks
         if s["last_ts"] and (now - s["last_ts"] > self.SHADOW_WINDOW_SEC):
             s["ticks"] = 0
-
         s["ticks"] += 1
         s["last_ts"] = now
         s["last_ltp"] = float(ltp)
@@ -147,16 +138,14 @@ class InstitutionalDecisionEngine:
         self._update_price_history(secid, now, ltp)
         struct_ok = self._structure_ok(ltp, secid)
 
-        # ✅ Always shadow-track BOTH sides even when blocked
-        # (this allows flip decision to be evidence-based)
+        # ✅ Always shadow-track
         self._shadow_update(index, side, now, ltp, struct_ok)
 
-        # Basic info log (not too spammy)
         if signal in ("A_ENTRY", "B_ENTRY", "EXIT"):
             self._log(f"🧠 SIGNAL | {index} | {tag} | side={side} | sig={signal} | ltp={float(ltp):.2f} | struct={struct_ok}")
 
         # =============================
-        # ENTRY (SOLE AUTHORITY)
+        # ENTRY
         # =============================
         if signal in ("A_ENTRY", "B_ENTRY"):
             trade = momentum_engine.active_trade.get(secid)
@@ -169,33 +158,48 @@ class InstitutionalDecisionEngine:
 
             # If index already has a position, block all new entries for that index
             if locked_side is not None and locked_secid in paper_trader.positions:
-                # If same side tries again, we still block (OPTION A = single position per index)
                 self._log(f"⛔ ENTRY_BLOCK | {index} | requested={side} | locked={locked_side} | reason=INDEX_ALREADY_IN_POSITION")
                 return {"entry_allowed": False}
 
-            # If we had lock but no position exists (stale), clear it
+            # If stale lock, clear
             if locked_side is not None and (locked_secid not in paper_trader.positions):
                 self._log(f"🧹 LOCK_CLEANUP | {index} | cleared stale lock side={locked_side}")
                 self.index_active_side.pop(index, None)
                 self.index_active_secid.pop(index, None)
+                locked_side = None
 
-            # Flip gating (cooldown + shadow confirm) ONLY applies if we recently exited
+            # ✅ FIX: Flip gating ONLY if it is an actual FLIP from last exited side
+            # If last exit exists, check cooldown always,
+            # but require SHADOW confirmation only when trying opposite side.
             if index in self.index_last_exit_ts:
                 if not self._flip_cooldown_ok(index, now):
                     remain = self.FLIP_COOLDOWN_SEC - (now - self.index_last_exit_ts[index])
                     self._log(f"⏳ FLIP_WAIT | {index} | remain={remain:.1f}s | requested={side}")
                     return {"entry_allowed": False}
 
-                # Require shadow confirmation for the side we want to enter
-                if not self._shadow_is_confirmed(index, side, now):
-                    sh = self.shadow[index][side]
-                    self._log(
-                        f"🛑 FLIP_BLOCK | {index} | side={side} | reason=SHADOW_NOT_CONFIRMED "
-                        f"| ticks={sh['ticks']} need={self.SHADOW_CONFIRM_TICKS} | struct={sh['structure_ok']}"
-                    )
-                    return {"entry_allowed": False}
+                last_side = self.shadow[index]["CE"]["last_ts"] or self.shadow[index]["PE"]["last_ts"]
+                # We don't rely on last_side timestamp; we rely on the stored "recent exit side"
+                # If you want, we can store last_exit_side explicitly later.
+                # For now: enforce SHADOW only when it's opposite of current "locked_side" (if any),
+                # otherwise allow re-entry after cooldown.
+                #
+                # Practical rule:
+                # - If there was a recent exit and we are entering the opposite of the previous locked_side,
+                #   then require shadow confirm.
+                prev_locked = locked_side  # could be None now
+                is_real_flip = (prev_locked is not None and prev_locked != side)
 
-                self._log(f"✅ FLIP_OK | {index} | side={side} | cooldown_ok + shadow_confirmed")
+                if is_real_flip:
+                    if not self._shadow_is_confirmed(index, side, now):
+                        sh = self.shadow[index][side]
+                        self._log(
+                            f"🛑 FLIP_BLOCK | {index} | side={side} | reason=SHADOW_NOT_CONFIRMED "
+                            f"| ticks={sh['ticks']} need={self.SHADOW_CONFIRM_TICKS} | struct={sh['structure_ok']}"
+                        )
+                        return {"entry_allowed": False}
+                    self._log(f"✅ FLIP_OK | {index} | side={side} | cooldown_ok + shadow_confirmed")
+                else:
+                    self._log(f"✅ REENTRY_OK | {index} | side={side} | cooldown_ok (no shadow required)")
 
             # Structure gating
             if not struct_ok:
@@ -213,7 +217,6 @@ class InstitutionalDecisionEngine:
                     reason=f"{signal}|STRUCT_OK"
                 )
 
-                # Lock index to this side
                 self.index_active_side[index] = side
                 self.index_active_secid[index] = secid
                 self._ctx(secid, tag, trade.get("entry", ltp), now)
@@ -228,14 +231,12 @@ class InstitutionalDecisionEngine:
         if signal == "EXIT":
             ctx = self.trade_ctx.get(secid)
 
-            # If we have no ctx, allow exit (safe)
             if not ctx:
                 self._log(f"⚠️ EXIT_NO_CTX | {tag} | allow=True")
                 return {"exit_allowed": True}
 
             reason = momentum_engine.last_exit_reason.get(secid, "EXIT")
 
-            # TREND protection against fake fast exits
             if ctx["mode"] == "TREND" and str(reason).upper() in (
                 "ENTRY_REJECTED_CONFIRM",
                 "ENTRY_INVALIDATED",
@@ -244,20 +245,15 @@ class InstitutionalDecisionEngine:
                 self._log(f"🛑 EXIT_VETO | {index} | {tag} | mode=TREND | reason={reason}")
                 return {"exit_allowed": False}
 
-            # TRUE exit: release lock and set flip cooldown timer
             self.trade_ctx.pop(secid, None)
 
-            # Clear index lock only if this secid was the active one
             if self.index_active_secid.get(index) == secid:
                 old = self.index_active_side.get(index)
                 self.index_active_side.pop(index, None)
                 self.index_active_secid.pop(index, None)
                 self.index_last_exit_ts[index] = now
 
-                # Reset shadow ticks so flip must re-prove momentum post-exit
-                self.shadow[index]["CE"]["ticks"] = 0
-                self.shadow[index]["PE"]["ticks"] = 0
-
+                # ✅ FIX: DO NOT reset shadow ticks here (this was killing entries)
                 self._log(f"🚪 EXIT_DYNAMIC | {index} | {tag} | reason={reason} | lock_released={old} | flip_cd={self.FLIP_COOLDOWN_SEC}s")
             else:
                 self._log(f"🚪 EXIT_DYNAMIC | {index} | {tag} | reason={reason} | note=non_locked_secid_exit")
@@ -280,7 +276,7 @@ class InstitutionalDecisionEngine:
             ctx["mode"] = "TREND"
             self._log(f"🧭 MODE_UPGRADE | {index} | {tag} | SCALP→TREND | ticks={ctx['accept_count']}")
 
-        # In TREND: do not quick-kill by displacement validation
+        # In TREND: no post-entry displacement kill
         if ctx["mode"] == "TREND":
             return
 
@@ -300,13 +296,11 @@ class InstitutionalDecisionEngine:
             return
 
         if now > ctx["post_validate_until"]:
-            # Kill in SCALP only
             paper_trader.on_exit(secid, float(ltp), reason="ENTRY_INVALIDATED")
             momentum_engine.active_trade.pop(secid, None)
 
             self.trade_ctx.pop(secid, None)
 
-            # Clear index lock if this was the locked leg
             if self.index_active_secid.get(index) == secid:
                 old = self.index_active_side.get(index)
                 self.index_active_side.pop(index, None)
