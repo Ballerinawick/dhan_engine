@@ -4,84 +4,85 @@ from collections import deque
 
 class StructureExitEngine:
     """
-    STRUCTURE EXIT ENGINE — STABLE (v1.1)
+    STRUCTURE EXIT ENGINE v2 — MATURITY + ENTRY-AWARE
 
-    FIXES APPLIED:
-    ✅ Pivot de-duplication (no repeated LL/LH spam)
-    ✅ SCALP structure stabilized
-    ✅ TREND exits gated until structure matures
-    ✅ Clean HH / HL / LH / LL timeline logs
+    DESIGN GOALS (FIXED):
+    ✅ Do NOT exit on first HL break
+    ✅ Require structure maturity before exits
+    ✅ Entry-price aware (profit vs loss)
+    ✅ Separate SCALP vs TREND logic
+    ✅ Allow healthy pullbacks
+    ✅ Exit only on PROVEN structure failure
     """
 
-    # ---------------- CONFIG ----------------
-    PIVOT_WINDOW = 5                   # must be odd
-    MIN_SECONDS_AFTER_ENTRY = 2         # ignore exits immediately after entry
+    # ================= CONFIG =================
 
-    # ---- TREND SAFETY ----
-    MIN_TREND_SECONDS = 12              # TREND exits blocked initially
-    REQUIRE_HH_FOR_TREND = True
+    # Candle building
+    CANDLE_SEC = 1
+    MAX_CANDLES = 120
 
-    # ---- SCALP ----
-    SCALP_EXIT_ON_LH = True
-    SCALP_LH_MIN_DROP_PCT = 0.15         # ignore micro LH noise
+    # Structure maturity
+    MIN_PIVOTS_SCALP = 4          # HH → HL → HH → HL
+    MIN_PIVOTS_TREND = 6          # stronger confirmation
 
-    # ---- HL BREAK ----
-    HL_BREAK_BUFFER_PCT = 0.05           # buffer to avoid micro stop-outs
-    SCALP_EXIT_ON_HL_BREAK = True
-    TREND_EXIT_ON_HL_BREAK = True
+    # Time guards
+    MIN_SECONDS_AFTER_ENTRY = 6
+    MIN_TREND_SECONDS = 20
 
-    # ---- TREND ----
-    TREND_EXIT_ON_LL = True
+    # Pullback tolerance (dynamic, % of entry)
+    MAX_ADVERSE_FROM_ENTRY_PCT = 0.9    # % loss allowed before structure exits activate
 
-    TIMELINE_MAX = 18
+    # Profit-based exit allowance
+    MIN_PROFIT_TO_EXIT_EARLY_PCT = 0.4  # if in profit, allow smart exits
+
+    # HL / LL buffers
+    HL_BREAK_BUFFER_PCT = 0.15
+    LL_BREAK_BUFFER_PCT = 0.20
+
+    # Visuals
+    TIMELINE_MAX = 20
+
+    # ==================================================
 
     def __init__(self, debug=True):
         self.debug = debug
         self.ctx = {}
 
-    # --------------------------------------------------
+    # ---------------- logging ----------------
     def _log(self, msg):
         if self.debug:
             print(msg)
 
-    # --------------------------------------------------
+    # ---------------- context ----------------
     def _new_ctx(self, entry):
         return {
             "entry": float(entry),
-
-            # candle building
             "cur_sec": None,
             "o": None,
             "h": None,
             "l": None,
             "c": None,
-            "candles": deque(maxlen=80),
+            "candles": deque(maxlen=self.MAX_CANDLES),
 
             # structure
+            "pivots": [],        # ("HH","HL","LH","LL")
+            "pivot_prices": [],
             "last_high": None,
             "last_low": None,
-            "last_hh": None,
-            "last_hl": None,
-            "has_hh": False,
 
-            # pivot guard
-            "last_pivot_ts": None,
-
-            # mode tracking
-            "last_mode": None,
+            # guards
+            "has_maturity": False,
             "trend_start_ts": None,
-
-            # exit guard
+            "last_mode": None,
             "last_exit_ts": 0.0,
 
-            # visual
+            # visuals
             "timeline": []
         }
 
-    # --------------------------------------------------
+    # ---------------- candle ----------------
     def _update_candle(self, c, ltp, ts):
         sec = int(ts)
-
         if c["cur_sec"] is None:
             c["cur_sec"] = sec
             c["o"] = c["h"] = c["l"] = c["c"] = ltp
@@ -98,42 +99,34 @@ class StructureExitEngine:
             "h": c["h"],
             "l": c["l"],
         })
-
         c["cur_sec"] = sec
         c["o"] = c["h"] = c["l"] = c["c"] = ltp
 
-    # --------------------------------------------------
+    # ---------------- pivot detection ----------------
     def _detect_pivot(self, c):
-        w = self.PIVOT_WINDOW
-        if len(c["candles"]) < w:
+        if len(c["candles"]) < 5:
             return None
 
-        arr = list(c["candles"])[-w:]
-        mid = w // 2
-        m = arr[mid]
+        arr = list(c["candles"])[-5:]
+        mid = arr[2]
 
-        is_ph = all(m["h"] > x["h"] for i, x in enumerate(arr) if i != mid)
-        is_pl = all(m["l"] < x["l"] for i, x in enumerate(arr) if i != mid)
+        is_ph = all(mid["h"] > x["h"] for i, x in enumerate(arr) if i != 2)
+        is_pl = all(mid["l"] < x["l"] for i, x in enumerate(arr) if i != 2)
 
         if is_ph:
-            return ("PH", m["ts"], m["h"])
+            return ("PH", mid["h"])
         if is_pl:
-            return ("PL", m["ts"], m["l"])
+            return ("PL", mid["l"])
         return None
 
-    # --------------------------------------------------
-    def _add_timeline(self, c, label, px):
-        c["timeline"].append(f"{label}@{px:.2f}")
-        c["timeline"] = c["timeline"][-self.TIMELINE_MAX:]
-
-    # --------------------------------------------------
+    # ---------------- mode ----------------
     def _read_mode(self, secid, decision_engine):
         try:
-            return decision_engine.trade_ctx.get(secid, {}).get("mode", "SCALP").upper()
+            return decision_engine.trade_ctx.get(secid, {}).get("mode", "SCALP")
         except Exception:
             return "SCALP"
 
-    # --------------------------------------------------
+    # ================= MAIN =================
     def on_tick(self, *, secid, tag, ltp, paper_trader, decision_engine):
 
         pos = paper_trader.positions.get(secid)
@@ -142,91 +135,94 @@ class StructureExitEngine:
             return None
 
         now = time.time()
+        entry = pos["entry"]
         entry_ts = pos["entry_ts"]
         ltp = float(ltp)
 
-        c = self.ctx.setdefault(secid, self._new_ctx(pos["entry"]))
+        c = self.ctx.setdefault(secid, self._new_ctx(entry))
 
-        # anti spam
+        # anti-spam
         if now - c["last_exit_ts"] < 1.0:
             return None
 
+        # build candles
         self._update_candle(c, ltp, now)
 
+        # hard guard: observe market first
         if now - entry_ts < self.MIN_SECONDS_AFTER_ENTRY:
             return None
 
+        # mode
         mode = self._read_mode(secid, decision_engine)
 
-        # track TREND start
         if c["last_mode"] != mode:
             c["last_mode"] = mode
             if mode == "TREND":
                 c["trend_start_ts"] = now
 
-        # detect pivot
+        # detect pivots
         pivot = self._detect_pivot(c)
         if pivot:
-            kind, ts, px = pivot
-
-            # 🔒 CRITICAL FIX: pivot de-duplication
-            if c["last_pivot_ts"] == ts:
-                return None
-            c["last_pivot_ts"] = ts
+            kind, px = pivot
 
             if kind == "PH":
                 if c["last_high"] is None or px > c["last_high"]:
                     c["last_high"] = px
-                    c["last_hh"] = px
-                    c["has_hh"] = True
-                    self._log(f"🧱 STRUCT_HH | {tag} | {px:.2f}")
-                    self._add_timeline(c, "HH", px)
+                    c["pivots"].append("HH")
+                    c["pivot_prices"].append(px)
+                    c["timeline"].append(f"HH@{px:.2f}")
                 else:
-                    self._log(f"🧱 STRUCT_LH | {tag} | {px:.2f}")
-                    self._add_timeline(c, "LH", px)
+                    c["pivots"].append("LH")
+                    c["pivot_prices"].append(px)
+                    c["timeline"].append(f"LH@{px:.2f}")
 
             if kind == "PL":
                 if c["last_low"] is None or px > c["last_low"]:
                     c["last_low"] = px
-                    c["last_hl"] = px
-                    self._log(f"🧱 STRUCT_HL | {tag} | {px:.2f}")
-                    self._add_timeline(c, "HL", px)
+                    c["pivots"].append("HL")
+                    c["pivot_prices"].append(px)
+                    c["timeline"].append(f"HL@{px:.2f}")
                 else:
-                    self._log(f"🧱 STRUCT_LL | {tag} | {px:.2f}")
-                    self._add_timeline(c, "LL", px)
+                    c["pivots"].append("LL")
+                    c["pivot_prices"].append(px)
+                    c["timeline"].append(f"LL@{px:.2f}")
 
-            self._log(f"🧩 STRUCT | {tag} | {' → '.join(c['timeline'])}")
+            c["timeline"] = c["timeline"][-self.TIMELINE_MAX:]
+            self._log(f"🧱 STRUCT | {tag} | {' → '.join(c['timeline'])}")
 
-        # ---------------- EXIT RULES ----------------
+        # ---------------- maturity ----------------
+        need = self.MIN_PIVOTS_TREND if mode == "TREND" else self.MIN_PIVOTS_SCALP
+        if len(c["pivots"]) >= need:
+            c["has_maturity"] = True
 
-        # TREND safety
+        # ---------------- profit / loss context ----------------
+        pnl_pct = (ltp - entry) / entry * 100.0
+
+        # LOSS SIDE: do nothing unless severe
+        if pnl_pct < -self.MAX_ADVERSE_FROM_ENTRY_PCT:
+            return None
+
+        # TREND early safety
         if mode == "TREND":
-            if self.REQUIRE_HH_FOR_TREND and not c["has_hh"]:
-                mode = "SCALP"
-            elif now - (c["trend_start_ts"] or now) < self.MIN_TREND_SECONDS:
+            if now - (c["trend_start_ts"] or now) < self.MIN_TREND_SECONDS:
                 return None
 
-        # HL break
-        if c["has_hh"] and c["last_hl"]:
-            buf = self.HL_BREAK_BUFFER_PCT / 100
-            if ltp < c["last_hl"] * (1 - buf):
+        # ---------------- EXIT LOGIC ----------------
+
+        # A) STRUCTURE FAILURE (real)
+        if c["has_maturity"]:
+            last = c["pivots"][-1]
+
+            # TREND: only LL after maturity
+            if mode == "TREND" and last == "LL":
                 c["last_exit_ts"] = now
-                self._log(f"📉 STRUCT_EXIT | {tag} | HL_BREAK | mode={mode}")
-                return {"exit": True, "reason": f"STRUCT_HL_BREAK_{mode}"}
+                self._log(f"📉 STRUCT_EXIT | {tag} | TREND_LL_FAIL")
+                return {"exit": True, "reason": "STRUCT_TREND_FAILURE"}
 
-        # SCALP LH
-        if mode == "SCALP" and self.SCALP_EXIT_ON_LH and pivot and pivot[0] == "PH":
-            if c["last_hh"]:
-                drop = (c["last_hh"] - pivot[2]) / c["last_hh"] * 100
-                if drop >= self.SCALP_LH_MIN_DROP_PCT:
-                    c["last_exit_ts"] = now
-                    self._log(f"📉 STRUCT_EXIT | {tag} | LH_SCALP")
-                    return {"exit": True, "reason": "STRUCT_LH_SCALP"}
-
-        # TREND LL
-        if mode == "TREND" and self.TREND_EXIT_ON_LL and pivot and pivot[0] == "PL":
-            c["last_exit_ts"] = now
-            self._log(f"📉 STRUCT_EXIT | {tag} | LL_TREND")
-            return {"exit": True, "reason": "STRUCT_LL_TREND"}
+            # SCALP: LH after HH with profit
+            if mode == "SCALP" and last == "LH" and pnl_pct > self.MIN_PROFIT_TO_EXIT_EARLY_PCT:
+                c["last_exit_ts"] = now
+                self._log(f"📉 STRUCT_EXIT | {tag} | SCALP_LH_PROFIT")
+                return {"exit": True, "reason": "STRUCT_SCALP_PROFIT"}
 
         return None
