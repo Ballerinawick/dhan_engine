@@ -4,12 +4,38 @@ import pandas as pd
 
 class InstrumentMaster:
     """
-    Reads Dhan api-scrip-master.csv and extracts:
-    - Nearest FUTIDX for index (NIFTY / BANKNIFTY / FINNIFTY)
-    - Nearest OPTIDX expiry
-    - Find option SecurityId by (index, expiry, strike, CE/PE)
-    - ✅ INDEX (spot) SecurityId for OptionChain REST
+    InstrumentMaster v3.1 — Expiry-Aware + Strike-Tolerant
+
+    FIXES:
+    ✅ NIFTY uses WEEKLY expiry (nearest weekly)
+    ✅ BANKNIFTY / FINNIFTY use MONTHLY expiry (last expiry in month)
+    ✅ Expiry selection happens BEFORE premium filter (as per your rule)
+    ✅ Strike selection is tolerant (prevents "No exact strike match" crashes)
+    ✅ Still supports:
+        - FUTIDX nearest
+        - OPTIDX lookup by (index, expiry, strike, CE/PE)
+        - INDEX spot SecurityId for OptionChain REST
     """
+
+    # ---------------- EXPIRY MODE RULES ----------------
+    # Your confirmed preference:
+    # NIFTY = WEEKLY
+    # BANKNIFTY / FINNIFTY = MONTHLY
+    EXPIRY_MODE_BY_INDEX = {
+        "NIFTY": "WEEKLY",
+        "BANKNIFTY": "MONTHLY",
+        "FINNIFTY": "MONTHLY",
+    }
+
+    # ---------------- STRIKE TOLERANCE ----------------
+    # Dhan CSV sometimes has strikes like 25900.0 exactly,
+    # but depending on rounding / chain selection you can land near it.
+    # We accept nearest strike if within a reasonable tolerance.
+    STRIKE_TOL_BY_INDEX = {
+        "NIFTY": 0.5,       # should be exact typically; allow tiny float noise
+        "BANKNIFTY": 0.5,
+        "FINNIFTY": 0.5,
+    }
 
     def __init__(self, csv_path: str):
         self.df = pd.read_csv(csv_path, low_memory=False)
@@ -21,7 +47,6 @@ class InstrumentMaster:
         for c in obj_cols:
             self.df[c] = self.df[c].astype(str).str.strip()
 
-        # Required columns (CSV VERIFIED)
         required = [
             "SEM_EXM_EXCH_ID",
             "SEM_SEGMENT",
@@ -44,10 +69,10 @@ class InstrumentMaster:
         # Strike numeric
         self.df["SEM_STRIKE_PRICE"] = pd.to_numeric(self.df["SEM_STRIKE_PRICE"], errors="coerce")
 
-        # Caches for speed
+        # Caches
         self._opt_cache = {}
         self._fut_cache = {}
-        self._index_cache = {}   # ✅ NEW (safe cache)
+        self._index_cache = {}
 
     # ---------------------------------------------------
     # Internal: OPTIDX filtered dataframe for index
@@ -71,6 +96,7 @@ class InstrumentMaster:
             "SEM_SMST_SECURITY_ID",
             "SEM_OPTION_TYPE"
         ])
+
         self._opt_cache[idx] = opts
         return opts
 
@@ -101,7 +127,7 @@ class InstrumentMaster:
         idx = str(index_name).upper().strip()
         fut = self._get_futidx_df(idx)
 
-        now = pd.Timestamp.now()
+        now = pd.Timestamp.now().normalize()
         fut2 = fut[fut["SEM_EXPIRY_DATE"] >= now].copy()
 
         if fut2.empty:
@@ -116,35 +142,103 @@ class InstrumentMaster:
             "lot_size": int(float(row["SEM_LOT_UNITS"])) if "SEM_LOT_UNITS" in row else 0,
         }
 
-    # ---------------------------------------------------
-    # Helper: FUT security id
-    # ---------------------------------------------------
     def get_current_fut_security_id(self, index_name: str) -> str:
         fut = self.get_nearest_future(index_name)
         return str(fut["security_id"])
 
-    # ---------------------------------------------------
-    # FUT exchange segment
-    # ---------------------------------------------------
     def get_fut_exchange_segment(self) -> str:
         return "NSE_FNO"
 
     # ---------------------------------------------------
-    # Nearest option expiry
+    # ✅ Expiry mode helper
+    # ---------------------------------------------------
+    def get_expiry_mode(self, index: str) -> str:
+        idx = str(index).upper().strip()
+        return self.EXPIRY_MODE_BY_INDEX.get(idx, "AUTO")
+
+    # ---------------------------------------------------
+    # ✅ Core: Get expiry list (future)
+    # ---------------------------------------------------
+    def _get_future_expiries(self, index: str):
+        opts = self._get_optidx_df(index)
+        now = pd.Timestamp.now().normalize()
+        exps = opts[opts["SEM_EXPIRY_DATE"] >= now]["SEM_EXPIRY_DATE"].dropna().unique()
+        exps = sorted(pd.to_datetime(exps))
+        return exps
+
+    # ---------------------------------------------------
+    # ✅ Classify: monthly expiry = last expiry in that month
+    # ---------------------------------------------------
+    def _monthly_expiry_for_month(self, expiries, year: int, month: int):
+        same_month = [e for e in expiries if (e.year == year and e.month == month)]
+        if not same_month:
+            return None
+        return max(same_month)
+
+    # ---------------------------------------------------
+    # ✅ Get option expiry (WEEKLY/MONTHLY aware)
+    # ---------------------------------------------------
+    def get_option_expiry(self, index: str, expiry_mode: str = None):
+        idx = str(index).upper().strip()
+        mode = (expiry_mode or self.get_expiry_mode(idx)).upper().strip()
+
+        expiries = self._get_future_expiries(idx)
+        if not expiries:
+            raise Exception(f"❌ No OPTIDX expiry >= now for {idx}")
+
+        # AUTO fallback: nearest expiry
+        if mode == "AUTO":
+            return expiries[0]
+
+        # MONTHLY: choose last expiry in current month if still valid else next month last expiry
+        if mode == "MONTHLY":
+            now = pd.Timestamp.now().normalize()
+            cur_month_monthly = self._monthly_expiry_for_month(expiries, now.year, now.month)
+            if cur_month_monthly and cur_month_monthly >= now:
+                return cur_month_monthly
+
+            # else choose next available month's monthly
+            for e in expiries:
+                m = self._monthly_expiry_for_month(expiries, e.year, e.month)
+                if m and m >= now:
+                    return m
+
+            return expiries[-1]  # last resort
+
+        # WEEKLY (NIFTY): choose nearest expiry that is NOT the monthly expiry of that month.
+        # If only monthly is left (monthly week), then fallback to monthly.
+        if mode == "WEEKLY":
+            now = pd.Timestamp.now().normalize()
+            # determine this month's monthly expiry
+            monthly_this_month = self._monthly_expiry_for_month(expiries, now.year, now.month)
+
+            # candidates = nearest expiry excluding monthly expiry of that month
+            weekly_candidates = []
+            for e in expiries:
+                # exclude monthly expiry for that month
+                monthly_for_e_month = self._monthly_expiry_for_month(expiries, e.year, e.month)
+                if monthly_for_e_month and e == monthly_for_e_month:
+                    continue
+                weekly_candidates.append(e)
+
+            if weekly_candidates:
+                return weekly_candidates[0]
+
+            # if no weekly candidate (rare), fallback to nearest expiry
+            return expiries[0]
+
+        # Unknown mode → nearest
+        return expiries[0]
+
+    # ---------------------------------------------------
+    # Backward compatibility: old method name
     # ---------------------------------------------------
     def get_nearest_option_expiry(self, index: str):
-        opts = self._get_optidx_df(index)
-
-        now = pd.Timestamp.now()
-        opts2 = opts[opts["SEM_EXPIRY_DATE"] >= now]
-
-        if opts2.empty:
-            raise Exception(f"❌ No OPTIDX expiry >= now for {index}")
-
-        return opts2["SEM_EXPIRY_DATE"].sort_values().iloc[0]
+        # IMPORTANT: now respects index rule (NIFTY weekly, others monthly)
+        return self.get_option_expiry(index)
 
     # ---------------------------------------------------
-    # Find option SecurityId
+    # Find option SecurityId (strike tolerant)
     # ---------------------------------------------------
     def find_option_security_id(self, index: str, expiry_dt, strike, opt_type: str):
         idx = str(index).upper().strip()
@@ -172,13 +266,17 @@ class InstrumentMaster:
         df["__strike_diff"] = (df["SEM_STRIKE_PRICE"] - strike_f).abs()
         best = df.sort_values("__strike_diff").iloc[0]
 
-        if float(best["__strike_diff"]) > 0.001:
-            raise Exception(f"❌ No exact strike match")
+        tol = float(self.STRIKE_TOL_BY_INDEX.get(idx, 0.5))
+        if float(best["__strike_diff"]) > tol:
+            raise Exception(
+                f"❌ No strike within tolerance | idx={idx} exp={exp_date} ot={ot} "
+                f"wanted={strike_f} best={float(best['SEM_STRIKE_PRICE'])} diff={float(best['__strike_diff'])}"
+            )
 
         return int(float(best["SEM_SMST_SECURITY_ID"]))
 
     # ---------------------------------------------------
-    # ✅ NEW: INDEX (SPOT) security id for OptionChain REST
+    # ✅ INDEX (SPOT) security id for OptionChain REST
     # ---------------------------------------------------
     def get_index_security_id(self, index_name: str) -> int:
         idx = str(index_name).upper().strip()
