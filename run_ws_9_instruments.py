@@ -2,7 +2,7 @@ import os
 import time
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
-import requests
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -35,6 +35,31 @@ IST = ZoneInfo("Asia/Kolkata")
 MARKET_START = dtime(9, 10)
 MARKET_END = dtime(15, 35)
 
+# ================= CSV AUTO DOWNLOAD =================
+MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+
+def download_master_csv(csv_url: str, save_path: str):
+    try:
+        print("📥 Downloading latest api-scrip-master.csv...")
+
+        response = requests.get(csv_url, timeout=30)
+        response.raise_for_status()
+
+        with open(save_path, "wb") as f:
+            f.write(response.content)
+
+        abs_path = os.path.abspath(save_path)
+
+        print("✅ Master CSV downloaded successfully.")
+        print(f"📂 CSV saved at: {abs_path}")
+
+        if os.path.exists(save_path):
+            size_kb = round(os.path.getsize(save_path) / 1024, 2)
+            print(f"📊 CSV size: {size_kb} KB")
+
+    except Exception as e:
+        print("❌ CSV download failed:", e)
+        raise
 
 def market_open():
     now = datetime.now(IST)
@@ -284,31 +309,5 @@ def main():
         time.sleep(0.2)
 
 
-
-         MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
-
-  def download_master_csv(csv_url: str, save_path: str):
-    try:
-        print("📥 Downloading latest api-scrip-master.csv...")
-
-        response = requests.get(csv_url, timeout=30)
-        response.raise_for_status()
-
-        with open(save_path, "wb") as f:
-            f.write(response.content)
-
-        abs_path = os.path.abspath(save_path)
-
-        print("✅ Master CSV downloaded successfully.")
-        print(f"📂 CSV saved at: {abs_path}")
-
-        if os.path.exists(save_path):
-            size_kb = round(os.path.getsize(save_path) / 1024, 2)
-            print(f"📊 CSV size: {size_kb} KB")
-
-    except Exception as e:
-        print("❌ CSV download failed:", e)
-        raise
-        
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
