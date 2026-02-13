@@ -64,7 +64,10 @@ class OptionChainSelector:
     def fetch_chain(self, index: str) -> dict:
         self._rate_limit()
 
-        expiry = self.im.get_nearest_option_expiry(index)
+        if index == "NIFTY":
+            expiry = self.im.get_nearest_option_expiry(index, prefer_weekly=True)
+        else:
+            expiry = self.im.get_nearest_option_expiry(index)
         expiry_str = expiry.strftime("%Y-%m-%d")
 
         # ✅ FIX: Always use INDEX (spot) security id
@@ -137,7 +140,10 @@ class OptionChainSelector:
         underlying_ltp = float(data["last_price"])
 
         step = self.strike_step_map[index]
-        expiry = self.im.get_nearest_option_expiry(index)
+        if index == "NIFTY":
+            expiry = self.im.get_nearest_option_expiry(index, prefer_weekly=True)
+        else:
+            expiry = self.im.get_nearest_option_expiry(index)
         expiry_str = expiry.strftime("%Y-%m-%d")
 
         atm = int(round(underlying_ltp / step) * step)
