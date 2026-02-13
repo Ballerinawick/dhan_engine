@@ -75,6 +75,11 @@ def main():
     if not token or not client_id:
         raise RuntimeError("Missing DHAN_ACCESS_TOKEN / DHAN_CLIENT_ID")
 
+    try:
+        download_master_csv(MASTER_URL, CSV_FILE)
+    except Exception:
+        print("⚠️ CSV download failed. Continuing with existing file.")
+
     # -------- Core objects --------
     master = InstrumentMaster(CSV_FILE)
 
