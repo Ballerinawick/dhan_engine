@@ -157,8 +157,14 @@ class OptionChainSelector:
         low = atm - self.max_steps * step
         high = atm + self.max_steps * step
 
-        best_ce = None
-        best_pe = None
+        min_prem, max_prem = {
+            "NIFTY": (10, 40),
+            "BANKNIFTY": (200, 400),
+            "FINNIFTY": (80, 250),
+        }[index]
+
+        ce_candidates = []
+        pe_candidates = []
 
         for strike_str, node in oc.items():
             strike = float(strike_str)
@@ -166,14 +172,33 @@ class OptionChainSelector:
                 continue
 
             if "ce" in node:
-                s, r = self._score_with_reason(node["ce"])
-                if not best_ce or s > best_ce["score"]:
-                    best_ce = dict(score=s, strike=strike, reason=r)
+                ce_leg = node["ce"]
+                ce_ltp = float(ce_leg.get("last_price", 0))
+                if min_prem <= ce_ltp <= max_prem:
+                    ce_candidates.append((strike, ce_leg))
 
             if "pe" in node:
-                s, r = self._score_with_reason(node["pe"])
-                if not best_pe or s > best_pe["score"]:
-                    best_pe = dict(score=s, strike=strike, reason=r)
+                pe_leg = node["pe"]
+                pe_ltp = float(pe_leg.get("last_price", 0))
+                if min_prem <= pe_ltp <= max_prem:
+                    pe_candidates.append((strike, pe_leg))
+
+        if not ce_candidates and not pe_candidates:
+            print(f"⚠️ NO_VALID_PREMIUM | {index} | range={min_prem}-{max_prem}")
+            return None
+
+        best_ce = None
+        best_pe = None
+
+        for strike, ce_leg in ce_candidates:
+            s, r = self._score_with_reason(ce_leg)
+            if not best_ce or s > best_ce["score"]:
+                best_ce = dict(score=s, strike=strike, reason=r)
+
+        for strike, pe_leg in pe_candidates:
+            s, r = self._score_with_reason(pe_leg)
+            if not best_pe or s > best_pe["score"]:
+                best_pe = dict(score=s, strike=strike, reason=r)
 
         out = {}
 
@@ -195,33 +220,6 @@ class OptionChainSelector:
 
         ce = build("CE", best_ce)
         pe = build("PE", best_pe)
-
-        # Premium validation layer (post score selection only)
-        min_prem, max_prem = PREMIUM_FILTER[index]
-
-        def selected_ltp(best_obj, side):
-            if not best_obj:
-                return None
-            strike_key = str(int(best_obj["strike"]))
-            node = oc.get(strike_key, {})
-            leg = node.get(side.lower(), {})
-            return float(leg.get("last_price", 0))
-
-        ce_ltp = selected_ltp(best_ce, "CE")
-        if ce and ce_ltp is not None and not (min_prem <= ce_ltp <= max_prem):
-            print(
-                f"🚫 PREMIUM_REJECT | {index}_CE | ltp={ce_ltp:.2f} | "
-                f"allowed={min_prem}-{max_prem}"
-            )
-            ce = None
-
-        pe_ltp = selected_ltp(best_pe, "PE")
-        if pe and pe_ltp is not None and not (min_prem <= pe_ltp <= max_prem):
-            print(
-                f"🚫 PREMIUM_REJECT | {index}_PE | ltp={pe_ltp:.2f} | "
-                f"allowed={min_prem}-{max_prem}"
-            )
-            pe = None
 
         if ce is None and pe is None:
             return None
