@@ -3,6 +3,13 @@ import requests
 from typing import Dict, Tuple
 
 
+PREMIUM_FILTER = {
+    "NIFTY": (10, 40),
+    "BANKNIFTY": (200, 450),
+    "FINNIFTY": (80, 250),
+}
+
+
 class OptionChainSelector:
     """
     Selects BEST CE / PE using Dhan Option Chain API.
@@ -188,6 +195,36 @@ class OptionChainSelector:
 
         ce = build("CE", best_ce)
         pe = build("PE", best_pe)
+
+        # Premium validation layer (post score selection only)
+        min_prem, max_prem = PREMIUM_FILTER[index]
+
+        def selected_ltp(best_obj, side):
+            if not best_obj:
+                return None
+            strike_key = str(int(best_obj["strike"]))
+            node = oc.get(strike_key, {})
+            leg = node.get(side.lower(), {})
+            return float(leg.get("last_price", 0))
+
+        ce_ltp = selected_ltp(best_ce, "CE")
+        if ce and ce_ltp is not None and not (min_prem <= ce_ltp <= max_prem):
+            print(
+                f"🚫 PREMIUM_REJECT | {index}_CE | ltp={ce_ltp:.2f} | "
+                f"allowed={min_prem}-{max_prem}"
+            )
+            ce = None
+
+        pe_ltp = selected_ltp(best_pe, "PE")
+        if pe and pe_ltp is not None and not (min_prem <= pe_ltp <= max_prem):
+            print(
+                f"🚫 PREMIUM_REJECT | {index}_PE | ltp={pe_ltp:.2f} | "
+                f"allowed={min_prem}-{max_prem}"
+            )
+            pe = None
+
+        if ce is None and pe is None:
+            return None
 
         if self.mode == 1:
             pick = ce if ce and (not pe or ce["score"] >= pe["score"]) else pe
