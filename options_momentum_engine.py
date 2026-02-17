@@ -25,6 +25,11 @@ class OptionsMomentumEngine:
     BASE_B_WICK = 0.65
     BASE_B_SPEED = 0.7
 
+    MICRO_MAX_SPREAD_PCT = 0.012
+    MICRO_MIN_ABS_IMB = 0.12
+    MICRO_MIN_ABSORB = 0.15
+    MICRO_MIN_FLOW = 1500
+
     EXIT_PULLBACK = 0.40
     EXIT_VOL_DROP = 0.40
 
@@ -48,6 +53,7 @@ class OptionsMomentumEngine:
         self._last_ctx_print_sec = None
 
         self.last_exit_reason = {}
+        self.last_micro_reject_sec = {}
 
     # --------------------------------------------------
     def market_open(self) -> bool:
@@ -134,16 +140,55 @@ class OptionsMomentumEngine:
         l = min(prices)
         c = prices[-1]
 
+        activity = 0.0
+        for i in range(1, len(ticks)):
+            prev = ticks[i - 1]
+            cur = ticks[i]
+            prev_depth = float(prev.get("bid_qty", 0) or 0) + float(prev.get("ask_qty", 0) or 0)
+            cur_depth = float(cur.get("bid_qty", 0) or 0) + float(cur.get("ask_qty", 0) or 0)
+            activity += abs(cur_depth - prev_depth)
+
+        activity += sum(abs(float(t.get("flow", 0) or 0)) for t in ticks)
+
         return {
             "open": o,
             "high": h,
             "low": l,
             "close": c,
             "range": h - l,
-            "volume": sum(int(t.get("last_traded_qty", 0) or 0) for t in ticks),
+            "volume": activity,
             "ts": float(ticks[-1]["ts"]),
             "sec": int(ticks[-1]["ts"]),
         }
+
+    def _micro_ok(self, secid: int, last_tick: dict, cur_sec: int) -> bool:
+        ltp = float(last_tick.get("ltp", 0) or 0)
+        bid = float(last_tick.get("bid", 0) or 0)
+        ask = float(last_tick.get("ask", 0) or 0)
+        spread = float(last_tick.get("spread", 0) or 0)
+        if spread <= 0 and bid > 0 and ask > 0:
+            spread = max(ask - bid, 0.0)
+
+        spread_pct = spread / max(ltp, 1e-9)
+        imb = float(last_tick.get("imbalance_5", 0) or 0)
+        flow = float(last_tick.get("flow", 0) or 0)
+        vac = bool(last_tick.get("vacuum_flag", False))
+        absorb_strength = float(last_tick.get("absorption_strength", 0) or 0)
+        absorb_flag = bool(last_tick.get("absorption_flag", False))
+
+        spread_ok = spread_pct <= self.MICRO_MAX_SPREAD_PCT
+        direction_ok = (imb >= self.MICRO_MIN_ABS_IMB) or (absorb_flag and absorb_strength >= self.MICRO_MIN_ABSORB)
+        confirm_ok = (absorb_strength >= self.MICRO_MIN_ABSORB) or (flow >= self.MICRO_MIN_FLOW)
+        micro_ok = spread_ok and (not vac) and direction_ok and confirm_ok
+
+        if (not micro_ok) and self.last_micro_reject_sec.get(secid) != cur_sec:
+            self.last_micro_reject_sec[secid] = cur_sec
+            print(
+                f"🚫 MICRO_REJECT | secid={secid} | spr%={spread_pct:.2%} "
+                f"imb={imb:.3f} flow={flow:.0f} vac={vac} absorb={absorb_strength:.2f}"
+            )
+
+        return micro_ok
 
     def _trade_pnl(self, side, entry, exit_price):
         return (exit_price - entry) if side == "LONG" else (entry - exit_price)
@@ -240,6 +285,10 @@ class OptionsMomentumEngine:
                 return "EXIT"
 
         if secid in self.active_trade:
+            return "NO_TRADE"
+
+        last_tick = self.tick_buffer[secid][-1] if self.tick_buffer[secid] else {}
+        if not self._micro_ok(secid, last_tick, cur_sec):
             return "NO_TRADE"
 
         # ==================================================
