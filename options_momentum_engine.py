@@ -25,10 +25,10 @@ class OptionsMomentumEngine:
     BASE_B_WICK = 0.65
     BASE_B_SPEED = 0.7
 
-    MICRO_MAX_SPREAD_PCT = 0.020
-    MICRO_MIN_ABS_IMB = 0.07
-    MICRO_MIN_ABSORB = 0.10
-    MICRO_MIN_FLOW = 600
+    MICRO_MAX_SPREAD_PCT = 0.012
+    MICRO_MIN_ABS_IMB = 0.12
+    MICRO_MIN_ABSORB = 0.15
+    MICRO_MIN_FLOW = 1500
 
     EXIT_PULLBACK = 0.40
     EXIT_VOL_DROP = 0.40
@@ -54,6 +54,9 @@ class OptionsMomentumEngine:
 
         self.last_exit_reason = {}
         self.last_micro_reject_sec = {}
+
+        self.last_candle_sec = {}
+        self.vol_exit_counter = defaultdict(int)
 
     # --------------------------------------------------
     def market_open(self) -> bool:
@@ -119,6 +122,12 @@ class OptionsMomentumEngine:
         candle = self._build_1s_candle(secid)
         if not candle:
             return "NO_TRADE"
+
+        candle_sec = int(candle["sec"])
+        if self.last_candle_sec.get(secid) == candle_sec:
+            return "NO_TRADE"
+
+        self.last_candle_sec[secid] = candle_sec
 
         self.candles[secid].append(candle)
         if len(self.candles[secid]) > 40:
@@ -248,7 +257,12 @@ class OptionsMomentumEngine:
             pnl = self._trade_pnl(t["side"], t["entry"], last["close"])
             pull = abs(last["close"] - t["entry"]) / max(t["entry"], 1e-9)
 
-            vol_exit = (avg_vol_5 > 0) and (last["volume"] < avg_vol_5 * self.EXIT_VOL_DROP)
+            if avg_vol_5 > 0 and last["volume"] < avg_vol_5 * self.EXIT_VOL_DROP:
+                self.vol_exit_counter[secid] += 1
+            else:
+                self.vol_exit_counter[secid] = 0
+
+            vol_exit = self.vol_exit_counter[secid] >= 2
 
             if pull > self.EXIT_PULLBACK or vol_exit:
                 self.last_trade_pnl[secid] = round(pnl, 2)
