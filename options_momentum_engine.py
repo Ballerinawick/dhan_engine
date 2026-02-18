@@ -186,7 +186,7 @@ class OptionsMomentumEngine:
         absorb_flag = bool(last_tick.get("absorption_flag", False))
 
         spread_ok = spread_pct <= self.MICRO_MAX_SPREAD_PCT
-        direction_ok = (imb >= self.MICRO_MIN_ABS_IMB) or (absorb_flag and absorb_strength >= self.MICRO_MIN_ABSORB)
+        direction_ok = (abs(imb) >= self.MICRO_MIN_ABS_IMB) or (absorb_flag and absorb_strength >= self.MICRO_MIN_ABSORB)
         confirm_ok = (absorb_strength >= self.MICRO_MIN_ABSORB) or (flow >= self.MICRO_MIN_FLOW)
         micro_ok = spread_ok and (not vac) and direction_ok and confirm_ok
 
