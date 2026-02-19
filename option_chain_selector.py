@@ -82,11 +82,7 @@ class OptionChainSelector:
     # --------------------------------------------------
     def fetch_chain(self, index: str) -> dict:
         self._rate_limit()
-
-        if index == "NIFTY":
-            expiry = self.im.get_nearest_option_expiry(index, prefer_weekly=True)
-        else:
-            expiry = self.im.get_nearest_option_expiry(index)
+        expiry = self.im.get_nearest_option_expiry(index, prefer_weekly=True)
         expiry_str = expiry.strftime("%Y-%m-%d")
 
         # ✅ FIX: Always use INDEX (spot) security id
@@ -159,10 +155,7 @@ class OptionChainSelector:
         underlying_ltp = float(data["last_price"])
 
         step = self.strike_step_map[index]
-        if index == "NIFTY":
-            expiry = self.im.get_nearest_option_expiry(index, prefer_weekly=True)
-        else:
-            expiry = self.im.get_nearest_option_expiry(index)
+        expiry = self.im.get_nearest_option_expiry(index, prefer_weekly=True)
         expiry_str = expiry.strftime("%Y-%m-%d")
 
         atm = int(round(underlying_ltp / step) * step)
@@ -266,6 +259,103 @@ class OptionChainSelector:
                 f"delta={min_delta:.2f}-{max_delta:.2f} "
                 f"spr<={max_spread_pct * 100:.1f}% | widen_steps or relax filters"
             )
+
+        if not ce_candidates or not pe_candidates:
+            rel_min_prem = max(self.min_ltp, min_prem * 0.6)
+            rel_max_prem = max_prem * 1.6
+            rel_min_delta = max(0.01, min_delta * 0.6)
+            rel_max_delta = min(0.95, max_delta * 1.8)
+            rel_max_spread = max_spread_pct * 1.8
+            ce_rel_low = atm + step
+            ce_rel_high = atm + max(self.max_steps + 8, self.max_steps * 2) * step
+            pe_rel_high = atm - step
+            pe_rel_low = atm - max(self.max_steps + 8, self.max_steps * 2) * step
+
+            if self.debug:
+                print(
+                    f"🛟 RELAXED_FILTERS | {index} | "
+                    f"prem={rel_min_prem:.1f}-{rel_max_prem:.1f} "
+                    f"delta={rel_min_delta:.2f}-{rel_max_delta:.2f} "
+                    f"spr<={rel_max_spread * 100:.1f}% "
+                    f"CE_OTM=[{ce_rel_low}..{ce_rel_high}] PE_OTM=[{pe_rel_high}..{pe_rel_low}]"
+                )
+
+            for strike_str, node in oc.items():
+                strike = float(strike_str)
+
+                if not ce_candidates and ("ce" in node) and (ce_rel_low <= strike <= ce_rel_high):
+                    ce_leg = node["ce"]
+                    ltp = float(ce_leg.get("last_price", 0) or 0)
+                    g = ce_leg.get("greeks", {}) or {}
+                    delta = abs(float(g.get("delta", 0) or 0))
+                    bid = float(ce_leg.get("top_bid_price", 0) or 0)
+                    ask = float(ce_leg.get("top_ask_price", 0) or 0)
+                    mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0 and ask >= bid) else 0.0
+                    spread_pct = ((ask - bid) / mid) if mid > 0 else 1e9
+                    if rel_min_prem <= ltp <= rel_max_prem and rel_min_delta <= delta <= rel_max_delta and spread_pct <= rel_max_spread:
+                        ce_candidates.append((strike, ce_leg, {"ltp": ltp, "delta": delta, "spread_pct": spread_pct}))
+
+                if not pe_candidates and ("pe" in node) and (pe_rel_low <= strike <= pe_rel_high):
+                    pe_leg = node["pe"]
+                    ltp = float(pe_leg.get("last_price", 0) or 0)
+                    g = pe_leg.get("greeks", {}) or {}
+                    delta = abs(float(g.get("delta", 0) or 0))
+                    bid = float(pe_leg.get("top_bid_price", 0) or 0)
+                    ask = float(pe_leg.get("top_ask_price", 0) or 0)
+                    mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0 and ask >= bid) else 0.0
+                    spread_pct = ((ask - bid) / mid) if mid > 0 else 1e9
+                    if rel_min_prem <= ltp <= rel_max_prem and rel_min_delta <= delta <= rel_max_delta and spread_pct <= rel_max_spread:
+                        pe_candidates.append((strike, pe_leg, {"ltp": ltp, "delta": delta, "spread_pct": spread_pct}))
+
+            if self.debug:
+                print(f"🛟 RELAXED_RESULT | {index} | CE_ok={len(ce_candidates)} PE_ok={len(pe_candidates)}")
+
+        if (not ce_candidates) or (not pe_candidates):
+            def _fallback_leg(side: str):
+                best = None
+                for strike_str, node in oc.items():
+                    strike = float(strike_str)
+                    leg = node.get("ce" if side == "CE" else "pe")
+                    if not leg:
+                        continue
+                    if side == "CE" and strike < (atm + step):
+                        continue
+                    if side == "PE" and strike > (atm - step):
+                        continue
+
+                    ltp = float(leg.get("last_price", 0) or 0)
+                    if ltp < self.min_ltp:
+                        continue
+
+                    bid = float(leg.get("top_bid_price", 0) or 0)
+                    ask = float(leg.get("top_ask_price", 0) or 0)
+                    if bid <= 0 or ask <= 0 or ask < bid:
+                        continue
+
+                    mid = (bid + ask) / 2.0
+                    spread_pct = (ask - bid) / mid if mid > 0 else 1e9
+                    score = spread_pct + (abs(strike - atm) / max(step, 1)) * 0.02
+                    if (best is None) or (score < best[0]):
+                        g = leg.get("greeks", {}) or {}
+                        delta = abs(float(g.get("delta", 0) or 0))
+                        best = (score, strike, leg, {"ltp": ltp, "delta": delta, "spread_pct": spread_pct})
+                return None if best is None else best[1:]
+
+            if not ce_candidates:
+                ce_fb = _fallback_leg("CE")
+                if ce_fb:
+                    if self.debug:
+                        print(f"🛟 EMERGENCY_PICK | {index} | CE strike={ce_fb[0]}")
+                    ce_candidates.append(ce_fb)
+
+            if not pe_candidates:
+                pe_fb = _fallback_leg("PE")
+                if pe_fb:
+                    if self.debug:
+                        print(f"🛟 EMERGENCY_PICK | {index} | PE strike={pe_fb[0]}")
+                    pe_candidates.append(pe_fb)
+
+        if not ce_candidates and not pe_candidates:
             return None
 
         best_ce = None
