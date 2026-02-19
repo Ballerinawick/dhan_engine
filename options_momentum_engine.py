@@ -55,6 +55,7 @@ class OptionsMomentumEngine:
         self.last_exit_reason = {}
         self.last_micro_reject_sec = {}
         self.last_micro_debug_sec = {}
+        self.micro_reject_window = defaultdict(deque)
 
         self.last_candle_sec = {}
         self.vol_exit_counter = defaultdict(int)
@@ -186,10 +187,41 @@ class OptionsMomentumEngine:
         absorb_strength = float(last_tick.get("absorption_strength", 0) or 0)
         absorb_flag = bool(last_tick.get("absorption_flag", False))
 
+        missing_fields = (
+            abs(imb) <= 1e-9
+            and abs(flow) <= 1e-9
+            and abs(absorb_strength) <= 1e-9
+            and (not absorb_flag)
+        )
+
         spread_ok = spread_pct <= self.MICRO_MAX_SPREAD_PCT
-        direction_ok = (abs(imb) >= self.MICRO_MIN_ABS_IMB) or (absorb_flag and absorb_strength >= self.MICRO_MIN_ABSORB)
-        confirm_ok = (absorb_strength >= self.MICRO_MIN_ABSORB) or (flow >= self.MICRO_MIN_FLOW)
+        direction_ok = missing_fields or (abs(imb) >= self.MICRO_MIN_ABS_IMB) or (absorb_flag and absorb_strength >= self.MICRO_MIN_ABSORB)
+        confirm_ok = missing_fields or (absorb_strength >= self.MICRO_MIN_ABSORB) or (abs(flow) >= self.MICRO_MIN_FLOW)
         micro_ok = spread_ok and (not vac) and direction_ok and confirm_ok
+
+        failed_reasons = []
+        if not spread_ok:
+            failed_reasons.append("spread")
+        if not direction_ok:
+            failed_reasons.append("direction")
+        if not confirm_ok:
+            failed_reasons.append("confirm")
+        if vac:
+            failed_reasons.append("vacuum")
+        if missing_fields:
+            failed_reasons.append("missing_fields")
+
+        if failed_reasons:
+            q = self.micro_reject_window[secid]
+            for reason in failed_reasons:
+                q.append((cur_sec, reason))
+            while q and q[0][0] <= (cur_sec - 60):
+                q.popleft()
+            reason_counts = defaultdict(int)
+            for _, reason in q:
+                reason_counts[reason] += 1
+        else:
+            reason_counts = defaultdict(int)
 
         if self.last_micro_debug_sec.get(secid) != cur_sec:
             self.last_micro_debug_sec[secid] = cur_sec
@@ -197,15 +229,19 @@ class OptionsMomentumEngine:
                 f"🔎 MICRO_CHECK | secid={secid} | micro_ok={micro_ok} "
                 f"spread_ok={spread_ok} direction_ok={direction_ok} confirm_ok={confirm_ok} vac={vac} | "
                 f"ltp={ltp:.2f} bid={bid:.2f} ask={ask:.2f} spread={spread:.4f} spread_pct={spread_pct:.4%} "
-                f"imb={imb:+.4f} flow={flow:.2f} absorb_strength={absorb_strength:.4f} "
-                f"absorb_flag={absorb_flag} vacuum_flag={vac}"
+                f"imbalance_5={imb:+.4f} flow={flow:.2f} absorb_strength={absorb_strength:.4f} "
+                f"absorb_flag={absorb_flag} vacuum_flag={vac} fail={','.join(failed_reasons) or 'none'} "
+                f"rej60s={{spread:{reason_counts['spread']},direction:{reason_counts['direction']},"
+                f"confirm:{reason_counts['confirm']},vacuum:{reason_counts['vacuum']},"
+                f"missing_fields:{reason_counts['missing_fields']}}}"
             )
 
         if (not micro_ok) and self.last_micro_reject_sec.get(secid) != cur_sec:
             self.last_micro_reject_sec[secid] = cur_sec
             print(
                 f"🚫 MICRO_REJECT | secid={secid} | spr%={spread_pct:.2%} "
-                f"imb={imb:.3f} flow={flow:.0f} vac={vac} absorb={absorb_strength:.2f}"
+                f"imb={imb:.3f} flow={flow:.0f} vac={vac} absorb={absorb_strength:.2f} "
+                f"fail={','.join(failed_reasons) or 'none'}"
             )
 
         return micro_ok
