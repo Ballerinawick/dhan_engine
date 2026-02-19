@@ -54,6 +54,7 @@ class OptionsMomentumEngine:
 
         self.last_exit_reason = {}
         self.last_micro_reject_sec = {}
+        self.last_micro_debug_sec = {}
 
         self.last_candle_sec = {}
         self.vol_exit_counter = defaultdict(int)
@@ -189,6 +190,16 @@ class OptionsMomentumEngine:
         direction_ok = (abs(imb) >= self.MICRO_MIN_ABS_IMB) or (absorb_flag and absorb_strength >= self.MICRO_MIN_ABSORB)
         confirm_ok = (absorb_strength >= self.MICRO_MIN_ABSORB) or (flow >= self.MICRO_MIN_FLOW)
         micro_ok = spread_ok and (not vac) and direction_ok and confirm_ok
+
+        if self.last_micro_debug_sec.get(secid) != cur_sec:
+            self.last_micro_debug_sec[secid] = cur_sec
+            print(
+                f"🔎 MICRO_CHECK | secid={secid} | micro_ok={micro_ok} "
+                f"spread_ok={spread_ok} direction_ok={direction_ok} confirm_ok={confirm_ok} vac={vac} | "
+                f"ltp={ltp:.2f} bid={bid:.2f} ask={ask:.2f} spread={spread:.4f} spread_pct={spread_pct:.4%} "
+                f"imb={imb:+.4f} flow={flow:.2f} absorb_strength={absorb_strength:.4f} "
+                f"absorb_flag={absorb_flag} vacuum_flag={vac}"
+            )
 
         if (not micro_ok) and self.last_micro_reject_sec.get(secid) != cur_sec:
             self.last_micro_reject_sec[secid] = cur_sec
