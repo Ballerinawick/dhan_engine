@@ -19,7 +19,7 @@ class OptionsMomentumEngine:
     MARKET_START = dtime(9, 10)
     MARKET_END = dtime(15, 30)
 
-    BASE_A_SPEED = 1.8
+    BASE_A_SPEED = 2.4
     BASE_A_VOL = 2.5
 
     BASE_B_WICK = 0.65
@@ -32,6 +32,9 @@ class OptionsMomentumEngine:
 
     EXIT_PULLBACK = 0.40
     EXIT_VOL_DROP = 0.40
+    MIN_HOLD_SEC = 180
+    EARLY_EXIT_PULLBACK = 0.70
+    VOL_EXIT_STREAK = 5
 
     # SIDEWAYS EXIT
     SIDEWAYS_MIN_HOLD_SEC = 120
@@ -59,6 +62,16 @@ class OptionsMomentumEngine:
 
         self.last_candle_sec = {}
         self.vol_exit_counter = defaultdict(int)
+
+        self.micro_stats_window = defaultdict(int)
+        self.last_micro_stats_sec = None
+
+        self.entries_taken = 0
+        self.exits_taken = 0
+        self.total_hold_sec = 0.0
+        self.fees_paid = 0.0
+        self.fee_per_trade = 0.0
+        self.last_engine_state_sec = None
 
     # --------------------------------------------------
     def market_open(self) -> bool:
@@ -211,38 +224,28 @@ class OptionsMomentumEngine:
         if missing_fields:
             failed_reasons.append("missing_fields")
 
-        if failed_reasons:
-            q = self.micro_reject_window[secid]
-            for reason in failed_reasons:
-                q.append((cur_sec, reason))
-            while q and q[0][0] <= (cur_sec - 60):
-                q.popleft()
-            reason_counts = defaultdict(int)
-            for _, reason in q:
-                reason_counts[reason] += 1
-        else:
-            reason_counts = defaultdict(int)
+        self.micro_stats_window["pass" if micro_ok else "fail"] += 1
+        if not spread_ok:
+            self.micro_stats_window["spread_fail"] += 1
+        if not direction_ok:
+            self.micro_stats_window["direction_fail"] += 1
+        if not confirm_ok:
+            self.micro_stats_window["confirm_fail"] += 1
+        if vac:
+            self.micro_stats_window["vacuum_fail"] += 1
 
-        if self.last_micro_debug_sec.get(secid) != cur_sec:
-            self.last_micro_debug_sec[secid] = cur_sec
+        bucket_30 = cur_sec // 30
+        if self.last_micro_stats_sec != bucket_30:
+            self.last_micro_stats_sec = bucket_30
             print(
-                f"🔎 MICRO_CHECK | secid={secid} | micro_ok={micro_ok} "
-                f"spread_ok={spread_ok} direction_ok={direction_ok} confirm_ok={confirm_ok} vac={vac} | "
-                f"ltp={ltp:.2f} bid={bid:.2f} ask={ask:.2f} spread={spread:.4f} spread_pct={spread_pct:.4%} "
-                f"imbalance_5={imb:+.4f} flow={flow:.2f} absorb_strength={absorb_strength:.4f} "
-                f"absorb_flag={absorb_flag} vacuum_flag={vac} fail={','.join(failed_reasons) or 'none'} "
-                f"rej60s={{spread:{reason_counts['spread']},direction:{reason_counts['direction']},"
-                f"confirm:{reason_counts['confirm']},vacuum:{reason_counts['vacuum']},"
-                f"missing_fields:{reason_counts['missing_fields']}}}"
+                "🧠 MICRO_STATS | "
+                f"pass={self.micro_stats_window['pass']} | "
+                f"spread_fail={self.micro_stats_window['spread_fail']} | "
+                f"direction_fail={self.micro_stats_window['direction_fail']} | "
+                f"confirm_fail={self.micro_stats_window['confirm_fail']} | "
+                f"vacuum_fail={self.micro_stats_window['vacuum_fail']}"
             )
-
-        if (not micro_ok) and self.last_micro_reject_sec.get(secid) != cur_sec:
-            self.last_micro_reject_sec[secid] = cur_sec
-            print(
-                f"🚫 MICRO_REJECT | secid={secid} | spr%={spread_pct:.2%} "
-                f"imb={imb:.3f} flow={flow:.0f} vac={vac} absorb={absorb_strength:.2f} "
-                f"fail={','.join(failed_reasons) or 'none'}"
-            )
+            self.micro_stats_window = defaultdict(int)
 
         return micro_ok
 
@@ -256,6 +259,25 @@ class OptionsMomentumEngine:
         avg_range = sum(x["range"] for x in candles_list) / len(candles_list)
         avg_vol = sum(x["volume"] for x in candles_list) / len(candles_list)
         return avg_range, avg_vol
+
+    def _log_engine_state(self, cur_sec: int):
+        bucket_60 = cur_sec // 60
+        if self.last_engine_state_sec == bucket_60:
+            return
+        self.last_engine_state_sec = bucket_60
+
+        open_trades = len(self.active_trade)
+        avg_hold = self.total_hold_sec / max(self.exits_taken, 1)
+        churn_ratio = self.exits_taken / max(self.entries_taken, 1)
+        print(
+            "📈 ENGINE_STATE | "
+            f"OpenTrades={open_trades} | "
+            f"EntriesTaken={self.entries_taken} | "
+            f"AvgHoldTime={avg_hold:.1f} | "
+            f"CumPnL={sum(self.cum_pnl.values()):.2f} | "
+            f"FeesPaid={self.fees_paid:.2f} | "
+            f"ChurnRatio={churn_ratio:.3f}"
+        )
 
     def _evaluate(self, secid: int) -> str:
         c = self.candles[secid]
@@ -278,6 +300,7 @@ class OptionsMomentumEngine:
 
         day = self.option_day_index()
         regime = self.time_regime()
+        self._log_engine_state(cur_sec)
 
         decay_penalty = 1.0 + (day * 0.15)
 
@@ -303,20 +326,40 @@ class OptionsMomentumEngine:
             t = self.active_trade[secid]
             pnl = self._trade_pnl(t["side"], t["entry"], last["close"])
             pull = abs(last["close"] - t["entry"]) / max(t["entry"], 1e-9)
+            age = float(last["ts"]) - float(t["ts"])
+            last_tick = self.tick_buffer[secid][-1] if self.tick_buffer[secid] else {}
+            vacuum_flag = bool(last_tick.get("vacuum_flag", False))
 
             if avg_vol_5 > 0 and last["volume"] < avg_vol_5 * self.EXIT_VOL_DROP:
                 self.vol_exit_counter[secid] += 1
             else:
                 self.vol_exit_counter[secid] = 0
 
-            vol_exit = self.vol_exit_counter[secid] >= 2
+            vol_exit = self.vol_exit_counter[secid] >= self.VOL_EXIT_STREAK
+
+            if age < self.MIN_HOLD_SEC:
+                if vol_exit:
+                    print(
+                        f"🛡 HOLD_LOCK | secid={secid} | age={age:.1f} | pull={pull:.3f} | "
+                        "reason=vol_exit_blocked"
+                    )
+                if pull <= self.EARLY_EXIT_PULLBACK and (not vacuum_flag):
+                    return "NO_TRADE"
+                vol_exit = False
 
             if pull > self.EXIT_PULLBACK or vol_exit:
                 self.last_trade_pnl[secid] = round(pnl, 2)
                 self.cum_pnl[secid] += pnl
                 self.active_trade.pop(secid, None)
+                self.exits_taken += 1
+                self.total_hold_sec += max(age, 0.0)
+                self.fees_paid += self.fee_per_trade
                 self.last_action_sec[secid] = cur_sec
                 self.last_exit_reason[secid] = "DYNAMIC"
+                print(
+                    f"🔻 EXIT_SIGNAL | secid={secid} | reason=DYNAMIC | pnl={pnl:.2f} | "
+                    f"age={age:.1f} | vol_counter={self.vol_exit_counter[secid]}"
+                )
                 return "EXIT"
 
         # ==================================================
@@ -334,15 +377,22 @@ class OptionsMomentumEngine:
             low_speed = (avg_range_20 > 0) and (price_speed < avg_range_20 * self.SIDEWAYS_LOW_SPEED_RATIO)
 
             if (
-                age >= self.SIDEWAYS_MIN_HOLD_SEC
+                age >= max(self.SIDEWAYS_MIN_HOLD_SEC, self.MIN_HOLD_SEC)
                 and compressed
                 and weak_volume
                 and low_speed
                 and pnl_pct <= self.SIDEWAYS_MAX_PNL_PCT
             ):
                 self.active_trade.pop(secid, None)
+                self.exits_taken += 1
+                self.total_hold_sec += max(age, 0.0)
+                self.fees_paid += self.fee_per_trade
                 self.last_action_sec[secid] = cur_sec
                 self.last_exit_reason[secid] = "SIDEWAYS"
+                print(
+                    f"🔻 EXIT_SIGNAL | secid={secid} | reason=SIDEWAYS | pnl={pnl:.2f} | "
+                    f"age={age:.1f} | vol_counter={self.vol_exit_counter[secid]}"
+                )
                 return "EXIT"
 
         if secid in self.active_trade:
@@ -367,7 +417,13 @@ class OptionsMomentumEngine:
                 "entry": float(last["close"]),
                 "ts": float(last["ts"]),
             }
+            self.entries_taken += 1
             self.last_action_sec[secid] = cur_sec
+            print(
+                f"🟢 ENTRY | secid={secid} | type=A | price={last['close']:.2f} | "
+                f"speed={price_speed:.4f} | avg_range_5={avg_range_5:.4f} | "
+                f"volume={last['volume']:.2f} | avg_vol_5={avg_vol_5:.2f} | regime={regime} | day={day}"
+            )
             return "A_ENTRY"
 
         # ==================================================
@@ -387,7 +443,13 @@ class OptionsMomentumEngine:
                     "entry": float(last["close"]),
                     "ts": float(last["ts"]),
                 }
+                self.entries_taken += 1
                 self.last_action_sec[secid] = cur_sec
+                print(
+                    f"🟢 ENTRY | secid={secid} | type=B | price={last['close']:.2f} | "
+                    f"speed={price_speed:.4f} | avg_range_5={avg_range_5:.4f} | "
+                    f"volume={last['volume']:.2f} | avg_vol_5={avg_vol_5:.2f} | regime={regime} | day={day}"
+                )
                 return "B_ENTRY"
 
         return "NO_TRADE"
