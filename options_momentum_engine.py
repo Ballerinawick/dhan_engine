@@ -163,17 +163,20 @@ class OptionsMomentumEngine:
 
     def _build_1s_candle(self, secid):
         ticks = self.tick_buffer[secid]
-        if len(ticks) < 2:
-            return None
-
         prices = [float(t.get("ltp", 0) or 0) for t in ticks if float(t.get("ltp", 0) or 0) > 0]
-        if not prices:
+        if len(prices) < 2:
             return None
 
-        o = prices[0]
-        h = max(prices)
-        l = min(prices)
-        c = prices[-1]
+        candle = {
+            "open": prices[0],
+            "high": prices[0],
+            "low": prices[0],
+            "close": prices[0],
+        }
+        for price in prices[1:]:
+            candle["high"] = max(candle["high"], price)
+            candle["low"] = min(candle["low"], price)
+            candle["close"] = price
 
         activity = 0.0
         for i in range(1, len(ticks)):
@@ -186,79 +189,18 @@ class OptionsMomentumEngine:
         activity += sum(abs(float(t.get("flow", 0) or 0)) for t in ticks)
 
         return {
-            "open": o,
-            "high": h,
-            "low": l,
-            "close": c,
-            "range": h - l,
+            "open": candle["open"],
+            "high": candle["high"],
+            "low": candle["low"],
+            "close": candle["close"],
+            "range": candle["high"] - candle["low"],
             "volume": activity,
             "ts": float(ticks[-1]["ts"]),
             "sec": int(ticks[-1]["ts"]),
         }
 
     def _micro_ok(self, secid: int, last_tick: dict, cur_sec: int) -> bool:
-        ltp = float(last_tick.get("ltp", 0) or 0)
-        bid = float(last_tick.get("bid", 0) or 0)
-        ask = float(last_tick.get("ask", 0) or 0)
-        spread = float(last_tick.get("spread", 0) or 0)
-        if spread <= 0 and bid > 0 and ask > 0:
-            spread = max(ask - bid, 0.0)
-
-        spread_pct = spread / max(ltp, 1e-9)
-        imb = float(last_tick.get("imbalance_5", 0) or 0)
-        flow = float(last_tick.get("flow", 0) or 0)
-        vac = bool(last_tick.get("vacuum_flag", False))
-        absorb_strength = float(last_tick.get("absorption_strength", 0) or 0)
-        absorb_flag = bool(last_tick.get("absorption_flag", False))
-
-        missing_fields = (
-            abs(imb) <= 1e-9
-            and abs(flow) <= 1e-9
-            and abs(absorb_strength) <= 1e-9
-            and (not absorb_flag)
-        )
-
-        spread_ok = spread_pct <= self.MICRO_MAX_SPREAD_PCT
-        direction_ok = missing_fields or (abs(imb) >= self.MICRO_MIN_ABS_IMB) or (absorb_flag and absorb_strength >= self.MICRO_MIN_ABSORB)
-        confirm_ok = missing_fields or (absorb_strength >= self.MICRO_MIN_ABSORB) or (abs(flow) >= self.MICRO_MIN_FLOW)
-        micro_ok = spread_ok and (not vac) and direction_ok and confirm_ok
-
-        failed_reasons = []
-        if not spread_ok:
-            failed_reasons.append("spread")
-        if not direction_ok:
-            failed_reasons.append("direction")
-        if not confirm_ok:
-            failed_reasons.append("confirm")
-        if vac:
-            failed_reasons.append("vacuum")
-        if missing_fields:
-            failed_reasons.append("missing_fields")
-
-        self.micro_stats_window["pass" if micro_ok else "fail"] += 1
-        if not spread_ok:
-            self.micro_stats_window["spread_fail"] += 1
-        if not direction_ok:
-            self.micro_stats_window["direction_fail"] += 1
-        if not confirm_ok:
-            self.micro_stats_window["confirm_fail"] += 1
-        if vac:
-            self.micro_stats_window["vacuum_fail"] += 1
-
-        bucket_30 = cur_sec // 30
-        if self.last_micro_stats_sec != bucket_30:
-            self.last_micro_stats_sec = bucket_30
-            print(
-                "🧠 MICRO_STATS | "
-                f"pass={self.micro_stats_window['pass']} | "
-                f"spread_fail={self.micro_stats_window['spread_fail']} | "
-                f"direction_fail={self.micro_stats_window['direction_fail']} | "
-                f"confirm_fail={self.micro_stats_window['confirm_fail']} | "
-                f"vacuum_fail={self.micro_stats_window['vacuum_fail']}"
-            )
-            self.micro_stats_window = defaultdict(int)
-
-        return micro_ok
+        return True
 
     def _trade_pnl(self, side, entry, exit_price):
         return (exit_price - entry) if side == "LONG" else (entry - exit_price)
