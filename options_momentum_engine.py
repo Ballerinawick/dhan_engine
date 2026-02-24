@@ -30,18 +30,7 @@ class OptionsMomentumEngine:
     MICRO_MIN_ABSORB = 0.12
     MICRO_MIN_FLOW = 800
 
-    EXIT_PULLBACK = 0.40
-    EXIT_VOL_DROP = 0.40
-    MIN_HOLD_SEC = 180
-    EARLY_EXIT_PULLBACK = 0.70
-    VOL_EXIT_STREAK = 5
-
-    # SIDEWAYS EXIT
-    SIDEWAYS_MIN_HOLD_SEC = 120
-    SIDEWAYS_RANGE_RATIO = 0.35
-    SIDEWAYS_VOL_RATIO = 0.60
-    SIDEWAYS_LOW_SPEED_RATIO = 0.40
-    SIDEWAYS_MAX_PNL_PCT = 0.15
+    TURN_SPEED_RATIO_THRESHOLD = 3.0
 
     def __init__(self):
         self.tick_buffer = defaultdict(deque)
@@ -268,6 +257,7 @@ class OptionsMomentumEngine:
         if not candles_list:
             return 0.0, 0.0
         avg_range = sum(x["range"] for x in candles_list) / len(candles_list)
+        avg_range = max(avg_range, 0.01)
         avg_vol = sum(x["volume"] for x in candles_list) / len(candles_list)
         return avg_range, avg_vol
 
@@ -301,21 +291,29 @@ class OptionsMomentumEngine:
         if self.last_action_sec.get(secid) == cur_sec:
             return "NO_TRADE"
 
-        price_speed = abs(last["close"] - prev["close"])
+        if len(c) < 3:
+            return "NO_TRADE"
+
+        prev2 = c[-3]
+        speed = float(last["close"] - prev["close"])
+        prev_speed = float(prev["close"] - prev2["close"])
 
         debug_last5 = list(c)[-5:]
         avg_range_5, avg_vol_5 = self._avg_range_vol(debug_last5)
+
+        speed_ratio = min(abs(speed) / max(avg_range_5, 1e-6), 50.0)
+        vol_ratio = (last["volume"] / avg_vol_5) if avg_vol_5 > 0 and last["volume"] > 0 else 0.0
 
         # ---- DEBUG ENTRY DIAGNOSTIC ----
         if len(c) >= 5:
             print(
                 f"🧪 ENTRY_CHECK | secid={secid} | "
                 f"close={last['close']:.2f} | "
-                f"speed={price_speed:.4f} | "
+                f"speed={abs(speed):.4f} | "
                 f"avg_range_5={avg_range_5:.4f} | "
-                f"speed_ratio={(price_speed / max(avg_range_5,1e-9)):.2f} | "
+                f"speed_ratio={speed_ratio:.2f} | "
                 f"vol={last['volume']:.2f} | "
-                f"vol_ratio={(last['volume'] / max(avg_vol_5,1e-9)):.2f}"
+                f"vol_ratio={vol_ratio:.2f}"
             )
 
         last5 = list(c)[-5:]
@@ -324,100 +322,38 @@ class OptionsMomentumEngine:
         avg_range_5, avg_vol_5 = self._avg_range_vol(last5)
         avg_range_20, avg_vol_20 = self._avg_range_vol(last20)
 
-        day = self.option_day_index()
-        regime = self.time_regime()
         self._log_engine_state(cur_sec)
 
-        decay_penalty = 1.0 + (day * 0.15)
-
-        if regime == "OPEN":
-            time_boost = 1.10
-        elif regime == "TREND":
-            time_boost = 0.90
-        elif regime == "CLOSE":
-            time_boost = 1.15
-        else:
-            time_boost = 1.00
-
-        A_SPEED = self.BASE_A_SPEED * decay_penalty * time_boost
-        A_VOL = self.BASE_A_VOL * decay_penalty
-
-        B_SPEED = self.BASE_B_SPEED * decay_penalty * time_boost
-        B_WICK = self.BASE_B_WICK
+        shrinking_range = float(last["range"]) < float(prev["range"])
+        speed_collapse = abs(speed) < abs(prev_speed) * 0.6
+        midpoint_prev = (float(prev["high"]) + float(prev["low"])) / 2.0
 
         # ==================================================
-        # EXIT (dynamic)
+        # EXIT ON OPPOSITE TURN (LONG-ONLY)
         # ==================================================
         if secid in self.active_trade:
-            t = self.active_trade[secid]
-            pnl = self._trade_pnl(t["side"], t["entry"], last["close"])
-            pull = abs(last["close"] - t["entry"]) / max(t["entry"], 1e-9)
-            age = float(last["ts"]) - float(t["ts"])
-            last_tick = self.tick_buffer[secid][-1] if self.tick_buffer[secid] else {}
-            vacuum_flag = bool(last_tick.get("vacuum_flag", False))
+            opposite_turn_exit = (
+                prev_speed > 0
+                and speed_ratio > self.TURN_SPEED_RATIO_THRESHOLD
+                and shrinking_range
+                and speed_collapse
+                and float(last["close"]) < midpoint_prev
+            )
 
-            if avg_vol_5 > 0 and last["volume"] < avg_vol_5 * self.EXIT_VOL_DROP:
-                self.vol_exit_counter[secid] += 1
-            else:
-                self.vol_exit_counter[secid] = 0
-
-            vol_exit = self.vol_exit_counter[secid] >= self.VOL_EXIT_STREAK
-
-            if age < self.MIN_HOLD_SEC:
-                if vol_exit:
-                    print(
-                        f"🛡 HOLD_LOCK | secid={secid} | age={age:.1f} | pull={pull:.3f} | "
-                        "reason=vol_exit_blocked"
-                    )
-                if pull <= self.EARLY_EXIT_PULLBACK and (not vacuum_flag):
-                    return "NO_TRADE"
-                vol_exit = False
-
-            if pull > self.EXIT_PULLBACK or vol_exit:
+            if opposite_turn_exit:
+                t = self.active_trade[secid]
+                pnl = self._trade_pnl(t["side"], t["entry"], last["close"])
+                self.active_trade.pop(secid, None)
+                self.exits_taken += 1
+                self.total_hold_sec += max(float(last["ts"]) - float(t["ts"]), 0.0)
+                self.fees_paid += self.fee_per_trade
+                self.last_action_sec[secid] = cur_sec
+                self.last_exit_reason[secid] = "OPPOSITE_TURN"
                 self.last_trade_pnl[secid] = round(pnl, 2)
                 self.cum_pnl[secid] += pnl
-                self.active_trade.pop(secid, None)
-                self.exits_taken += 1
-                self.total_hold_sec += max(age, 0.0)
-                self.fees_paid += self.fee_per_trade
-                self.last_action_sec[secid] = cur_sec
-                self.last_exit_reason[secid] = "DYNAMIC"
                 print(
-                    f"🔻 EXIT_SIGNAL | secid={secid} | reason=DYNAMIC | pnl={pnl:.2f} | "
-                    f"age={age:.1f} | vol_counter={self.vol_exit_counter[secid]}"
-                )
-                return "EXIT"
-
-        # ==================================================
-        # SIDEWAYS EXIT (correct compression logic)
-        # ==================================================
-        if secid in self.active_trade:
-            t = self.active_trade[secid]
-            age = float(last["ts"]) - float(t["ts"])
-
-            pnl = self._trade_pnl(t["side"], t["entry"], last["close"])
-            pnl_pct = abs(pnl) / max(t["entry"], 1e-9)
-
-            compressed = (avg_range_20 > 0) and (avg_range_5 < avg_range_20 * self.SIDEWAYS_RANGE_RATIO)
-            weak_volume = (avg_vol_20 > 0) and (avg_vol_5 < avg_vol_20 * self.SIDEWAYS_VOL_RATIO)
-            low_speed = (avg_range_20 > 0) and (price_speed < avg_range_20 * self.SIDEWAYS_LOW_SPEED_RATIO)
-
-            if (
-                age >= max(self.SIDEWAYS_MIN_HOLD_SEC, self.MIN_HOLD_SEC)
-                and compressed
-                and weak_volume
-                and low_speed
-                and pnl_pct <= self.SIDEWAYS_MAX_PNL_PCT
-            ):
-                self.active_trade.pop(secid, None)
-                self.exits_taken += 1
-                self.total_hold_sec += max(age, 0.0)
-                self.fees_paid += self.fee_per_trade
-                self.last_action_sec[secid] = cur_sec
-                self.last_exit_reason[secid] = "SIDEWAYS"
-                print(
-                    f"🔻 EXIT_SIGNAL | secid={secid} | reason=SIDEWAYS | pnl={pnl:.2f} | "
-                    f"age={age:.1f} | vol_counter={self.vol_exit_counter[secid]}"
+                    f"🔻 TURN_EXIT LONG | secid={secid} | close={last['close']:.2f} | "
+                    "reason=OPPOSITE_TURN"
                 )
                 return "EXIT"
 
@@ -428,17 +364,17 @@ class OptionsMomentumEngine:
         if not self._micro_ok(secid, last_tick, cur_sec):
             return "NO_TRADE"
 
-        # ==================================================
-        # STRATEGY A
-        # ==================================================
-        if (
-            avg_range_5 > 0
-            and price_speed > avg_range_5 * A_SPEED
-            and avg_vol_5 > 0
-            and last["volume"] > avg_vol_5 * A_VOL
-        ):
+        prior_move_down = prev_speed < 0
+        down_exhaustion = (
+            speed_ratio > self.TURN_SPEED_RATIO_THRESHOLD
+            and shrinking_range
+            and speed_collapse
+        )
+        reversal_confirm = float(last["close"]) > midpoint_prev
+
+        if prior_move_down and down_exhaustion and reversal_confirm:
             self.active_trade[secid] = {
-                "type": "A",
+                "type": "TURN",
                 "side": "LONG",
                 "entry": float(last["close"]),
                 "ts": float(last["ts"]),
@@ -446,36 +382,9 @@ class OptionsMomentumEngine:
             self.entries_taken += 1
             self.last_action_sec[secid] = cur_sec
             print(
-                f"🟢 ENTRY | secid={secid} | type=A | price={last['close']:.2f} | "
-                f"speed={price_speed:.4f} | avg_range_5={avg_range_5:.4f} | "
-                f"volume={last['volume']:.2f} | avg_vol_5={avg_vol_5:.2f} | regime={regime} | day={day}"
+                f"🟢 TURN_ENTRY LONG | secid={secid} | close={last['close']:.2f} | "
+                f"speed_ratio={speed_ratio:.2f} | shrink={shrinking_range} | collapse={speed_collapse}"
             )
-            return "A_ENTRY"
-
-        # ==================================================
-        # STRATEGY B
-        # ==================================================
-        rng = float(last["range"])
-        if rng > 0 and avg_range_5 > 0:
-            uw = float(last["high"]) - max(float(last["open"]), float(last["close"]))
-            lw = min(float(last["open"]), float(last["close"])) - float(last["low"])
-
-            trap_down = lw > rng * B_WICK
-
-            if price_speed > avg_range_5 * B_SPEED and trap_down:
-                self.active_trade[secid] = {
-                    "type": "B",
-                    "side": "LONG",
-                    "entry": float(last["close"]),
-                    "ts": float(last["ts"]),
-                }
-                self.entries_taken += 1
-                self.last_action_sec[secid] = cur_sec
-                print(
-                    f"🟢 ENTRY | secid={secid} | type=B | price={last['close']:.2f} | "
-                    f"speed={price_speed:.4f} | avg_range_5={avg_range_5:.4f} | "
-                    f"volume={last['volume']:.2f} | avg_vol_5={avg_vol_5:.2f} | regime={regime} | day={day}"
-                )
-                return "B_ENTRY"
+            return "TURN_ENTRY"
 
         return "NO_TRADE"

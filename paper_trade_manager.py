@@ -85,7 +85,11 @@ class PaperTradeManager:
         if secid in self.positions:
             return
 
-        if side == "SHORT":
+        side_norm = str(side).upper()
+        if side_norm in {"SHORT", "SELL", "-1"}:
+            print(
+                f"🛑 LONG_ONLY_BLOCKED | attempted={side_norm} | secid={secid} | strategy={reason}"
+            )
             return
 
         index = self._extract_index(tag)
