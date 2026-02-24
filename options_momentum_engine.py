@@ -303,6 +303,21 @@ class OptionsMomentumEngine:
 
         price_speed = abs(last["close"] - prev["close"])
 
+        debug_last5 = list(c)[-5:]
+        avg_range_5, avg_vol_5 = self._avg_range_vol(debug_last5)
+
+        # ---- DEBUG ENTRY DIAGNOSTIC ----
+        if len(c) >= 5:
+            print(
+                f"🧪 ENTRY_CHECK | secid={secid} | "
+                f"close={last['close']:.2f} | "
+                f"speed={price_speed:.4f} | "
+                f"avg_range_5={avg_range_5:.4f} | "
+                f"speed_ratio={(price_speed / max(avg_range_5,1e-9)):.2f} | "
+                f"vol={last['volume']:.2f} | "
+                f"vol_ratio={(last['volume'] / max(avg_vol_5,1e-9)):.2f}"
+            )
+
         last5 = list(c)[-5:]
         last20 = list(c)[-20:] if len(c) >= 20 else list(c)
 
