@@ -110,11 +110,11 @@ class InstitutionalDecisionEngine:
 
         self._shadow_update(index, side, now, struct_ok)
 
-        if signal in ("A_ENTRY", "B_ENTRY", "EXIT"):
+        if signal in ("A_ENTRY", "B_ENTRY", "TURN_ENTRY", "EXIT"):
             self._log(f"🧠 SIGNAL | {index} | {tag} | {signal} | ltp={ltp:.2f}")
 
         # ================= ENTRY =================
-        if signal in ("A_ENTRY", "B_ENTRY"):
+        if signal in ("A_ENTRY", "B_ENTRY", "TURN_ENTRY"):
             trade = momentum_engine.active_trade.get(secid)
             if not trade:
                 return {"entry_allowed": False}
