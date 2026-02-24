@@ -73,6 +73,10 @@ class OptionsMomentumEngine:
         self.fee_per_trade = 0.0
         self.last_engine_state_sec = None
 
+        # --- DEBUG: print tick format once per secid ---
+        self._printed_sample_tick = set()
+        self._printed_sample_tick_ts = {}
+
     # --------------------------------------------------
     def market_open(self) -> bool:
         now = datetime.now(self.IST)
@@ -122,6 +126,13 @@ class OptionsMomentumEngine:
         ltp = float(tick.get("ltp", 0) or 0)
         if not ts or ltp <= 0:
             return "NO_TRADE"
+
+        # --- DEBUG: print tick dict format once per instrument ---
+        if secid not in self._printed_sample_tick:
+            print("🔍 SAMPLE_TICK_FORMAT | secid=", secid, "| keys=", sorted(list(tick.keys())))
+            print("🔍 SAMPLE_TICK_DICT  |", tick)
+            self._printed_sample_tick.add(secid)
+            self._printed_sample_tick_ts[secid] = time.time()
 
         self._print_day_context(float(ts))
 
