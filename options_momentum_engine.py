@@ -1,5 +1,6 @@
 from collections import defaultdict, deque
 from datetime import datetime, time as dtime
+from statistics import median
 from zoneinfo import ZoneInfo
 
 import time
@@ -65,6 +66,19 @@ class OptionsMomentumEngine:
         # --- DEBUG: print tick format once per secid ---
         self._printed_sample_tick = set()
         self._printed_sample_tick_ts = {}
+
+        # 30-minute warmup baseline stats (collection-only)
+        self.warmup_start_sec = {}
+        self.warmup_reported = set()
+        self.warmup_stats = defaultdict(lambda: {
+            "avg_range_5": [],
+            "speed": [],
+            "abs_flow": [],
+            "abs_imbalance_5": [],
+            "absorption_true": 0,
+            "absorption_total": 0,
+            "spread": [],
+        })
 
     # --------------------------------------------------
     def market_open(self) -> bool:
@@ -280,6 +294,69 @@ class OptionsMomentumEngine:
             f"ChurnRatio={churn_ratio:.3f}"
         )
 
+    def _dist_summary(self, values):
+        if not values:
+            return "n=0"
+        sorted_vals = sorted(float(v) for v in values)
+        n = len(sorted_vals)
+
+        def pct(p):
+            idx = int((n - 1) * p)
+            return sorted_vals[idx]
+
+        return (
+            f"n={n} p50={pct(0.50):.4f} p90={pct(0.90):.4f} "
+            f"p99={pct(0.99):.4f} max={sorted_vals[-1]:.4f}"
+        )
+
+    def _collect_warmup_stats(self, secid: int, cur_sec: int, speed: float, avg_range_5: float, last_tick: dict):
+        if secid in self.warmup_reported:
+            return
+
+        if secid not in self.warmup_start_sec:
+            self.warmup_start_sec[secid] = cur_sec
+
+        stats = self.warmup_stats[secid]
+        stats["avg_range_5"].append(float(avg_range_5))
+        stats["speed"].append(abs(float(speed)))
+        stats["abs_flow"].append(abs(float(last_tick.get("flow", 0) or 0)))
+        stats["abs_imbalance_5"].append(abs(float(last_tick.get("imbalance_5", 0) or 0)))
+        stats["absorption_total"] += 1
+        if bool(last_tick.get("absorption_flag", False)):
+            stats["absorption_true"] += 1
+
+        spread = float(last_tick.get("spread", 0) or 0)
+        bid = float(last_tick.get("bid", 0) or 0)
+        ask = float(last_tick.get("ask", 0) or 0)
+        if spread <= 0 and bid > 0 and ask > 0:
+            spread = max(ask - bid, 0.0)
+        stats["spread"].append(float(spread))
+
+        if (cur_sec - self.warmup_start_sec[secid]) < 1800:
+            return
+
+        avg_range_values = stats["avg_range_5"]
+        speed_values = stats["speed"]
+        spread_values = stats["spread"]
+
+        avg_range_mean = (sum(avg_range_values) / len(avg_range_values)) if avg_range_values else 0.0
+        avg_speed = (sum(speed_values) / len(speed_values)) if speed_values else 0.0
+        absorption_freq = stats["absorption_true"] / max(stats["absorption_total"], 1)
+        spread_med = median(spread_values) if spread_values else 0.0
+
+        print("SESSION_BASELINE_REPORT")
+        print(
+            f"📊 BASELINE | secid={secid} | "
+            f"avg_range_5_mean={avg_range_mean:.4f} | "
+            f"avg_range_5_median={median(avg_range_values) if avg_range_values else 0.0:.4f} | "
+            f"avg_speed={avg_speed:.4f} | "
+            f"abs(flow)_dist=({self._dist_summary(stats['abs_flow'])}) | "
+            f"abs(imbalance_5)_dist=({self._dist_summary(stats['abs_imbalance_5'])}) | "
+            f"absorption_freq={absorption_freq:.3f} | "
+            f"spread_median={spread_med:.4f}"
+        )
+        self.warmup_reported.add(secid)
+
     def _evaluate(self, secid: int) -> str:
         c = self.candles[secid]
         if len(c) < 8:
@@ -322,6 +399,9 @@ class OptionsMomentumEngine:
         avg_range_5, avg_vol_5 = self._avg_range_vol(last5)
         avg_range_20, avg_vol_20 = self._avg_range_vol(last20)
 
+        last_tick = self.tick_buffer[secid][-1] if self.tick_buffer[secid] else {}
+        self._collect_warmup_stats(secid, cur_sec, speed, avg_range_5, last_tick)
+
         self._log_engine_state(cur_sec)
 
         shrinking_range = float(last["range"]) < float(prev["range"])
@@ -360,7 +440,6 @@ class OptionsMomentumEngine:
         if secid in self.active_trade:
             return "NO_TRADE"
 
-        last_tick = self.tick_buffer[secid][-1] if self.tick_buffer[secid] else {}
         if not self._micro_ok(secid, last_tick, cur_sec):
             return "NO_TRADE"
 
