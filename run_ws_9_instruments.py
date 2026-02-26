@@ -125,6 +125,10 @@ def main():
             if not market_open():
                 return
 
+            bid_levels = len(bid.prices) if hasattr(bid, "prices") else len(bid)
+            ask_levels = len(ask.prices) if hasattr(ask, "prices") else len(ask)
+            print(f"🧩 DEPTH_CALLBACK | secid={secid} | bid_levels={bid_levels} | ask_levels={ask_levels}")
+
             raw = feature_builder.build(secid, bid, ask)
             if not raw:
                 return
