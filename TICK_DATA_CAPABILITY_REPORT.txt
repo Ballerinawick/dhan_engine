@@ -1,0 +1,181 @@
+REAL-TIME TICK DATA CAPABILITY REPORT (SINGLE-COPY FORMAT)
+
+SCOPE
+This report traces the active depth-based runtime path used by the engine, starting from run_ws_9_instruments.py.
+
+STEP 1 — ENTRY POINT TRACE
+1) Websocket initialization class:
+   - DhanTwentyDepthWS is initialized in run_ws_9_instruments.py inside main(), with on_depth=on_opt_depth.
+   - depth20.connect() starts the websocket thread/loop.
+
+2) Function that receives raw tick:
+   - DhanTwentyDepthWS._on_message() receives websocket frames.
+   - DhanTwentyDepthWS._parse_one_packet() parses each binary packet.
+
+3) Where raw tick is first printed or transformed:
+   - Broker feed arrives as binary bytes, not a Python dict in this path.
+   - First transformation occurs in DhanTwentyDepthWS._parse_one_packet(): binary -> DepthSide(prices, qty, orders, ts).
+   - First engine tick dict is created in run_ws_9_instruments.py:on_opt_depth via:
+       raw = feature_builder.build(secid, bid, ask)
+
+4) Where OptionsMomentumEngine.on_tick() is called:
+   - Called in run_ws_9_instruments.py:on_opt_depth:
+       action = momentum_engine.on_tick(secid, raw)
+
+STEP 2 — ONE RAW TICK SAMPLE BEFORE MODIFICATION
+Requested: one raw broker dict before modification.
+Actual in current path: broker sends binary frames for 20-depth stream, so no broker-native raw dict exists before transformation.
+First dict available in this pipeline is the derived 'raw' dict from DepthMicroFeatureBuilder.build(...).
+
+STEP 3 — FIELD AUDIT (CURRENT ENGINE TICK DICT)
+Fields emitted by DepthMicroFeatureBuilder.build(...):
+
+Field: ltp
+- Data type: float
+- Always present: Y
+- Frequently zero: N (except invalid/missing best levels)
+- Derived or raw: Derived (mid-price proxy from best bid/ask)
+- Used currently in engine: Y
+- Used in _micro_ok(): Y
+
+Field: bid_qty
+- Data type: int
+- Always present: Y
+- Frequently zero: N (can be zero in sparse/invalid states)
+- Derived or raw: Raw from decoded depth top-1 qty
+- Used currently in engine: Y (_build_1s_candle activity)
+- Used in _micro_ok(): N
+
+Field: ask_qty
+- Data type: int
+- Always present: Y
+- Frequently zero: N (can be zero in sparse/invalid states)
+- Derived or raw: Raw from decoded depth top-1 qty
+- Used currently in engine: Y (_build_1s_candle activity)
+- Used in _micro_ok(): N
+
+Field: imbalance_5
+- Data type: float
+- Always present: Y
+- Frequently zero: Y (balanced depth or zero denominator)
+- Derived or raw: Derived from top-5 qty sums
+- Used currently in engine: Y
+- Used in _micro_ok(): Y
+
+Field: flow
+- Data type: float
+- Always present: Y
+- Frequently zero: Y (first tick per secid or low-change periods)
+- Derived or raw: Derived delta of top-5 bid/ask liquidity
+- Used currently in engine: Y (_build_1s_candle + _micro_ok)
+- Used in _micro_ok(): Y
+
+Field: vacuum_flag
+- Data type: bool
+- Always present: Y
+- Frequently zero: Y (usually False)
+- Derived or raw: Derived
+- Used currently in engine: Y
+- Used in _micro_ok(): Y
+
+Field: absorption_flag
+- Data type: bool
+- Always present: Y
+- Frequently zero: Y (False before warm-up and most non-absorption periods)
+- Derived or raw: Derived
+- Used currently in engine: Y
+- Used in _micro_ok(): Y
+
+Field: absorption_strength
+- Data type: float
+- Always present: Y
+- Frequently zero: Y (zero before warm-up and outside absorption)
+- Derived or raw: Derived
+- Used currently in engine: Y
+- Used in _micro_ok(): Y
+
+Field: spread
+- Data type: float
+- Always present: Y
+- Frequently zero: N (can be zero in invalid/missing best levels)
+- Derived or raw: Derived (best_ask - best_bid)
+- Used currently in engine: Y
+- Used in _micro_ok(): Y
+
+Field: ts
+- Data type: float
+- Always present: Y
+- Frequently zero: N
+- Derived or raw: Derived local timestamp (time.time())
+- Used currently in engine: Y
+- Used in _micro_ok(): Indirectly via on_tick flow (cur_sec)
+
+Additional callback-added fields:
+- secid: int, always present Y, derived local annotation, not used in _micro_ok()
+- tag: str, always present Y, derived local annotation, not used in _micro_ok()
+
+STEP 4 — FREQUENCY REPORT
+- Average ticks/second/instrument:
+  Not directly measurable in this environment because broker credentials are unavailable, so live stream measurement could not be run.
+
+- Are ticks batched?
+  Yes. _on_message() iterates through multiple packets within one websocket message using packet lengths.
+
+- Timestamp broker time or local time?
+  Local time. Tick dict ts is generated with time.time() in DepthMicroFeatureBuilder.
+
+- Delay/jitter?
+  Possible due to network, websocket scheduling, parsing, and callback dispatch.
+  No explicit broker-vs-local latency metric is currently logged in this path.
+
+STEP 5 — DEPTH AVAILABILITY
+Required fields availability in current momentum tick dict:
+- bid: NO
+- ask: NO
+- spread: YES
+- bid_qty: YES
+- ask_qty: YES
+- imbalance_5: YES
+- absorption_flag: YES
+- absorption_strength: YES
+- vacuum_flag: YES
+- flow: YES
+
+Where/how imbalance/absorption/flow are calculated:
+- imbalance_5:
+  (sum_bid_top5 - sum_ask_top5) / (sum_bid_top5 + sum_ask_top5), guarded when denominator > 0.
+- flow:
+  (current_sum_bid5 - prev_sum_bid5) - (current_sum_ask5 - prev_sum_ask5).
+- absorption_flag + absorption_strength:
+  Uses 6-point buffers; if mid-price range <= 0.10 and best qty builds up, flag turns true;
+  strength normalized by min(1.0, (abs(bid_build)+abs(ask_build))/50000).
+
+STEP 6 — STABILITY CHECK
+- Do we ever receive avg_range_5 = 0?
+  Flat prices can produce zero raw average range, but engine floors avg_range with max(avg_range, 0.01).
+
+- Do we ever divide by zero?
+  Protections are present:
+  - spread_pct uses max(ltp, 1e-9)
+  - speed_ratio uses max(avg_range_5, 1e-6)
+  - imbalance denominator guarded with if denom > 0 else 0.0
+  - vol_ratio computed only when avg_vol_5 > 0 and volume > 0
+
+- Warm-up protection before ratios?
+  Yes:
+  - minimum candle history checks before evaluation
+  - absorption requires 6 buffered points
+  - flow defaults to 0 on first snapshot (no prev top-5)
+
+STEP 7 — CONCLUSION
+1) Can we build turning detection using only LTP?
+   Yes, core turning logic is candle/speed/range based on ltp sequence.
+   But entries are currently gated by _micro_ok(), so practical signal firing depends on micro fields and thresholds.
+
+2) Do we have enough order flow data?
+   Partially. We have order-book-derived micro proxies (imbalance/flow/absorption/vacuum),
+   but not true executed-trade aggressor/tape flow from trade prints.
+
+3) What additional dependency is required?
+   Add/enable official marketfeed tick stream (e.g., dhanhq.marketfeed.DhanFeed Quote/Full) in parallel
+   to capture broker-native tick dict with richer trade fields and broker timestamp; fuse with depth stream.
