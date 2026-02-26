@@ -462,6 +462,21 @@ class OptionsMomentumEngine:
                 return "EXIT"
 
         if secid in self.active_trade:
+            warmup_block = bool(self.warmup_active)
+            risk_block = False
+            cooldown_block = False
+            regime_block = False
+            position_block = True
+            max_trade_block = False
+            print(
+                f"🧩 FINAL_GATE | secid={secid} | "
+                f"warmup_block={warmup_block} | "
+                f"risk_block={risk_block} | "
+                f"cooldown_block={cooldown_block} | "
+                f"regime_block={regime_block} | "
+                f"position_block={position_block} | "
+                f"max_trade_block={max_trade_block}"
+            )
             return "NO_TRADE"
 
         ltp = float(last_tick.get("ltp", 0) or 0)
@@ -499,6 +514,21 @@ class OptionsMomentumEngine:
                 f"vacuum_ok={vacuum_ok} | "
                 f"spread_ok={spread_ok}"
             )
+            warmup_block = bool(self.warmup_active)
+            risk_block = True
+            cooldown_block = False
+            regime_block = False
+            position_block = False
+            max_trade_block = False
+            print(
+                f"🧩 FINAL_GATE | secid={secid} | "
+                f"warmup_block={warmup_block} | "
+                f"risk_block={risk_block} | "
+                f"cooldown_block={cooldown_block} | "
+                f"regime_block={regime_block} | "
+                f"position_block={position_block} | "
+                f"max_trade_block={max_trade_block}"
+            )
             return "NO_TRADE"
 
         prior_move_down = prev_speed < 0
@@ -522,6 +552,7 @@ class OptionsMomentumEngine:
                 f"🟢 TURN_ENTRY LONG | secid={secid} | close={last['close']:.2f} | "
                 f"speed_ratio={speed_ratio:.2f} | shrink={shrinking_range} | collapse={speed_collapse}"
             )
+            print(f"✅ ENTRY_ALLOWED | secid={secid} | speed_ratio={speed_ratio:.2f}")
             return "TURN_ENTRY"
 
         print(
@@ -532,6 +563,22 @@ class OptionsMomentumEngine:
             f"micro_ok={micro_ok} | "
             f"vacuum_ok={vacuum_ok} | "
             f"spread_ok={spread_ok}"
+        )
+
+        warmup_block = bool(self.warmup_active)
+        risk_block = False
+        cooldown_block = False
+        regime_block = True
+        position_block = False
+        max_trade_block = False
+        print(
+            f"🧩 FINAL_GATE | secid={secid} | "
+            f"warmup_block={warmup_block} | "
+            f"risk_block={risk_block} | "
+            f"cooldown_block={cooldown_block} | "
+            f"regime_block={regime_block} | "
+            f"position_block={position_block} | "
+            f"max_trade_block={max_trade_block}"
         )
 
         return "NO_TRADE"
