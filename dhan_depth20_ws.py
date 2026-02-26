@@ -272,6 +272,14 @@ class DhanTwentyDepthWS:
         self._bin_msg_count += 1
         self._last_msg_at = time.time()
 
+        if not hasattr(self, "_debug_counter"):
+            self._debug_counter = 0
+
+        if self._debug_counter < 5:
+            print("🔎 RAW_DEPTH_PACKET_LENGTH:", len(message))
+            print("🔎 RAW_FIRST_200_BYTES:", message[:200])
+            self._debug_counter += 1
+
         # periodic diag line
         if self.diag_print_every > 0 and (self._bin_msg_count % self.diag_print_every == 0):
             print(
@@ -303,6 +311,7 @@ class DhanTwentyDepthWS:
                 return
 
             feed_code = pkt[2]
+            packet_type = feed_code
             secid = struct.unpack_from("<i", pkt, 4)[0]
 
             # body must have 20 levels = 20 * 16 bytes = 320 bytes
@@ -335,6 +344,31 @@ class DhanTwentyDepthWS:
             ask = self._latest_ask.get(secid)
             if not bid or not ask:
                 return
+
+            bids = [
+                (bid.prices[i], bid.qty[i], bid.orders[i])
+                for i in range(min(len(bid.prices), len(bid.qty), len(bid.orders)))
+            ]
+            asks = [
+                (ask.prices[i], ask.qty[i], ask.orders[i])
+                for i in range(min(len(ask.prices), len(ask.qty), len(ask.orders)))
+            ]
+
+            if not hasattr(self, "_book_debug_counter"):
+                self._book_debug_counter = 0
+
+            if self._book_debug_counter < 10:
+                print("📘 PARSED_BOOK_SUMMARY")
+                print("   bids_count:", len(bids))
+                print("   asks_count:", len(asks))
+                if len(bids) > 0 and len(asks) > 0:
+                    print("   best_bid:", bids[0])
+                    print("   best_ask:", asks[0])
+                    print("   spread:", asks[0][0] - bids[0][0])
+                print("   level_20_bid:", bids[-1] if len(bids) >= 20 else "NA")
+                print("   level_20_ask:", asks[-1] if len(asks) >= 20 else "NA")
+                print("📡 DEPTH_PACKET_TYPE:", packet_type)
+                self._book_debug_counter += 1
 
             self._parse_ok_packets += 1
 
