@@ -73,7 +73,6 @@ class OptionsMomentumEngine:
         self.warmup_active = False
         self.baseline_printed = set()
         self.warmup_duration_sec = 120  # TEMP TEST WINDOW (2 minutes)
-        self._last_warmup_status_minute = {}
         self.warmup_stats = defaultdict(lambda: {
             "avg_range_5": [],
             "speed": [],
@@ -321,13 +320,7 @@ class OptionsMomentumEngine:
             self.warmup_start_sec[secid] = cur_sec
 
         elapsed_sec = max(cur_sec - self.warmup_start_sec[secid], 0)
-        elapsed_minutes = elapsed_sec / 60.0
         self.warmup_active = elapsed_sec < self.warmup_duration_sec
-        minute_bucket = cur_sec // 60
-        if self._last_warmup_status_minute.get(secid) != minute_bucket:
-            self._last_warmup_status_minute[secid] = minute_bucket
-            print(f"🧪 WARMUP_STATUS | secid={secid} | elapsed={elapsed_minutes:.2f} min | collecting={self.warmup_active}")
-
         stats = self.warmup_stats[secid]
         stats["avg_range_5"].append(float(avg_range_5))
         stats["speed"].append(abs(float(speed)))
