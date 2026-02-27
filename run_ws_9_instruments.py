@@ -1,5 +1,8 @@
 import os
+import json
+import asyncio
 import time
+import threading
 import requests
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -19,6 +22,11 @@ from institutional_decision_engine import InstitutionalDecisionEngine
 from institutional_trailing_exit_engine import InstitutionalTrailingExitEngine
 from structure_exit_engine import StructureExitEngine
 
+try:
+    from dhanhq.marketfeed import DhanFeed
+except Exception:
+    DhanFeed = None
+
 
 # ================= CONFIG =================
 CSV_FILE = os.getenv("CSV_FILE", "api-scrip-master.csv")
@@ -31,6 +39,9 @@ OPT_EXCHANGE_SEGMENT_20D = "NSE_FNO"
 REST_POLL_INTERVAL_SEC = 1.1
 REST_MAX_WAIT_SEC = 45
 HEARTBEAT_SEC = 30.0
+FULL_QUOTE_REQ_CODE = 21
+FULL_QUOTE_SEGMENT = 2
+FULL_QUOTE_LOG_SEC = 10
 
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_START = dtime(9, 10)
@@ -67,6 +78,117 @@ def market_open():
     if now.weekday() >= 5:
         return False
     return MARKET_START <= now.time() <= MARKET_END
+
+
+def _first_non_none(d: dict, *keys):
+    for key in keys:
+        if key in d and d[key] is not None:
+            return d[key]
+    return None
+
+
+class FullMarketQuoteSampler:
+    """
+    Parallel broker full-marketfeed sampler.
+    - Subscribes exactly to secids already chosen for depth stream.
+    - Prints one JSON tick per second per secid.
+    - Auto-stops after FULL_QUOTE_LOG_SEC logs per secid.
+    """
+
+    def __init__(self, client_id: str, token: str, secid_tag_map: dict):
+        if DhanFeed is None:
+            raise RuntimeError("dhanhq is not installed. Run: pip install dhanhq")
+
+        self.client_id = str(client_id)
+        self.token = str(token)
+        self.secid_tag_map = {int(k): str(v) for k, v in secid_tag_map.items()}
+
+        self._latest = {}
+        self._count = {int(k): 0 for k in self.secid_tag_map.keys()}
+        self._lock = threading.Lock()
+
+    def _on_ticks(self, msg):
+        ticks = msg if isinstance(msg, list) else [msg]
+        with self._lock:
+            for tick in ticks:
+                sid = _first_non_none(tick, "security_id", "securityId", "sec_id", "SecurityId")
+                if sid is None:
+                    continue
+                try:
+                    sid = int(sid)
+                except Exception:
+                    continue
+                if sid in self.secid_tag_map:
+                    self._latest[sid] = tick
+
+    @staticmethod
+    def _extract(tick: dict, secid: int, tag: str) -> dict:
+        broker_ts = _first_non_none(
+            tick,
+            "exchange_time", "exchangeTime",
+            "last_trade_time", "lastTradeTime",
+            "ltt", "timestamp", "time",
+        )
+        return {
+            "secid": secid,
+            "tag": tag,
+            "ltp": _first_non_none(tick, "LTP", "ltp", "last_traded_price", "lastTradedPrice"),
+            "ltq": _first_non_none(tick, "LTQ", "ltq", "last_traded_quantity", "lastTradedQuantity"),
+            "total_volume": _first_non_none(tick, "volume", "Volume", "total_volume", "totalTradedVolume"),
+            "oi": _first_non_none(tick, "oi", "OI", "open_interest", "openInterest"),
+            "bid_price": _first_non_none(tick, "best_bid_price", "bestBidPrice", "bid_price", "bidPrice"),
+            "ask_price": _first_non_none(tick, "best_ask_price", "bestAskPrice", "ask_price", "askPrice"),
+            "iv": _first_non_none(tick, "iv", "IV", "implied_volatility", "impliedVolatility"),
+            "delta": _first_non_none(tick, "delta", "Delta"),
+            "timestamp": broker_ts if broker_ts is not None else datetime.now(IST).isoformat(),
+            "raw": tick,
+        }
+
+    def run(self):
+        secids = list(self.secid_tag_map.keys())
+        if not secids:
+            return
+
+        instruments = [(FULL_QUOTE_SEGMENT, sid, FULL_QUOTE_REQ_CODE) for sid in secids]
+        feed = DhanFeed(
+            client_id=self.client_id,
+            access_token=self.token,
+            instruments=instruments,
+            version="v2",
+        )
+        feed.on_ticks = self._on_ticks
+
+        ws_thread = threading.Thread(target=feed.run_forever, name="FullQuoteWS", daemon=True)
+        ws_thread.start()
+
+        try:
+            while True:
+                time.sleep(1.0)
+                with self._lock:
+                    snap = dict(self._latest)
+
+                for sid in secids:
+                    if self._count[sid] >= FULL_QUOTE_LOG_SEC:
+                        continue
+                    tick = snap.get(sid)
+                    if not tick:
+                        continue
+
+                    payload = self._extract(tick, sid, self.secid_tag_map[sid])
+                    print(json.dumps(payload, ensure_ascii=False))
+                    self._count[sid] += 1
+
+                if all(self._count[sid] >= FULL_QUOTE_LOG_SEC for sid in secids):
+                    print("✅ Full marketfeed sampling completed (10s per instrument).")
+                    break
+        finally:
+            try:
+                if hasattr(feed, "disconnect"):
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(feed.disconnect())
+                    loop.close()
+            except Exception as e:
+                print("⚠️ Full marketfeed disconnect warning:", e)
 
 
 # ================= MAIN =================
@@ -276,6 +398,7 @@ def main():
 
     # ================= OPTION SUBSCRIPTION =================
     print("\n🎯 Subscribing OPTIONS...")
+    full_quote_secid_tag = {}
 
     for idx in INDEXES:
         try:
@@ -297,9 +420,23 @@ def main():
 
             if subs:
                 depth20.subscribe(subs)
+                for s in subs:
+                    full_quote_secid_tag[int(s["SecurityId"])] = s["tag"]
 
         except Exception as e:
             print(f"❌ [{idx}] OptionChain error:", e)
+
+    if full_quote_secid_tag:
+        try:
+            sampler = FullMarketQuoteSampler(
+                client_id=client_id,
+                token=token,
+                secid_tag_map=full_quote_secid_tag,
+            )
+            threading.Thread(target=sampler.run, name="FullQuoteSampler", daemon=True).start()
+            print(f"✅ Full marketfeed sampler started for {len(full_quote_secid_tag)} instruments")
+        except Exception as e:
+            print("⚠️ Full marketfeed sampler not started:", e)
 
     print("\n🔥 LIVE: INSTITUTIONAL OPTIONS ENGINE ACTIVE\n")
 
