@@ -149,6 +149,10 @@ class FullMarketQuoteSampler:
         if not secids:
             return
 
+        # dhanhq marketfeed constructor expects a current loop in this thread.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         instruments = [(FULL_QUOTE_SEGMENT, sid, FULL_QUOTE_REQ_CODE) for sid in secids]
         feed = DhanFeed(
             client_id=self.client_id,
@@ -184,11 +188,12 @@ class FullMarketQuoteSampler:
         finally:
             try:
                 if hasattr(feed, "disconnect"):
-                    loop = asyncio.new_event_loop()
                     loop.run_until_complete(feed.disconnect())
-                    loop.close()
             except Exception as e:
                 print("⚠️ Full marketfeed disconnect warning:", e)
+            finally:
+                loop.close()
+                asyncio.set_event_loop(None)
 
 
 # ================= MAIN =================
