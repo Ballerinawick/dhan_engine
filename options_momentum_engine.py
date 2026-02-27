@@ -405,18 +405,6 @@ class OptionsMomentumEngine:
         speed_ratio = min(abs(speed) / max(avg_range_5, 1e-6), 50.0)
         vol_ratio = (last["volume"] / avg_vol_5) if avg_vol_5 > 0 and last["volume"] > 0 else 0.0
 
-        # ---- DEBUG ENTRY DIAGNOSTIC ----
-        if len(c) >= 5:
-            print(
-                f"🧪 ENTRY_CHECK | secid={secid} | "
-                f"close={last['close']:.2f} | "
-                f"speed={abs(speed):.4f} | "
-                f"avg_range_5={avg_range_5:.4f} | "
-                f"speed_ratio={speed_ratio:.2f} | "
-                f"vol={last['volume']:.2f} | "
-                f"vol_ratio={vol_ratio:.2f}"
-            )
-
         last5 = list(c)[-5:]
         last20 = list(c)[-20:] if len(c) >= 20 else list(c)
 
@@ -505,15 +493,6 @@ class OptionsMomentumEngine:
         micro_ok = spread_ok and vacuum_ok and dir_ok and confirm_ok
 
         if not self._micro_ok(secid, last_tick, cur_sec):
-            print(
-                f"🚫 ENTRY_REJECT | secid={secid} | "
-                f"speed_ratio={speed_ratio:.2f} | "
-                f"dir_ok={dir_ok} | "
-                f"confirm_ok={confirm_ok} | "
-                f"micro_ok={micro_ok} | "
-                f"vacuum_ok={vacuum_ok} | "
-                f"spread_ok={spread_ok}"
-            )
             warmup_block = bool(self.warmup_active)
             risk_block = True
             cooldown_block = False
@@ -554,16 +533,6 @@ class OptionsMomentumEngine:
             )
             print(f"✅ ENTRY_ALLOWED | secid={secid} | speed_ratio={speed_ratio:.2f}")
             return "TURN_ENTRY"
-
-        print(
-            f"🚫 ENTRY_REJECT | secid={secid} | "
-            f"speed_ratio={speed_ratio:.2f} | "
-            f"dir_ok={dir_ok} | "
-            f"confirm_ok={confirm_ok} | "
-            f"micro_ok={micro_ok} | "
-            f"vacuum_ok={vacuum_ok} | "
-            f"spread_ok={spread_ok}"
-        )
 
         warmup_block = bool(self.warmup_active)
         risk_block = False
