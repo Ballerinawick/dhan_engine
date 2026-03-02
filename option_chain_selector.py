@@ -159,10 +159,21 @@ class OptionChainSelector:
         expiry_str = expiry.strftime("%Y-%m-%d")
 
         atm = int(round(underlying_ltp / step) * step)
-        ce_low = atm + step
-        ce_high = atm + self.max_steps * step
-        pe_high = atm - step
-        pe_low = atm - self.max_steps * step
+        if index == "NIFTY":
+            itm_steps = 2  # ATM + 2 ITM
+
+            # CE ITM are below ATM
+            ce_low = atm - (itm_steps * step)
+            ce_high = atm  # include ATM
+
+            # PE ITM are above ATM
+            pe_low = atm  # include ATM
+            pe_high = atm + (itm_steps * step)
+        else:
+            ce_low = atm + step
+            ce_high = atm + self.max_steps * step
+            pe_high = atm - step
+            pe_low = atm - self.max_steps * step
 
         min_prem, max_prem = PREMIUM_FILTER[index]
         min_delta, max_delta = DELTA_FILTER[index]
@@ -187,8 +198,12 @@ class OptionChainSelector:
 
         def _evaluate_leg(leg: dict):
             ltp = float(leg.get("last_price", 0))
-            if not (min_prem <= ltp <= max_prem):
-                return None, "premium"
+            if index == "NIFTY":
+                if ltp < self.min_ltp:
+                    return None, "premium"
+            else:
+                if not (min_prem <= ltp <= max_prem):
+                    return None, "premium"
 
             g = leg.get("greeks", {}) or {}
             delta = abs(float(g.get("delta", 0)))
