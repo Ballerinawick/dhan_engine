@@ -159,16 +159,35 @@ class OptionChainSelector:
         expiry_str = expiry.strftime("%Y-%m-%d")
 
         atm = int(round(underlying_ltp / step) * step)
+        ce_strikes = None
+        pe_strikes = None
         if index == "NIFTY":
-            itm_steps = 2  # ATM + 2 ITM
-
-            # CE ITM are below ATM
-            ce_low = atm - (itm_steps * step)
-            ce_high = atm  # include ATM
-
-            # PE ITM are above ATM
-            pe_low = atm  # include ATM
-            pe_high = atm + (itm_steps * step)
+            ce_strikes = [
+                atm - 2 * step,
+                atm - 1 * step,
+                atm,
+                atm + 1 * step,
+                atm + 2 * step,
+                atm + 3 * step,
+                atm + 4 * step,
+                atm + 5 * step,
+                atm + 6 * step,
+                atm + 7 * step,
+            ]
+            pe_strikes = [
+                atm + 2 * step,
+                atm + 1 * step,
+                atm,
+                atm - 1 * step,
+                atm - 2 * step,
+                atm - 3 * step,
+                atm - 4 * step,
+                atm - 5 * step,
+                atm - 6 * step,
+                atm - 7 * step,
+            ]
+            ce_strike_set = set(ce_strikes)
+            pe_strike_set = set(pe_strikes)
         else:
             ce_low = atm + step
             ce_high = atm + self.max_steps * step
@@ -182,8 +201,8 @@ class OptionChainSelector:
         if self.debug:
             print(
                 f"🧭 FILTERS | {index} | ATM={atm} | "
-                f"CE_OTM=[{ce_low}..{ce_high}] | "
-                f"PE_OTM=[{pe_high}..{pe_low}] | "
+                f"CE_STRIKES={ce_strikes if ce_strikes is not None else f'[{ce_low}..{ce_high}]'} | "
+                f"PE_STRIKES={pe_strikes if pe_strikes is not None else f'[{pe_low}..{pe_high}]'} | "
                 f"prem={min_prem}-{max_prem} | "
                 f"delta={min_delta:.2f}-{max_delta:.2f} | "
                 f"spr<={max_spread_pct * 100:.1f}%"
@@ -230,7 +249,8 @@ class OptionChainSelector:
             strike = float(strike_str)
 
             if "ce" in node:
-                if not (ce_low <= strike <= ce_high):
+                ce_in_range = strike in ce_strike_set if index == "NIFTY" else (ce_low <= strike <= ce_high)
+                if not ce_in_range:
                     otm_reject += 1
                 else:
                     ce_leg = node["ce"]
@@ -245,7 +265,8 @@ class OptionChainSelector:
                         ce_candidates.append((strike, ce_leg, ce_meta))
 
             if "pe" in node:
-                if not (pe_low <= strike <= pe_high):
+                pe_in_range = strike in pe_strike_set if index == "NIFTY" else (pe_low <= strike <= pe_high)
+                if not pe_in_range:
                     otm_reject += 1
                 else:
                     pe_leg = node["pe"]

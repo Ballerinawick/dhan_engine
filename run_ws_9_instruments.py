@@ -243,6 +243,8 @@ def main():
         fut_secids[idx] = int(fut["security_id"])
 
     fut_ltp = {k: 0.0 for k in INDEXES}
+    zero_book_counter = {}
+    zero_book_warned = set()
 
     # ==================================================
     # OPTION DEPTH CALLBACK (INSTITUTIONAL FLOW)
@@ -258,6 +260,21 @@ def main():
             raw = feature_builder.build(secid, bid, ask)
             if not raw:
                 return
+
+            bid_price = float(raw.get("bid_price", 0.0) or 0.0)
+            ask_price = float(raw.get("ask_price", 0.0) or 0.0)
+            if bid_price == 0.0 and ask_price == 0.0:
+                count = zero_book_counter.get(secid, 0) + 1
+                zero_book_counter[secid] = count
+                if count >= 20 and secid not in zero_book_warned:
+                    print(
+                        f"⚠️ ZERO_BOOK | {tag} | secid={secid} | "
+                        "depth prices are 0 — check Dhan depth entitlement/segment/subscription"
+                    )
+                    zero_book_warned.add(secid)
+            else:
+                zero_book_counter[secid] = 0
+                zero_book_warned.discard(secid)
 
             raw["secid"] = secid
             raw["tag"] = tag
