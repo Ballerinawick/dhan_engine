@@ -22,7 +22,7 @@ class DepthSide:
 class DhanTwentyDepthWS:
     """
     Production-safe 20-level depth WebSocket client
-    with strong diagnostics + numeric ExchangeSegment fix.
+    with strong diagnostics.
     """
 
     def __init__(
@@ -30,7 +30,7 @@ class DhanTwentyDepthWS:
         token: str,
         client_id: str,
         auth_type: int = 2,
-        exchange_segment: int = 2,   # ✅ FIXED: numeric (2 = NSE_FNO)
+        exchange_segment: str = "NSE_FNO",
         on_depth: Optional[Callable[[int, str, DepthSide, DepthSide], None]] = None,
         debug: bool = False,
         ping_interval: int = 25,
@@ -41,7 +41,12 @@ class DhanTwentyDepthWS:
         self.token = token
         self.client_id = client_id
         self.auth_type = auth_type
-        self.exchange_segment = int(exchange_segment)
+        self.exchange_segment = str(exchange_segment).strip()
+        allowed = {"NSE_EQ", "NSE_FNO"}
+        if self.exchange_segment not in allowed:
+            print(f"🚨 20D_BAD_SEGMENT | got={self.exchange_segment} | expected one of {sorted(allowed)}")
+        else:
+            print(f"✅ 20D_SEGMENT_OK | seg={self.exchange_segment}")
         self.on_depth = on_depth
         self.debug = debug
 
@@ -198,9 +203,28 @@ class DhanTwentyDepthWS:
                 f"last_msg_age={last_age}"
             )
 
-            if self._last_msg_at == 0 and \
-               (time.time() - self._connected_at) > self.no_data_warn_sec:
-                print("🚨 20D_NO_DATA_WARNING – CONNECTED BUT NO BINARY PACKETS")
+            self.diag_should_warn_no_data()
+
+    def diag_snapshot(self):
+        last_age = "NO_MSG_YET" if self._last_msg_at <= 0 else round(time.time() - self._last_msg_at, 2)
+        return {
+            "connected": self._connected.is_set(),
+            "bin": self._bin_msg_count,
+            "text": self._text_msg_count,
+            "ok": self._parse_ok_packets,
+            "bad": self._parse_bad_packets,
+            "last_msg_age": last_age,
+            "seg": self.exchange_segment,
+        }
+
+    def diag_should_warn_no_data(self):
+        if self._last_msg_at == 0 and (time.time() - self._connected_at) > self.no_data_warn_sec:
+            print(
+                "🚨 20D_NO_DATA_WARNING – CONNECTED BUT NO BINARY PACKETS"
+                f" | pending_subs={len(self._pending_subs)} | subscribed={len(self._subscribed)}"
+            )
+            return True
+        return False
 
     # ==================================================
     # SUBSCRIBE
@@ -225,7 +249,10 @@ class DhanTwentyDepthWS:
 
         self._last_sub_payload = payload
 
-        print(f"📤 20D_SUBSCRIBE_SENT | count={len(inst_list)} | seg={self.exchange_segment}")
+        print(
+            f"📤 20D_SUBSCRIBE_SENT | count={len(inst_list)} | seg={self.exchange_segment} "
+            f"| secids={[x['SecurityId'] for x in inst_list]}"
+        )
         print("📤 20D_PAYLOAD:", payload)
 
         try:
@@ -245,7 +272,11 @@ class DhanTwentyDepthWS:
         self._parse_bad_packets = 0
         self._first_bin_printed = False
 
-        print("✅ 20Depth WS CONNECTED")
+        print("✅ 20Depth WS connected")
+        print(
+            f"🧷 20D_CONNECTED | seg={self.exchange_segment} | "
+            f"subscribed_count={len(self._subscribed)} | pending_count={len(self._pending_subs)}"
+        )
 
         if self._subscribed:
             subs = [{"SecurityId": str(k)} for k in self._subscribed.keys()]
@@ -272,6 +303,9 @@ class DhanTwentyDepthWS:
 
         self._bin_msg_count += 1
         self._last_msg_at = time.time()
+
+        if self._bin_msg_count == 1:
+            print("📥 20D_FIRST_BINARY_MSG_RECEIVED")
 
         if not self._first_bin_printed:
             print("📥 FIRST_BINARY_FRAME len=", len(message))
