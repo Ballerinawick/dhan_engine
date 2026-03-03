@@ -9,6 +9,10 @@ import websocket  # pip install websocket-client
 
 FEED_BID = 41
 FEED_ASK = 51
+SEGMENT_ENUM = {
+    "NSE_EQ": 1,
+    "NSE_FNO": 2,
+}
 
 
 @dataclass
@@ -82,6 +86,7 @@ class DhanTwentyDepthWS:
         self._parse_ok_packets = 0
         self._parse_bad_packets = 0
         self._first_bin_printed = False
+        self._enum_subscribe_retry_done = False
         self._last_sub_payload = None
 
     # ==================================================
@@ -168,7 +173,8 @@ class DhanTwentyDepthWS:
             f"wss://depth-api-feed.dhan.co/twentydepth"
             f"?token={self.token}&clientId={self.client_id}&authType={self.auth_type}"
         )
-        print("🔗 20Depth URL:", url)
+        masked = f"wss://depth-api-feed.dhan.co/twentydepth?token=***&clientId={self.client_id}&authType={self.auth_type}"
+        print("🔗 20Depth URL:", masked)
 
         return websocket.WebSocketApp(
             url,
@@ -223,6 +229,15 @@ class DhanTwentyDepthWS:
                 "🚨 20D_NO_DATA_WARNING – CONNECTED BUT NO BINARY PACKETS"
                 f" | pending_subs={len(self._pending_subs)} | subscribed={len(self._subscribed)}"
             )
+
+            # Dhan docs define ExchangeSegment as enum (NSE_EQ=1, NSE_FNO=2).
+            # If no data arrives after subscribing, retry once with enum segment payload.
+            if self._subscribed and not self._enum_subscribe_retry_done:
+                self._enum_subscribe_retry_done = True
+                print("🔁 20D_RETRY_SUBSCRIBE_WITH_SEGMENT_ENUM")
+                subs = [{"SecurityId": str(k)} for k in self._subscribed.keys()]
+                self._send_subscribe(subs)
+
             return True
         return False
 
@@ -233,9 +248,11 @@ class DhanTwentyDepthWS:
         if not self._ws:
             return
 
+        segment_value = SEGMENT_ENUM.get(self.exchange_segment, self.exchange_segment)
+
         inst_list = [
             {
-                "ExchangeSegment": self.exchange_segment,  # numeric FIX
+                "ExchangeSegment": segment_value,
                 "SecurityId": str(int(it["SecurityId"])),
             }
             for it in instruments
@@ -271,6 +288,7 @@ class DhanTwentyDepthWS:
         self._parse_ok_packets = 0
         self._parse_bad_packets = 0
         self._first_bin_printed = False
+        self._enum_subscribe_retry_done = False
 
         print("✅ 20Depth WS connected")
         print(
