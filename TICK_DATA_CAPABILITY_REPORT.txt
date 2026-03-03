@@ -5,16 +5,16 @@ This report traces the active depth-based runtime path used by the engine, start
 
 STEP 1 — ENTRY POINT TRACE
 1) Websocket initialization class:
-   - DhanTwentyDepthWS is initialized in run_ws_9_instruments.py inside main(), with on_depth=on_opt_depth.
-   - depth20.connect() starts the websocket thread/loop.
+   - DhanAsyncDepthAdapter is initialized in run_ws_9_instruments.py inside main(), with on_depth=on_opt_depth.
+   - depth_adapter.start() starts the websocket thread/loop.
 
 2) Function that receives raw tick:
-   - DhanTwentyDepthWS._on_message() receives websocket frames.
-   - DhanTwentyDepthWS._parse_one_packet() parses each binary packet.
+   - DhanAsyncDepthAdapter._on_message() receives websocket frames.
+   - DhanAsyncDepthAdapter._parse_one_packet() parses each binary packet.
 
 3) Where raw tick is first printed or transformed:
    - Broker feed arrives as binary bytes, not a Python dict in this path.
-   - First transformation occurs in DhanTwentyDepthWS._parse_one_packet(): binary -> DepthSide(prices, qty, orders, ts).
+   - First transformation occurs in DhanAsyncDepthAdapter._parse_one_packet(): binary -> DepthSide(prices, qty, orders, ts).
    - First engine tick dict is created in run_ws_9_instruments.py:on_opt_depth via:
        raw = feature_builder.build(secid, bid, ask)
 

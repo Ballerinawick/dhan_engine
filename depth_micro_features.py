@@ -3,7 +3,7 @@ import time
 from collections import deque
 from typing import Dict, Tuple
 
-from dhan_depth20_ws import DepthSide
+from dhan_async_depth_adapter import DepthSide
 
 
 class DepthMicroFeatureBuilder:

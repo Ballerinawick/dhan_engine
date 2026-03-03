@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from instrument_master import InstrumentMaster
-from dhan_depth20_ws import DhanTwentyDepthWS
+from dhan_async_depth_adapter import DhanAsyncDepthAdapter
 from ltp_rest_engine import DhanLtpRestEngine
 
 from depth_micro_features import DepthMicroFeatureBuilder
@@ -383,32 +383,14 @@ def main():
             print("❌ on_opt_depth error:", e)
 
     # ================= WS INIT =================
-    depth20 = DhanTwentyDepthWS(
-        token=token,
+    depth_adapter = DhanAsyncDepthAdapter(
         client_id=client_id,
-        auth_type=2,
+        token=token,
         exchange_segment=OPT_EXCHANGE_SEGMENT_20D,
-        on_depth=on_opt_depth,
-        debug=False
+        on_depth=on_opt_depth
     )
 
-    depth20.connect()
-    print("✅ 20Depth WS started")
-
-    def diag_watchdog_loop():
-        time.sleep(1)
-        while True:
-            print("🛰️ 20D_DIAG_SNAPSHOT", depth20.diag_snapshot())
-            if depth20.diag_should_warn_no_data():
-                print("🚨 20D_NO_DATA_WARNING – CONNECTED BUT NO BINARY PACKETS")
-                print("   Possible reasons (ordered):")
-                print("   1) Wrong ExchangeSegment (must be 'NSE_FNO' / 'NSE_EQ')")
-                print("   2) No entitlement for Full Market Depth on this account")
-                print("   3) SecurityId not valid for segment")
-                print("   4) Network blocks WSS in cloud environment")
-            time.sleep(10)
-
-    threading.Thread(target=diag_watchdog_loop, name="Depth20DiagWatchdog", daemon=True).start()
+    depth_adapter.start()
 
     # ================= FUT LTP =================
     print("\n⏳ Fetching initial FUT LTP...")
@@ -467,7 +449,7 @@ def main():
                 })
 
             if subs:
-                depth20.subscribe(subs)
+                depth_adapter.subscribe([(2, s["SecurityId"]) for s in subs])
                 for s in subs:
                     full_quote_secid_tag[int(s["SecurityId"])] = s["tag"]
 

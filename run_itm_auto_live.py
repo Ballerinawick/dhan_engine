@@ -11,7 +11,7 @@ from quant_processor import QuantProcessor
 from microstructure_state import MicrostructureState
 from signal_engine import SignalEngine
 
-from dhan_depth20_ws import DhanTwentyDepthWS
+from dhan_async_depth_adapter import DhanAsyncDepthAdapter
 from depth_micro_features import DepthMicroFeatureBuilder
 
 
@@ -65,15 +65,13 @@ def main():
         sig = signal_engine.generate(q)
         latest_q[tag] = (q, sig)
 
-    depth_ws = DhanTwentyDepthWS(
-        token=DHAN_TOKEN,
+    depth_ws = DhanAsyncDepthAdapter(
         client_id=DHAN_CLIENT_ID,
-        auth_type=2,
+        token=DHAN_TOKEN,
         exchange_segment="NSE_FNO",
         on_depth=on_depth,
-        debug=True
     )
-    depth_ws.connect()
+    depth_ws.start()
 
     current = {idx: {"atm": None, "last_switch": 0.0} for idx in INDEXES}
     expiry_cache = {}
@@ -142,8 +140,8 @@ def main():
                 continue
 
             depth_ws.subscribe([
-                {"SecurityId": str(ce_secid), "tag": f"{idx}_CE_{ce_strike}"},
-                {"SecurityId": str(pe_secid), "tag": f"{idx}_PE_{pe_strike}"},
+                (2, str(ce_secid)),
+                (2, str(pe_secid)),
             ])
 
         time.sleep(6.0)   # REST SAFE GAP
