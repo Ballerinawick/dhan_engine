@@ -1,4 +1,3 @@
-# dhan_depth20_ws.py
 import json
 import struct
 import threading
@@ -8,8 +7,8 @@ from typing import Callable, Dict, List, Optional
 
 import websocket  # pip install websocket-client
 
-FEED_BID = 41  # Bid Data (Buy)
-FEED_ASK = 51  # Ask Data (Sell)
+FEED_BID = 41
+FEED_ASK = 51
 
 
 @dataclass
@@ -22,11 +21,8 @@ class DepthSide:
 
 class DhanTwentyDepthWS:
     """
-    Stable 20-level depth WebSocket client.
-    Adds diagnostics for cloud deployments:
-    - message counters
-    - last message timestamps
-    - "NO DATA" warnings if WS is connected but no packets arrive
+    Production-safe 20-level depth WebSocket client
+    with strong diagnostics + numeric ExchangeSegment fix.
     """
 
     def __init__(
@@ -34,19 +30,18 @@ class DhanTwentyDepthWS:
         token: str,
         client_id: str,
         auth_type: int = 2,
-        exchange_segment: str = "NSE_FNO",
+        exchange_segment: int = 2,   # ✅ FIXED: numeric (2 = NSE_FNO)
         on_depth: Optional[Callable[[int, str, DepthSide, DepthSide], None]] = None,
         debug: bool = False,
         ping_interval: int = 25,
         ping_timeout: int = 10,
-        # NEW: diagnostics
-        no_data_warn_sec: int = 20,      # warn if no packets after connect
-        diag_print_every: int = 200,     # print 1 line every N binary messages
+        no_data_warn_sec: int = 20,
+        diag_print_every: int = 200,
     ):
         self.token = token
         self.client_id = client_id
         self.auth_type = auth_type
-        self.exchange_segment = exchange_segment
+        self.exchange_segment = int(exchange_segment)
         self.on_depth = on_depth
         self.debug = debug
 
@@ -58,13 +53,14 @@ class DhanTwentyDepthWS:
 
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
+        self._diag_thread: Optional[threading.Thread] = None
 
         self._stop = threading.Event()
         self._connected = threading.Event()
         self._connecting_lock = threading.Lock()
 
         self._pending_subs: List[Dict[str, str]] = []
-        self._subscribed: Dict[int, str] = {}  # secid -> tag
+        self._subscribed: Dict[int, str] = {}
 
         self._latest_bid: Dict[int, DepthSide] = {}
         self._latest_ask: Dict[int, DepthSide] = {}
@@ -73,22 +69,30 @@ class DhanTwentyDepthWS:
         self._cooldown_until_epoch = 0.0
         self._last_error_text = ""
 
-        # --- diagnostics ---
+        # Diagnostics
         self._connected_at = 0.0
         self._last_msg_at = 0.0
         self._bin_msg_count = 0
         self._text_msg_count = 0
         self._parse_ok_packets = 0
         self._parse_bad_packets = 0
+        self._first_bin_printed = False
+        self._last_sub_payload = None
 
-    # ---------------- public API ----------------
+    # ==================================================
+    # PUBLIC API
+    # ==================================================
     def connect(self):
         if self._stop.is_set():
             return
         if self._thread and self._thread.is_alive():
             return
+
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+
+        self._diag_thread = threading.Thread(target=self._diag_loop, daemon=True)
+        self._diag_thread.start()
 
     def is_connected(self) -> bool:
         return self._connected.is_set()
@@ -106,27 +110,27 @@ class DhanTwentyDepthWS:
         if not instruments:
             return
 
+        secids = []
         for it in instruments:
             secid = int(it["SecurityId"])
             tag = it.get("tag", str(secid))
             self._subscribed[secid] = tag
+            secids.append(secid)
+
+        print(f"🛰️ DEPTH_SUBSCRIBE_CALLED | connected={self._connected.is_set()} | secids={secids}")
 
         if not self._connected.is_set():
+            print("🕓 DEPTH_SUB_QUEUED (waiting for connect)")
             self._pending_subs.extend(instruments)
             return
 
         self._send_subscribe(instruments)
 
-    # ---------------- internal: connection loop ----------------
+    # ==================================================
+    # INTERNAL LOOP
+    # ==================================================
     def _run_loop(self):
         while not self._stop.is_set():
-            now = time.time()
-            if now < self._cooldown_until_epoch:
-                sleep_for = max(1.0, self._cooldown_until_epoch - now)
-                if self.debug:
-                    print(f"🧊 Cooldown active. Sleeping {sleep_for:.1f}s")
-                time.sleep(min(sleep_for, 5.0))
-                continue
 
             with self._connecting_lock:
                 if self._stop.is_set():
@@ -143,30 +147,23 @@ class DhanTwentyDepthWS:
                 )
             except Exception as e:
                 self._last_error_text = str(e)
-                print("❌ 20Depth WS run_forever exception:", e)
+                print("❌ WS run_forever exception:", e)
 
             if self._stop.is_set():
                 break
 
             self._connected.clear()
-
-            if self._looks_like_rate_limited(self._last_error_text):
-                self._cooldown_until_epoch = time.time() + (15 * 60)
-                print("🛑 Detected rate-limit/block. Cooling down 15 minutes.")
-                continue
-
             self._reconnect_attempt += 1
-            wait = self._calc_backoff(self._reconnect_attempt)
-            print(f"⚠️ 20Depth WS reconnecting in {wait}s ...")
+            wait = min(60, 10 + self._reconnect_attempt * 5)
+            print(f"⚠️ Reconnecting in {wait}s...")
             time.sleep(wait)
 
-    def _create_ws(self) -> websocket.WebSocketApp:
+    def _create_ws(self):
         url = (
             f"wss://depth-api-feed.dhan.co/twentydepth"
             f"?token={self.token}&clientId={self.client_id}&authType={self.auth_type}"
         )
-        if self.debug:
-            print("🔗 Connecting to 20Depth WS URL:", url)
+        print("🔗 20Depth URL:", url)
 
         return websocket.WebSocketApp(
             url,
@@ -176,20 +173,50 @@ class DhanTwentyDepthWS:
             on_close=self._on_close,
         )
 
-    # ---------------- internal: subscribe ----------------
-    def _send_subscribe(self, instruments: List[Dict[str, str]]):
+    # ==================================================
+    # DIAGNOSTIC LOOP
+    # ==================================================
+    def _diag_loop(self):
+        while not self._stop.is_set():
+            time.sleep(10)
+
+            if not self._connected.is_set():
+                continue
+
+            age = (
+                round(time.time() - self._last_msg_at, 1)
+                if self._last_msg_at > 0
+                else "NO_MSG_YET"
+            )
+
+            print(
+                f"🛰️ 20D_DIAG | "
+                f"bin={self._bin_msg_count} | "
+                f"text={self._text_msg_count} | "
+                f"ok={self._parse_ok_packets} | "
+                f"bad={self._parse_bad_packets} | "
+                f"last_msg_age={age} | "
+                f"last_error={self._last_error_text}"
+            )
+
+            if self._last_msg_at == 0 and \
+               (time.time() - self._connected_at) > self.no_data_warn_sec:
+                print("🚨 20D_NO_DATA_WARNING — CONNECTED BUT NO BINARY PACKETS")
+
+    # ==================================================
+    # SUBSCRIBE
+    # ==================================================
+    def _send_subscribe(self, instruments):
         if not self._ws:
             return
 
-        inst_list = []
-        for it in instruments:
-            secid = int(it["SecurityId"])
-            inst_list.append(
-                {
-                    "ExchangeSegment": self.exchange_segment,
-                    "SecurityId": str(secid),
-                }
-            )
+        inst_list = [
+            {
+                "ExchangeSegment": self.exchange_segment,  # numeric FIX
+                "SecurityId": str(int(it["SecurityId"])),
+            }
+            for it in instruments
+        ]
 
         payload = {
             "RequestCode": 23,
@@ -197,34 +224,33 @@ class DhanTwentyDepthWS:
             "InstrumentList": inst_list,
         }
 
-        if self.debug:
-            print("📤 SUBSCRIBE:", payload)
+        self._last_sub_payload = payload
+
+        print(f"📤 20D_SUBSCRIBE_SENT | count={len(inst_list)} | seg={self.exchange_segment}")
+        print("📤 PAYLOAD:", payload)
 
         try:
             self._ws.send(json.dumps(payload))
         except Exception as e:
-            self._last_error_text = str(e)
             print("❌ SUBSCRIBE send failed:", e)
 
-    # ---------------- handlers ----------------
+    # ==================================================
+    # HANDLERS
+    # ==================================================
     def _on_open(self, ws):
         self._connected.set()
-        self._reconnect_attempt = 0
-        self._last_error_text = ""
-
-        # diagnostics reset for this session
         self._connected_at = time.time()
         self._last_msg_at = 0.0
         self._bin_msg_count = 0
-        self._text_msg_count = 0
         self._parse_ok_packets = 0
         self._parse_bad_packets = 0
+        self._first_bin_printed = False
 
-        print("✅ 20Depth WS connected")
+        print("✅ 20Depth WS CONNECTED")
 
         if self._subscribed:
-            resub = [{"SecurityId": str(k), "tag": v} for k, v in self._subscribed.items()]
-            self._send_subscribe(resub)
+            subs = [{"SecurityId": str(k)} for k in self._subscribed.keys()]
+            self._send_subscribe(subs)
 
         if self._pending_subs:
             subs = self._pending_subs[:]
@@ -232,64 +258,36 @@ class DhanTwentyDepthWS:
             self._send_subscribe(subs)
 
     def _on_error(self, ws, error):
-        txt = str(error)
-        self._last_error_text = txt
-
-        if self._looks_like_rate_limited(txt):
-            self._cooldown_until_epoch = time.time() + (15 * 60)
-            print("🛑 20Depth WS rate-limited/blocked detected. Cooling down 15 minutes.")
-            try:
-                ws.close()
-            except Exception:
-                pass
-            return
-
-        print("❌ 20Depth WS error:", txt)
+        self._last_error_text = str(error)
+        print("❌ 20Depth WS ERROR:", error)
 
     def _on_close(self, ws, code, msg):
         self._connected.clear()
-        if msg:
-            self._last_error_text = str(msg)
-        print("⚠️ 20Depth WS closed:", code, msg)
+        print("⚠️ 20Depth WS CLOSED:", code, msg)
 
     def _on_message(self, ws, message):
-        # text message (often error/notice)
         if isinstance(message, str):
             self._text_msg_count += 1
-            self._last_error_text = message
-            print("📩 20Depth WS TEXT:", message[:300])
-
-            if self._looks_like_rate_limited(message):
-                self._cooldown_until_epoch = time.time() + (15 * 60)
-                print("🛑 20Depth WS text rate-limit/block. Cooling down 15 minutes.")
-                try:
-                    ws.close()
-                except Exception:
-                    pass
+            print("📩 20Depth TEXT:", message[:200])
             return
 
-        # binary message
         self._bin_msg_count += 1
         self._last_msg_at = time.time()
 
-        # periodic diag line
-        if self.diag_print_every > 0 and (self._bin_msg_count % self.diag_print_every == 0):
-            print(
-                f"📦 20D BIN msgs:{self._bin_msg_count} | "
-                f"ok_pkts:{self._parse_ok_packets} bad_pkts:{self._parse_bad_packets}"
-            )
+        if not self._first_bin_printed:
+            print("📥 FIRST_BINARY_FRAME len=", len(message))
+            print("HEX:", message[:48].hex())
+            self._first_bin_printed = True
 
         data = message
         off = 0
         n = len(data)
 
-        # NEW: warn if connected but no data for long time (runs on first message too late)
-        # We'll do a separate warning in main loop by time checks (see below in parser also)
         while off + 2 <= n:
-            # IMPORTANT: use unsigned short (signed <h can become negative and break parsing)
             pkt_len = struct.unpack_from("<H", data, off)[0]
             if pkt_len <= 0 or off + pkt_len > n:
                 self._parse_bad_packets += 1
+                print("⚠️ PARSE_BREAK | pkt_len=", pkt_len)
                 break
 
             pkt = data[off: off + pkt_len]
@@ -303,11 +301,9 @@ class DhanTwentyDepthWS:
                 return
 
             feed_code = pkt[2]
-            packet_type = feed_code
             secid = struct.unpack_from("<i", pkt, 4)[0]
 
-            # body must have 20 levels = 20 * 16 bytes = 320 bytes
-            if len(pkt) < 12 + 320:
+            if len(pkt) < 332:
                 self._parse_bad_packets += 1
                 return
 
@@ -318,18 +314,18 @@ class DhanTwentyDepthWS:
                 levels.append((price, qty, orders))
                 off += 16
 
-            prices = [x[0] for x in levels]
-            qtys = [int(x[1]) for x in levels]
-            orders = [int(x[2]) for x in levels]
-            ts = time.time()
-            side = DepthSide(prices=prices, qty=qtys, orders=orders, ts=ts)
+            side = DepthSide(
+                prices=[x[0] for x in levels],
+                qty=[x[1] for x in levels],
+                orders=[x[2] for x in levels],
+                ts=time.time(),
+            )
 
             if feed_code == FEED_BID:
                 self._latest_bid[secid] = side
             elif feed_code == FEED_ASK:
                 self._latest_ask[secid] = side
             else:
-                # unknown feed code
                 return
 
             bid = self._latest_bid.get(secid)
@@ -337,60 +333,12 @@ class DhanTwentyDepthWS:
             if not bid or not ask:
                 return
 
-            bids = [
-                (bid.prices[i], bid.qty[i], bid.orders[i])
-                for i in range(min(len(bid.prices), len(bid.qty), len(bid.orders)))
-            ]
-            asks = [
-                (ask.prices[i], ask.qty[i], ask.orders[i])
-                for i in range(min(len(ask.prices), len(ask.qty), len(ask.orders)))
-            ]
-
             self._parse_ok_packets += 1
 
             tag = self._subscribed.get(secid, str(secid))
             if self.on_depth:
-                try:
-                    self.on_depth(secid, tag, bid, ask)
-                except Exception as e:
-                    print("❌ on_depth callback error:", e)
+                self.on_depth(secid, tag, bid, ask)
 
-        except Exception:
+        except Exception as e:
             self._parse_bad_packets += 1
-            # keep silent unless debug
-            if self.debug:
-                print("❌ parse_one_packet exception")
-
-    # ---------------- helpers ----------------
-    @staticmethod
-    def _calc_backoff(attempt: int) -> int:
-        if attempt <= 1:
-            return 10
-        if attempt == 2:
-            return 20
-        if attempt == 3:
-            return 40
-        if attempt == 4:
-            return 60
-        return min(300, 60 + (attempt - 4) * 30)
-
-    @staticmethod
-    def _looks_like_rate_limited(text: str) -> bool:
-        t = (text or "").lower()
-        return (
-            "429" in t
-            or "too many requests" in t
-            or "blocked" in t
-            or "client id is blocked" in t
-            or ("rate" in t and "limit" in t)
-        )
-
-    # NEW: you can call this from your main loop if needed
-    def diag_should_warn_no_data(self) -> bool:
-        if not self._connected.is_set():
-            return False
-        if self._connected_at <= 0:
-            return False
-        if self._last_msg_at > 0:
-            return False
-        return (time.time() - self._connected_at) >= float(self.no_data_warn_sec)
+            print("❌ PARSE_EXCEPTION:", e)
