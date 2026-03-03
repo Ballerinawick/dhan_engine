@@ -9,10 +9,6 @@ import websocket  # pip install websocket-client
 
 FEED_BID = 41
 FEED_ASK = 51
-SEGMENT_ENUM = {
-    "NSE_EQ": 1,
-    "NSE_FNO": 2,
-}
 
 
 @dataclass
@@ -86,7 +82,7 @@ class DhanTwentyDepthWS:
         self._parse_ok_packets = 0
         self._parse_bad_packets = 0
         self._first_bin_printed = False
-        self._enum_subscribe_retry_done = False
+        self._subscribe_retry_done = False
         self._last_sub_payload = None
 
     # ==================================================
@@ -230,11 +226,9 @@ class DhanTwentyDepthWS:
                 f" | pending_subs={len(self._pending_subs)} | subscribed={len(self._subscribed)}"
             )
 
-            # Dhan docs define ExchangeSegment as enum (NSE_EQ=1, NSE_FNO=2).
-            # If no data arrives after subscribing, retry once with enum segment payload.
-            if self._subscribed and not self._enum_subscribe_retry_done:
-                self._enum_subscribe_retry_done = True
-                print("🔁 20D_RETRY_SUBSCRIBE_WITH_SEGMENT_ENUM")
+            if self._subscribed and not self._subscribe_retry_done:
+                self._subscribe_retry_done = True
+                print("🔁 20D_RETRY_SUBSCRIBE")
                 subs = [{"SecurityId": str(k)} for k in self._subscribed.keys()]
                 self._send_subscribe(subs)
 
@@ -248,28 +242,28 @@ class DhanTwentyDepthWS:
         if not self._ws:
             return
 
-        segment_value = SEGMENT_ENUM.get(self.exchange_segment, self.exchange_segment)
-
-        inst_list = [
-            {
-                "ExchangeSegment": segment_value,
-                "SecurityId": str(int(it["SecurityId"])),
-            }
-            for it in instruments
-        ]
+        secids = [int(it["SecurityId"]) for it in instruments]
+        inst_list = secids
 
         payload = {
             "RequestCode": 23,
             "InstrumentCount": len(inst_list),
-            "InstrumentList": inst_list,
+            "InstrumentList": [
+                {
+                    "ExchangeSegment": self.exchange_segment,
+                    "SecurityId": str(secid),
+                }
+                for secid in secids
+            ],
         }
 
         self._last_sub_payload = payload
 
         print(
             f"📤 20D_SUBSCRIBE_SENT | count={len(inst_list)} | seg={self.exchange_segment} "
-            f"| secids={[x['SecurityId'] for x in inst_list]}"
+            f"| secids={secids}"
         )
+        print("📤 FINAL_20D_PAYLOAD:", payload)
         print("📤 20D_PAYLOAD:", payload)
 
         try:
@@ -288,7 +282,7 @@ class DhanTwentyDepthWS:
         self._parse_ok_packets = 0
         self._parse_bad_packets = 0
         self._first_bin_printed = False
-        self._enum_subscribe_retry_done = False
+        self._subscribe_retry_done = False
 
         print("✅ 20Depth WS connected")
         print(
