@@ -31,7 +31,7 @@ except Exception:
 # ================= CONFIG =================
 CSV_FILE = os.getenv("CSV_FILE", "api-scrip-master.csv")
 
-INDEXES = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+INDEXES = ["NIFTY"]
 STRIKE_STEP = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
 
 OPT_EXCHANGE_SEGMENT_20D = "NSE_FNO"
