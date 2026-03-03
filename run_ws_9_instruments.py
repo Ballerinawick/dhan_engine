@@ -34,7 +34,7 @@ CSV_FILE = os.getenv("CSV_FILE", "api-scrip-master.csv")
 INDEXES = ["NIFTY"]
 STRIKE_STEP = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
 
-OPT_EXCHANGE_SEGMENT_20D = 2  # NSE_FNO numeric segment for Dhan 20 depth
+OPT_EXCHANGE_SEGMENT_20D = "NSE_FNO"
 
 REST_POLL_INTERVAL_SEC = 1.1
 REST_MAX_WAIT_SEC = 45
@@ -245,6 +245,7 @@ def main():
     fut_ltp = {k: 0.0 for k in INDEXES}
     zero_book_counter = {}
     zero_book_warned = set()
+    last_depth_tick_log = {}
 
     # ==================================================
     # OPTION DEPTH CALLBACK (INSTITUTIONAL FLOW)
@@ -256,6 +257,15 @@ def main():
 
             bid_levels = len(bid.prices) if hasattr(bid, "prices") else len(bid)
             ask_levels = len(ask.prices) if hasattr(ask, "prices") else len(ask)
+
+            now_ts = time.time()
+            last_log_ts = last_depth_tick_log.get(secid, 0.0)
+            if now_ts - last_log_ts >= 2.0 and bid_levels > 0 and ask_levels > 0:
+                print(
+                    f"📡 DEPTH_TICK | {tag} | secid={secid} | "
+                    f"bid0={bid.prices[0]:.2f} ask0={ask.prices[0]:.2f}"
+                )
+                last_depth_tick_log[secid] = now_ts
 
             raw = feature_builder.build(secid, bid, ask)
             if not raw:
@@ -384,6 +394,21 @@ def main():
 
     depth20.connect()
     print("✅ 20Depth WS started")
+
+    def diag_watchdog_loop():
+        time.sleep(1)
+        while True:
+            print("🛰️ 20D_DIAG_SNAPSHOT", depth20.diag_snapshot())
+            if depth20.diag_should_warn_no_data():
+                print("🚨 20D_NO_DATA_WARNING – CONNECTED BUT NO BINARY PACKETS")
+                print("   Possible reasons (ordered):")
+                print("   1) Wrong ExchangeSegment (must be 'NSE_FNO' / 'NSE_EQ')")
+                print("   2) No entitlement for Full Market Depth on this account")
+                print("   3) SecurityId not valid for segment")
+                print("   4) Network blocks WSS in cloud environment")
+            time.sleep(10)
+
+    threading.Thread(target=diag_watchdog_loop, name="Depth20DiagWatchdog", daemon=True).start()
 
     # ================= FUT LTP =================
     print("\n⏳ Fetching initial FUT LTP...")
