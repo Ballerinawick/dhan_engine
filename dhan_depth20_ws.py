@@ -120,7 +120,7 @@ class DhanTwentyDepthWS:
         print(f"🛰️ DEPTH_SUBSCRIBE_CALLED | connected={self._connected.is_set()} | secids={secids}")
 
         if not self._connected.is_set():
-            print("🕓 DEPTH_SUB_QUEUED (waiting for connect)")
+            print("🕓 DEPTH_SUB_QUEUED (waiting for connection)")
             self._pending_subs.extend(instruments)
             return
 
@@ -183,7 +183,7 @@ class DhanTwentyDepthWS:
             if not self._connected.is_set():
                 continue
 
-            age = (
+            last_age = (
                 round(time.time() - self._last_msg_at, 1)
                 if self._last_msg_at > 0
                 else "NO_MSG_YET"
@@ -195,13 +195,12 @@ class DhanTwentyDepthWS:
                 f"text={self._text_msg_count} | "
                 f"ok={self._parse_ok_packets} | "
                 f"bad={self._parse_bad_packets} | "
-                f"last_msg_age={age} | "
-                f"last_error={self._last_error_text}"
+                f"last_msg_age={last_age}"
             )
 
             if self._last_msg_at == 0 and \
                (time.time() - self._connected_at) > self.no_data_warn_sec:
-                print("🚨 20D_NO_DATA_WARNING — CONNECTED BUT NO BINARY PACKETS")
+                print("🚨 20D_NO_DATA_WARNING – CONNECTED BUT NO BINARY PACKETS")
 
     # ==================================================
     # SUBSCRIBE
@@ -227,7 +226,7 @@ class DhanTwentyDepthWS:
         self._last_sub_payload = payload
 
         print(f"📤 20D_SUBSCRIBE_SENT | count={len(inst_list)} | seg={self.exchange_segment}")
-        print("📤 PAYLOAD:", payload)
+        print("📤 20D_PAYLOAD:", payload)
 
         try:
             self._ws.send(json.dumps(payload))
@@ -276,7 +275,7 @@ class DhanTwentyDepthWS:
 
         if not self._first_bin_printed:
             print("📥 FIRST_BINARY_FRAME len=", len(message))
-            print("HEX:", message[:48].hex())
+            print("HEX_HEAD:", message[:48].hex())
             self._first_bin_printed = True
 
         data = message
