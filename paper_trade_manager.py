@@ -130,6 +130,11 @@ class PaperTradeManager:
             f"✅ ENTRY_COMMITTED | {tag} | {side} | "
             f"Lots:{lots} | Qty:{qty} | Entry:{ltp:.2f} | Reason:{reason}"
         )
+        print(
+            f"💰 ENTRY_COST_ANALYSIS | "
+            f"Entry:{ltp:.2f} | "
+            f"RoundTripFee:{self.ROUND_TRIP_FEE}"
+        )
 
     # --------------------------------------------------
     # EXIT (FULL LOT ONLY) — FEES APPLIED HERE

@@ -31,11 +31,13 @@ class OptionsMomentumEngine:
     MICRO_MIN_ABSORB = 0.12
     MICRO_MIN_FLOW = 800
 
-    TURN_SPEED_RATIO_THRESHOLD = 3.0
+    TURN_SPEED_RATIO_THRESHOLD = 1.2
 
     def __init__(self):
         self.tick_buffer = defaultdict(deque)
         self.candles = defaultdict(deque)
+        self.candles_3s = defaultdict(deque)
+        self.last_3s_bucket = {}
 
         self.active_trade = {}
         self.last_action_sec = {}
@@ -164,6 +166,29 @@ class OptionsMomentumEngine:
         self.candles[secid].append(candle)
         if len(self.candles[secid]) > 40:
             self.candles[secid].popleft()
+
+        bucket_3 = candle_sec // 3
+        if self.last_3s_bucket.get(secid) != bucket_3:
+            self.last_3s_bucket[secid] = bucket_3
+            last3 = list(self.candles[secid])[-3:]
+            if len(last3) == 3:
+                o = last3[0]["open"]
+                h = max(x["high"] for x in last3)
+                l = min(x["low"] for x in last3)
+                c3 = last3[-1]["close"]
+
+                self.candles_3s[secid].append({
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c3,
+                    "sec": candle_sec
+                })
+
+                if len(self.candles_3s[secid]) > 20:
+                    self.candles_3s[secid].popleft()
+
+                print(f"🕒 3S_CANDLE | secid={secid} | close={c3:.2f}")
 
         return self._evaluate(secid)
 
@@ -404,6 +429,13 @@ class OptionsMomentumEngine:
         avg_range_5, avg_vol_5 = self._avg_range_vol(last5)
         avg_range_20, avg_vol_20 = self._avg_range_vol(last20)
 
+        print(
+            f"🔎 TURN_CHECK | secid={secid} | "
+            f"speed={speed:.4f} | prev_speed={prev_speed:.4f} | "
+            f"speed_ratio={speed_ratio:.2f} | "
+            f"avg_range_5={avg_range_5:.4f}"
+        )
+
         last_tick = self.tick_buffer[secid][-1] if self.tick_buffer[secid] else {}
         self._collect_warmup_stats(secid, cur_sec, speed, avg_range_5, last_tick)
 
@@ -481,7 +513,29 @@ class OptionsMomentumEngine:
         )
         reversal_confirm = float(last["close"]) > midpoint_prev
 
-        if prior_move_down and down_exhaustion and reversal_confirm:
+        tf3_ok = False
+        if len(self.candles_3s[secid]) >= 2:
+            c3_last = self.candles_3s[secid][-1]
+            c3_prev = self.candles_3s[secid][-2]
+            tf3_ok = c3_last["close"] > c3_prev["close"]
+
+        print(
+            f"🧭 TF_CONFIRM | secid={secid} | "
+            f"1s_turn={prior_move_down and down_exhaustion and reversal_confirm} | "
+            f"3s_ok={tf3_ok}"
+        )
+
+        if prior_move_down and down_exhaustion and reversal_confirm and tf3_ok:
+            spread_value = float(last_tick.get("spread", 0) or 0)
+            expected_move = avg_range_5
+
+            if expected_move <= spread_value * 1.2:
+                print(
+                    f"🚫 ENTRY_BLOCK_FEE_RISK | secid={secid} | "
+                    f"expected_move={expected_move:.4f} | spread={spread_value:.4f}"
+                )
+                return "NO_TRADE"
+
             self.active_trade[secid] = {
                 "type": "TURN",
                 "side": "LONG",
