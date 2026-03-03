@@ -130,6 +130,7 @@ class OptionsMomentumEngine:
 
     # --------------------------------------------------
     def on_tick(self, secid: int, tick: dict) -> str:
+        print(f"⚡ MOMENTUM_RECEIVED | secid={secid} | ltp={tick.get('ltp')} | ts={tick.get('ts')}")
         ts = tick.get("ts")
         ltp = float(tick.get("ltp", 0) or 0)
         if not ts or ltp <= 0:
@@ -229,8 +230,8 @@ class OptionsMomentumEngine:
 
     def _micro_ok(self, secid: int, last_tick: dict, cur_sec: int) -> bool:
         ltp = float(last_tick.get("ltp", 0) or 0)
-        bid = float(last_tick.get("bid", 0) or 0)
-        ask = float(last_tick.get("ask", 0) or 0)
+        bid = float(last_tick.get("bid_price", 0) or 0)
+        ask = float(last_tick.get("ask_price", 0) or 0)
         spread = float(last_tick.get("spread", 0) or 0)
         if spread <= 0 and bid > 0 and ask > 0:
             spread = max(ask - bid, 0.0)

@@ -278,6 +278,7 @@ def main():
 
             raw["secid"] = secid
             raw["tag"] = tag
+            raw["ts"] = time.time()
 
             # 0️⃣ MTM update
             paper_trader.on_tick(secid, raw["ltp"])
@@ -316,6 +317,7 @@ def main():
             # ---------------------------------------------------------
 
             # 1️⃣ Momentum signal
+            print(f"📡 DEPTH_CALLBACK | secid={secid} | ltp={raw.get('ltp')}")
             action = momentum_engine.on_tick(secid, raw)
 
             # 2️⃣ Institutional decision layer (ENTRY gating etc)
