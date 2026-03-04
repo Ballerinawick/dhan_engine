@@ -34,6 +34,8 @@ class DhanAsyncDepthAdapter:
         self._latest_bid: Dict[int, Tuple[List[float], List[int], List[int]]] = {}
         self._latest_ask: Dict[int, Tuple[List[float], List[int], List[int]]] = {}
         self._secid_tag_map: Dict[int, str] = {}
+        self._loop = None
+        self._connected_evt = threading.Event()
 
         self._first_packet_logged = False
         self._first_pair_logged = False
@@ -55,17 +57,26 @@ class DhanAsyncDepthAdapter:
             self._secid_tag_map[secid_int] = secid_text
             secids.append(secid_int)
 
-        print("📤 ASYNC_20DEPTH_SUBSCRIBED")
         print("📤 ASYNC_20DEPTH_SUBSCRIBED | secids=", secids)
 
-        if hasattr(self.full_depth, "subscribe"):
-            self.full_depth.subscribe(instruments)
-        elif hasattr(self.full_depth, "subscribe_instruments"):
-            self.full_depth.subscribe_instruments(instruments)
+        if not self._connected_evt.wait(timeout=5):
+            print("⚠️ ASYNC_SUBSCRIBE_BEFORE_CONNECTED")
+            return
+
+        if not self._loop:
+            print("❌ ASYNC_NO_LOOP_FOR_SUBSCRIBE")
+            return
+
+        asyncio.run_coroutine_threadsafe(
+            self.full_depth.subscribe_async(instruments),
+            self._loop,
+        )
 
     async def _run(self):
+        self._loop = asyncio.get_running_loop()
         await self.full_depth.connect()
         print("✅ ASYNC_20DEPTH_CONNECTED")
+        self._connected_evt.set()
 
         while True:
             async for update in self.full_depth.get_instrument_data():

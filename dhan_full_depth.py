@@ -18,7 +18,7 @@ class FullDepth:
         self._lock = asyncio.Lock()
 
     async def connect(self):
-        if not self.ws or self.ws.state == websockets.protocol.State.CLOSED:
+        if self.ws is None or self.ws.closed:
             url = (
                 f"{depth_feed_wss}?token={self.access_token}"
                 f"&clientId={self.client_id}&authType=2"
@@ -42,7 +42,13 @@ class FullDepth:
             loop = asyncio.get_running_loop()
             loop.create_task(self._send_subscription(self._subscribed))
         except RuntimeError:
-            pass
+            print("⚠️ subscribe() called without asyncio loop — use subscribe_async")
+
+    async def subscribe_async(self, instruments):
+        self._subscribed = list(instruments or [])
+        if not self._subscribed:
+            return
+        await self._send_subscription(self._subscribed)
 
     def subscribe_instruments(self, instruments):
         self.subscribe(instruments)
@@ -52,7 +58,7 @@ class FullDepth:
             return
 
         async with self._lock:
-            if not self.ws or self.ws.state == websockets.protocol.State.CLOSED:
+            if self.ws is None or self.ws.closed:
                 return
 
             payload = {
@@ -67,6 +73,7 @@ class FullDepth:
                 ],
             }
             await self.ws.send(json.dumps(payload))
+            print("✅ ASYNC_SUBSCRIPTION_SENT_TO_WS")
 
     async def disconnect(self):
         if self.ws:
