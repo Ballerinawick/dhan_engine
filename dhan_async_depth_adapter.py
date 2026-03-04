@@ -4,7 +4,7 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
-from dhanhq.full_depth import FullDepth
+from dhan_full_depth import FullDepth
 
 
 @dataclass
@@ -28,6 +28,7 @@ class DhanAsyncDepthAdapter:
         self.exchange_segment = str(exchange_segment)
         self.on_depth = on_depth
 
+        print("🚀 DEPTH_ADAPTER_INITIALIZING")
         self.full_depth = FullDepth(client_id=self.client_id, access_token=self.token)
 
         self._latest_bid: Dict[int, Tuple[List[float], List[int], List[int]]] = {}
@@ -54,6 +55,7 @@ class DhanAsyncDepthAdapter:
             self._secid_tag_map[secid_int] = self._secid_tag_map.get(secid_int, secid_text)
             secids.append(secid_int)
 
+        print("📤 ASYNC_20DEPTH_SUBSCRIBED")
         print("📤 ASYNC_20DEPTH_SUBSCRIBED | secids=", secids)
 
         if hasattr(self.full_depth, "subscribe"):
