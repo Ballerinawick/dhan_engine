@@ -69,65 +69,10 @@ class DhanAsyncDepthAdapter:
 
         while True:
             async for update in self.full_depth.get_instrument_data():
-                if isinstance(update, (bytes, bytearray)):
-                    if not self._first_packet_logged:
-                        self._first_packet_logged = True
-                        print("📥 FIRST_BINARY_PACKET_RECEIVED")
-
-                    update = self._decode_binary_packet(update)
-
-                if update is None:
-                    continue
-
+                if not self._first_packet_logged:
+                    self._first_packet_logged = True
+                    print("📥 ASYNC_FIRST_PACKET_RECEIVED")
                 self._process_update(update)
-
-    def _decode_binary_packet(self, packet: bytes):
-        import struct
-
-        if len(packet) < 12:
-            return None
-
-        try:
-            msg_code = packet[0]
-
-            msg_len = struct.unpack("<H", packet[1:3])[0]
-            segment = packet[3]
-            secid = struct.unpack("<I", packet[4:8])[0]
-
-            payload = packet[8:]
-
-            levels = []
-
-            step = 20
-
-            for i in range(0, len(payload), step):
-                chunk = payload[i:i + step]
-
-                if len(chunk) < 20:
-                    break
-
-                bid_qty = struct.unpack("<I", chunk[0:4])[0]
-                ask_qty = struct.unpack("<I", chunk[4:8])[0]
-                bid_orders = struct.unpack("<H", chunk[8:10])[0]
-                ask_orders = struct.unpack("<H", chunk[10:12])[0]
-                bid_price = struct.unpack("<f", chunk[12:16])[0]
-                ask_price = struct.unpack("<f", chunk[16:20])[0]
-
-                levels.append({
-                    "price": bid_price,
-                    "qty": bid_qty,
-                    "orders": bid_orders,
-                })
-
-            return {
-                "msg_code": msg_code,
-                "security_id": secid,
-                "levels": levels,
-            }
-
-        except Exception as e:
-            print("⚠️ BINARY_PARSE_ERROR", e)
-            return None
 
     @staticmethod
     def _pick_msg_code(update: dict) -> Optional[int]:
