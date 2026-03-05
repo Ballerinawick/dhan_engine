@@ -17,6 +17,18 @@ class FullDepth:
         self._subscribed: List[Tuple[int, str]] = []
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def _normalize_exchange_segment(segment) -> str:
+        """Map numeric Dhan segments to documented string names."""
+        seg_text = str(segment).strip().upper()
+        segment_map = {
+            "1": "NSE_EQ",
+            "2": "NSE_FNO",
+            "NSE_EQ": "NSE_EQ",
+            "NSE_FNO": "NSE_FNO",
+        }
+        return segment_map.get(seg_text, seg_text)
+
     async def connect(self):
         if self.ws is None or self.ws.closed:
             url = (
@@ -66,14 +78,15 @@ class FullDepth:
                 "InstrumentCount": len(instruments),
                 "InstrumentList": [
                     {
-                        "ExchangeSegment": str(seg),
+                        "ExchangeSegment": self._normalize_exchange_segment(seg),
                         "SecurityId": str(secid),
                     }
                     for seg, secid in instruments
                 ],
             }
+            print("📨 DEPTH_SUB_PAYLOAD", json.dumps(payload, separators=(",", ":")))
             await self.ws.send(json.dumps(payload))
-            print("✅ ASYNC_SUBSCRIPTION_SENT_TO_WS")
+            print("✅ SUB_SENT_OK")
 
     async def disconnect(self):
         if self.ws:
@@ -92,6 +105,7 @@ class FullDepth:
                 except Exception:
                     continue
             else:
+                print(f"📥 BIN_FRAME_RX size={len(data)}")
                 parsed = self._parse_binary_message(data)
                 if parsed:
                     yield parsed
