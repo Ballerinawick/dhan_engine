@@ -33,7 +33,7 @@ class FullDepth:
 
     async def connect(self):
 
-        if self.ws is None or self.ws.closed:
+        if self.ws is None or getattr(self.ws, "close_code", None) is not None:
 
             url = (
                 f"{depth_feed_wss}?token={self.access_token}"
@@ -90,7 +90,7 @@ class FullDepth:
 
         async with self._lock:
 
-            if self.ws is None or self.ws.closed:
+            if self.ws is None or getattr(self.ws, "close_code", None) is not None:
                 return
 
             payload = {
@@ -105,8 +105,10 @@ class FullDepth:
                 ],
             }
 
-            print("📨 DEPTH_SUB_PAYLOAD",
-                  json.dumps(payload, separators=(",", ":")))
+            print(
+                "📨 DEPTH_SUB_PAYLOAD",
+                json.dumps(payload, separators=(",", ":"))
+            )
 
             await self.ws.send(json.dumps(payload))
 
@@ -122,7 +124,7 @@ class FullDepth:
 
         while True:
 
-            if not self.ws:
+            if self.ws is None:
                 await self.connect()
 
             try:
