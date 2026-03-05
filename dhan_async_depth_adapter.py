@@ -39,6 +39,7 @@ class DhanAsyncDepthAdapter:
 
         self._first_packet_logged = False
         self._first_pair_logged = False
+        self._first_parsed_logged = False
 
     def start(self):
         threading.Thread(
@@ -146,6 +147,10 @@ class DhanAsyncDepthAdapter:
         msg_code = self._pick_msg_code(update)
         secid = self._pick_secid(update)
         levels = self._pick_levels(update)
+
+        if not self._first_parsed_logged and msg_code is not None and secid is not None:
+            self._first_parsed_logged = True
+            print(f"🧭 ASYNC_FIRST_PARSED msg_code={msg_code} secid={secid}")
 
         if msg_code is None or secid is None or levels is None:
             return
