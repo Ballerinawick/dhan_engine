@@ -29,7 +29,7 @@ class OptionsMomentumEngine:
     MICRO_MAX_SPREAD_PCT = 0.015
     MICRO_MIN_ABS_IMB = 0.08
     MICRO_MIN_ABSORB = 0.12
-    MICRO_MIN_FLOW = 800
+    MICRO_MIN_FLOW = 250
 
     TURN_SPEED_RATIO_THRESHOLD = 1.2
 
@@ -230,11 +230,13 @@ class OptionsMomentumEngine:
 
     def _micro_ok(self, secid: int, last_tick: dict, cur_sec: int) -> bool:
         ltp = float(last_tick.get("ltp", 0) or 0)
-        bid = float(last_tick.get("bid_price", 0) or 0)
-        ask = float(last_tick.get("ask_price", 0) or 0)
+        bid = float(last_tick.get("bid_price") or last_tick.get("bid") or 0)
+        ask = float(last_tick.get("ask_price") or last_tick.get("ask") or 0)
         spread = float(last_tick.get("spread", 0) or 0)
         if spread <= 0 and bid > 0 and ask > 0:
             spread = max(ask - bid, 0.0)
+        if spread <= 0:
+            spread = max(ask - bid, 0.01)
 
         spread_pct = spread / max(ltp, 1e-9)
         imb = float(last_tick.get("imbalance_5", 0) or 0)
@@ -478,31 +480,6 @@ class OptionsMomentumEngine:
         if secid in self.active_trade:
             return "NO_TRADE"
 
-        ltp = float(last_tick.get("ltp", 0) or 0)
-        bid = float(last_tick.get("bid", 0) or 0)
-        ask = float(last_tick.get("ask", 0) or 0)
-        spread = float(last_tick.get("spread", 0) or 0)
-        if spread <= 0 and bid > 0 and ask > 0:
-            spread = max(ask - bid, 0.0)
-        spread_ok = (spread / max(ltp, 1e-9)) <= self.MICRO_MAX_SPREAD_PCT
-
-        imb = float(last_tick.get("imbalance_5", 0) or 0)
-        flow = float(last_tick.get("flow", 0) or 0)
-        absorb_strength = float(last_tick.get("absorption_strength", 0) or 0)
-        absorb_flag = bool(last_tick.get("absorption_flag", False))
-        vac = bool(last_tick.get("vacuum_flag", False))
-
-        missing_fields = (
-            abs(imb) <= 1e-9
-            and abs(flow) <= 1e-9
-            and abs(absorb_strength) <= 1e-9
-            and (not absorb_flag)
-        )
-        dir_ok = missing_fields or (abs(imb) >= self.MICRO_MIN_ABS_IMB) or (absorb_flag and absorb_strength >= self.MICRO_MIN_ABSORB)
-        confirm_ok = missing_fields or (absorb_strength >= self.MICRO_MIN_ABSORB) or (abs(flow) >= self.MICRO_MIN_FLOW)
-        vacuum_ok = not vac
-        micro_ok = spread_ok and vacuum_ok and dir_ok and confirm_ok
-
         if not self._micro_ok(secid, last_tick, cur_sec):
             return "NO_TRADE"
 
@@ -525,6 +502,15 @@ class OptionsMomentumEngine:
             f"1s_turn={prior_move_down and down_exhaustion and reversal_confirm} | "
             f"3s_ok={tf3_ok}"
         )
+
+        if not (prior_move_down and down_exhaustion and reversal_confirm and tf3_ok):
+            print(
+                f"🚫 ENTRY_REJECT | secid={secid} | "
+                f"prior_down={prior_move_down} | "
+                f"exhaust={down_exhaustion} | "
+                f"reversal={reversal_confirm} | "
+                f"tf3={tf3_ok}"
+            )
 
         if prior_move_down and down_exhaustion and reversal_confirm and tf3_ok:
             spread_value = float(last_tick.get("spread", 0) or 0)
