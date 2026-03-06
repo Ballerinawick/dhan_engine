@@ -449,9 +449,11 @@ def main():
                 })
 
             if subs:
-                depth_adapter.subscribe([(2, s["SecurityId"]) for s in subs])
+                instruments = []
                 for s in subs:
+                    instruments.append((2, s["SecurityId"], s["tag"]))
                     full_quote_secid_tag[int(s["SecurityId"])] = s["tag"]
+                depth_adapter.subscribe(instruments)
 
         except Exception as e:
             print(f"❌ [{idx}] OptionChain error:", e)
