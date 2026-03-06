@@ -99,6 +99,32 @@ class InstitutionalDecisionEngine:
         self._log(f"🧯 ENTRY_REJECT | {index} | {tag} | side={side} | reason={reason}")
         return {"entry_allowed": False}
 
+    def _pressure_score(self, tick):
+        score = 0
+
+        imb = abs(float(tick.get("imbalance_5", 0) or 0))
+        flow = abs(float(tick.get("flow", 0) or 0))
+        absorb = float(tick.get("absorption_strength", 0) or 0)
+        vac = bool(tick.get("vacuum_flag", False))
+        spread = float(tick.get("spread", 0) or 0)
+
+        if imb > 0.20:
+            score += 2
+
+        if flow > 400:
+            score += 2
+
+        if absorb > 0.20:
+            score += 2
+
+        if spread < 0.20:
+            score += 1
+
+        if vac:
+            score -= 2
+
+        return score
+
     # --------------------------------------------------
     def on_signal(self, *, secid, tag, ltp, signal, momentum_engine, paper_trader):
         now = time.time()
@@ -120,6 +146,15 @@ class InstitutionalDecisionEngine:
 
         # ================= ENTRY =================
         if signal in ("A_ENTRY", "B_ENTRY", "TURN_ENTRY"):
+            last_tick = momentum_engine.tick_buffer[secid][-1] if momentum_engine.tick_buffer[secid] else {}
+
+            pressure = self._pressure_score(last_tick)
+
+            print(f"⚖️ PRESSURE_SCORE | {tag} | score={pressure}")
+
+            if pressure < 3:
+                return self._reject_entry(index, tag, side, "WEAK_PRESSURE", secid, momentum_engine)
+
             trade = momentum_engine.active_trade.get(secid)
             if not trade:
                 return {"entry_allowed": False}
