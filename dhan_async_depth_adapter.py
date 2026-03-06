@@ -47,16 +47,17 @@ class DhanAsyncDepthAdapter:
             daemon=True,
         ).start()
 
-    def subscribe(self, instruments: List[Tuple[int, str]]):
+    def subscribe(self, instruments: List[Tuple[str, str, str]]):
         if not instruments:
             return
 
         secids = []
-        for exchange_segment, secid in instruments:
+        subscribe_payload = []
+        for exchange_segment, secid, tag in instruments:
             secid_int = int(secid)
-            secid_text = str(secid_int)
-            self._secid_tag_map[secid_int] = secid_text
+            self._secid_tag_map[secid_int] = str(tag)
             secids.append(secid_int)
+            subscribe_payload.append((exchange_segment, secid))
 
         print("📤 ASYNC_20DEPTH_SUBSCRIBED | secids=", secids)
 
@@ -69,7 +70,7 @@ class DhanAsyncDepthAdapter:
             return
 
         asyncio.run_coroutine_threadsafe(
-            self.full_depth.subscribe_async(instruments),
+            self.full_depth.subscribe_async(subscribe_payload),
             self._loop,
         )
 
