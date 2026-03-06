@@ -52,12 +52,12 @@ class DhanAsyncDepthAdapter:
             return
 
         secids = []
-        subscribe_payload = []
+        broker_instruments = []
         for exchange_segment, secid, tag in instruments:
             secid_int = int(secid)
-            self._secid_tag_map[secid_int] = str(tag)
+            self._secid_tag_map[secid_int] = tag
             secids.append(secid_int)
-            subscribe_payload.append((exchange_segment, secid))
+            broker_instruments.append((exchange_segment, secid))
 
         print("📤 ASYNC_20DEPTH_SUBSCRIBED | secids=", secids)
 
@@ -70,7 +70,7 @@ class DhanAsyncDepthAdapter:
             return
 
         asyncio.run_coroutine_threadsafe(
-            self.full_depth.subscribe_async(subscribe_payload),
+            self.full_depth.subscribe_async(broker_instruments),
             self._loop,
         )
 
