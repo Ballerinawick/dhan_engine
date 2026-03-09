@@ -21,6 +21,8 @@ class DepthMicroFeatureBuilder:
         # per security state
         self._prev_top5: Dict[int, Tuple[int, int]] = {}  # (sumBid5, sumAsk5)
         self._prev_best: Dict[int, Tuple[float, float, int, int]] = {}  # (bidPx, askPx, bidQty, askQty)
+        self._prev_bid1: Dict[int, int] = {}
+        self._prev_ask1: Dict[int, int] = {}
 
         # stability buffer for absorption detection
         self._mid_buf: Dict[int, deque] = {}   # mid prices
@@ -37,8 +39,22 @@ class DepthMicroFeatureBuilder:
         best_bid_qty = int(bid.qty[0]) if bid.qty else 0
         best_ask_qty = int(ask.qty[0]) if ask.qty else 0
 
+        prev_bid = self._prev_bid1.get(secid, best_bid_qty)
+        prev_ask = self._prev_ask1.get(secid, best_ask_qty)
+
+        ofi = (best_bid_qty - prev_bid) - (best_ask_qty - prev_ask)
+
+        self._prev_bid1[secid] = best_bid_qty
+        self._prev_ask1[secid] = best_ask_qty
+
         # mid + spread
         mid = (best_bid_px + best_ask_px) / 2.0 if best_bid_px and best_ask_px else 0.0
+        microprice = 0.0
+        if best_bid_qty + best_ask_qty > 0:
+            microprice = (
+                (best_bid_px * best_ask_qty) +
+                (best_ask_px * best_bid_qty)
+            ) / (best_bid_qty + best_ask_qty)
         spread = (best_ask_px - best_bid_px) if best_bid_px and best_ask_px else 0.0
 
         # top5
@@ -61,6 +77,7 @@ class DepthMicroFeatureBuilder:
         # vacuum: sudden pull on one side OR spread expansion + thinning
         prev_best = self._prev_best.get(secid)
         vacuum_flag = False
+        vacuum_strength = 0.0
         if prev_best:
             pbid_px, pask_px, pbid_qty, pask_qty = prev_best
             # pull definition (simple + robust)
@@ -68,6 +85,12 @@ class DepthMicroFeatureBuilder:
             pull_ask = (best_ask_qty < pask_qty * 0.45) and (best_ask_px >= pask_px)
             spread_jump = spread > (pask_px - pbid_px) * 1.8 if (pbid_px and pask_px) else False
             vacuum_flag = pull_bid or pull_ask or spread_jump
+
+            if pull_bid:
+                vacuum_strength = min(1.0, (pbid_qty - best_bid_qty) / max(pbid_qty, 1))
+
+            elif pull_ask:
+                vacuum_strength = min(1.0, (pask_qty - best_ask_qty) / max(pask_qty, 1))
         self._prev_best[secid] = (best_bid_px, best_ask_px, best_bid_qty, best_ask_qty)
 
         # absorption: mid stable but best qty increases (trapping)
@@ -105,12 +128,15 @@ class DepthMicroFeatureBuilder:
             "ask_qty": best_ask_qty,
             "imbalance_5": float(imbalance_5),
             "flow": float(flow),
+            "ofi": float(ofi),
+
             "vacuum_flag": bool(vacuum_flag),
+            "vacuum_strength": float(vacuum_strength),
 
             "absorption_flag": bool(absorption_flag),
             "absorption_strength": float(absorption_strength),
 
-            # optional debug
+            "microprice": float(microprice),
             "spread": float(spread),
             "ts": time.time(),
         }
