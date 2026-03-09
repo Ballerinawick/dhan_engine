@@ -114,6 +114,21 @@ class DepthMicroFeatureBuilder:
                 # normalize (keep bounded)
                 absorption_strength = min(1.0, (abs(bid_build) + abs(ask_build)) / 50000.0)
 
+        pressure_score = (
+            0.35 * imbalance_5 +
+            0.25 * (ofi / 1000.0) +
+            0.20 * (flow / 1000.0) +
+            0.10 * vacuum_strength +
+            0.10 * absorption_strength
+        )
+        pressure_score = max(min(pressure_score, 1.0), -1.0)
+
+        pressure_side = "NEUTRAL"
+        if pressure_score > 0.15:
+            pressure_side = "BUY"
+        elif pressure_score < -0.15:
+            pressure_side = "SELL"
+
         # LTP proxy:
         # In depth feed you don't get last trade here, so we use mid as "ltp-like" for engine inputs.
         # (Later: if you also run a separate LTP feed, replace this with true LTP.)
@@ -138,5 +153,8 @@ class DepthMicroFeatureBuilder:
 
             "microprice": float(microprice),
             "spread": float(spread),
+
+            "pressure_score": float(pressure_score),
+            "pressure_side": pressure_side,
             "ts": time.time(),
         }
