@@ -440,6 +440,19 @@ class OptionsMomentumEngine:
         )
 
         last_tick = self.tick_buffer[secid][-1] if self.tick_buffer[secid] else {}
+        imbalance = float(last_tick.get("imbalance_5", 0) or 0)
+        flow = float(last_tick.get("flow", 0) or 0)
+        ofi = float(last_tick.get("ofi", 0) or 0)
+        absorb_strength = float(last_tick.get("absorption_strength", 0) or 0)
+
+        pressure_score = (
+            0.40 * imbalance +
+            0.30 * (ofi / 1000.0) +
+            0.20 * (flow / 1000.0) +
+            0.10 * absorb_strength
+        )
+        pressure_score = max(min(pressure_score, 1.0), -1.0)
+
         self._collect_warmup_stats(secid, cur_sec, speed, avg_range_5, last_tick)
 
         self._log_engine_state(cur_sec)
@@ -484,11 +497,18 @@ class OptionsMomentumEngine:
             return "NO_TRADE"
 
         prior_move_down = prev_speed < 0
-        down_exhaustion = (
-            speed_ratio > self.TURN_SPEED_RATIO_THRESHOLD
-            and shrinking_range
-            and speed_collapse
-        )
+        exhaust_score = 0
+
+        if speed_ratio > self.TURN_SPEED_RATIO_THRESHOLD:
+            exhaust_score += 1
+
+        if shrinking_range:
+            exhaust_score += 1
+
+        if speed_collapse:
+            exhaust_score += 1
+
+        down_exhaustion = exhaust_score >= 2
         reversal_confirm = float(last["close"]) > midpoint_prev
 
         tf3_ok = False
@@ -503,16 +523,24 @@ class OptionsMomentumEngine:
             f"3s_ok={tf3_ok}"
         )
 
-        if not (prior_move_down and down_exhaustion and reversal_confirm and tf3_ok):
+        pressure_ok = pressure_score > 0.12 or ofi > 150
+
+        if not (prior_move_down and down_exhaustion and reversal_confirm and tf3_ok and pressure_ok):
             print(
                 f"🚫 ENTRY_REJECT | secid={secid} | "
                 f"prior_down={prior_move_down} | "
                 f"exhaust={down_exhaustion} | "
                 f"reversal={reversal_confirm} | "
-                f"tf3={tf3_ok}"
+                f"tf3={tf3_ok} | "
+                f"pressure_ok={pressure_ok}"
             )
 
-        if prior_move_down and down_exhaustion and reversal_confirm and tf3_ok:
+        if prior_move_down and down_exhaustion and reversal_confirm and tf3_ok and pressure_ok:
+            print(
+                f"🧠 PRESSURE_CHECK | secid={secid} | "
+                f"pressure={pressure_score:.3f} | "
+                f"imb={imbalance:.3f} | flow={flow:.1f} | ofi={ofi:.1f}"
+            )
             spread_value = float(last_tick.get("spread", 0) or 0)
             expected_move = avg_range_5
 
