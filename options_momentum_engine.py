@@ -465,6 +465,40 @@ class OptionsMomentumEngine:
         # EXIT ON OPPOSITE TURN (LONG-ONLY)
         # ==================================================
         if secid in self.active_trade:
+            t = self.active_trade[secid]
+            entry = t["entry"]
+            price = float(last["close"])
+
+            t["best_price"] = max(t["best_price"], price)
+            t["worst_price"] = min(t["worst_price"], price)
+
+            t["mfe"] = t["best_price"] - entry
+            t["mae"] = entry - t["worst_price"]
+
+            spread = max(t["entry_spread"], 0.05)
+            elapsed = float(last["ts"]) - float(t["ts"])
+
+            if elapsed > 4 and t["mfe"] < spread * 0.6:
+                print(f"⚠️ FAIL_FAST_EXIT | secid={secid} | mfe={t['mfe']:.3f}")
+                return "EXIT"
+
+            if not t["breakeven_armed"] and t["mfe"] >= spread:
+                t["breakeven_armed"] = True
+                print(f"🛡 BREAKEVEN_ARMED | secid={secid}")
+
+            if t["breakeven_armed"] and price <= entry:
+                print(f"🟡 BREAKEVEN_EXIT | secid={secid}")
+                return "EXIT"
+
+            if t["mfe"] >= spread * 2:
+                t["profit_lock_armed"] = True
+
+            if t["profit_lock_armed"]:
+                giveback = t["best_price"] - price
+                if giveback >= t["mfe"] * 0.5:
+                    print(f"💰 PROFIT_GIVEBACK_EXIT | secid={secid} | mfe={t['mfe']:.3f}")
+                    return "EXIT"
+
             opposite_turn_exit = (
                 prev_speed > 0
                 and speed_ratio > self.TURN_SPEED_RATIO_THRESHOLD
@@ -556,6 +590,14 @@ class OptionsMomentumEngine:
                 "side": "LONG",
                 "entry": float(last["close"]),
                 "ts": float(last["ts"]),
+                "best_price": float(last["close"]),
+                "worst_price": float(last["close"]),
+                "mfe": 0.0,
+                "mae": 0.0,
+                "breakeven_armed": False,
+                "profit_lock_armed": False,
+                "entry_spread": float(last_tick.get("spread", 0) or 0),
+                "entry_pressure": pressure_score,
             }
             self.entries_taken += 1
             self.last_action_sec[secid] = cur_sec
