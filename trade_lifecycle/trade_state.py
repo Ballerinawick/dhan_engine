@@ -2,6 +2,7 @@ class TradeState:
     def __init__(self, entry_price: float, ts: float):
         self.entry = entry_price
         self.entry_ts = ts
+        self.last_ts = ts
 
         self.best_price = entry_price
         self.worst_price = entry_price
@@ -30,10 +31,15 @@ class TradeState:
         self.mfe = self.best_price - self.entry
         self.mae = self.entry - self.worst_price
 
-        if price < self.entry:
-            self.seconds_below_entry += 1
+        delta = ts - self.last_ts
 
-        if self.last_price >= self.entry and price < self.entry:
+        if price < self.entry:
+            self.seconds_below_entry += delta
+
+        self.last_ts = ts
+
+        buffer = 0.05
+        if self.last_price >= self.entry + buffer and price < self.entry - buffer:
             self.retests += 1
 
         if price > self.entry and dt > 2:
