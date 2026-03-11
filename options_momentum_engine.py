@@ -558,7 +558,19 @@ class OptionsMomentumEngine:
                 and float(last["close"]) < midpoint_prev
             )
 
-            if opposite_turn_exit:
+            momentum_confirmed = (
+                t["mfe"] >= spread
+                or (state and state.accepted)
+            )
+
+            if opposite_turn_exit and not momentum_confirmed:
+                print(
+                    f"🧱 TURN_BLOCKED_NO_MOMENTUM | "
+                    f"secid={secid} | price={price:.2f} | "
+                    f"mfe={t['mfe']:.3f} | spread={spread:.3f}"
+                )
+
+            if opposite_turn_exit and momentum_confirmed:
                 print(
                     f"⚠️ OPPOSITE_TURN_CHECK | secid={secid} | "
                     f"speed={speed:.4f} | prev_speed={prev_speed:.4f} | "
