@@ -5,6 +5,11 @@ from zoneinfo import ZoneInfo
 
 import time
 
+from trade_lifecycle.trade_state import TradeState
+from trade_lifecycle.entry_acceptance_analyzer import EntryAcceptanceAnalyzer
+from trade_lifecycle.failure_analyzer import FailureAnalyzer
+from trade_lifecycle.multi_tf_bias_filter import MultiTimeframeBiasFilter
+
 
 class OptionsMomentumEngine:
     """
@@ -40,6 +45,10 @@ class OptionsMomentumEngine:
         self.last_3s_bucket = {}
 
         self.active_trade = {}
+        self.trade_state = {}
+        self.acceptance_analyzer = EntryAcceptanceAnalyzer()
+        self.failure_analyzer = FailureAnalyzer()
+        self.bias_filter = MultiTimeframeBiasFilter()
         self.last_action_sec = {}
 
         self.last_trade_pnl = defaultdict(float)
@@ -469,6 +478,36 @@ class OptionsMomentumEngine:
             entry = t["entry"]
             price = float(last["close"])
 
+            state = self.trade_state.get(secid)
+            if state:
+                state.update(price, last["ts"])
+                print(
+                    f"📊 TRADE_STATE_UPDATE | secid={secid} | price={price:.2f} | "
+                    f"mfe={state.mfe:.3f} | mae={state.mae:.3f} | "
+                    f"below_entry={state.seconds_below_entry} | "
+                    f"retests={state.retests}"
+                )
+
+                spread = max(t["entry_spread"], 0.05)
+                fail = self.failure_analyzer.check(state, spread)
+
+                if fail:
+                    print(f"🚪 FAILURE_EXIT | secid={secid} | price={price:.2f} | reason={fail['reason']}")
+                    print(f"🚪 EXIT_REASON | secid={secid} | price={price:.2f} | reason={fail['reason']}")
+                    self.trade_state.pop(secid, None)
+                    print(f"🧹 TRADE_STATE_CLEAN | secid={secid} | price={price:.2f}")
+                    return "EXIT"
+
+                acc = self.acceptance_analyzer.evaluate(state)
+                print(f"✅ ACCEPTANCE_STATUS | secid={secid} | price={price:.2f} | status={acc}")
+
+                if acc == "REJECTED":
+                    print(f"🚪 ENTRY_REJECTION_EXIT | secid={secid} | price={price:.2f}")
+                    print(f"🚪 EXIT_REASON | secid={secid} | price={price:.2f} | reason=ENTRY_REJECTED")
+                    self.trade_state.pop(secid, None)
+                    print(f"🧹 TRADE_STATE_CLEAN | secid={secid} | price={price:.2f}")
+                    return "EXIT"
+
             t["best_price"] = max(t["best_price"], price)
             t["worst_price"] = min(t["worst_price"], price)
 
@@ -476,18 +515,16 @@ class OptionsMomentumEngine:
             t["mae"] = entry - t["worst_price"]
 
             spread = max(t["entry_spread"], 0.05)
-            elapsed = float(last["ts"]) - float(t["ts"])
-
-            if elapsed > 4 and t["mfe"] < spread * 0.6:
-                print(f"⚠️ FAIL_FAST_EXIT | secid={secid} | mfe={t['mfe']:.3f}")
-                return "EXIT"
 
             if not t["breakeven_armed"] and t["mfe"] >= spread:
                 t["breakeven_armed"] = True
-                print(f"🛡 BREAKEVEN_ARMED | secid={secid}")
+                print(f"🛡 BREAKEVEN_ARMED | secid={secid} | price={price:.2f}")
 
             if t["breakeven_armed"] and price <= entry:
-                print(f"🟡 BREAKEVEN_EXIT | secid={secid}")
+                print(f"🟡 BREAKEVEN_EXIT | secid={secid} | price={price:.2f}")
+                print(f"🚪 EXIT_REASON | secid={secid} | price={price:.2f} | reason=BREAKEVEN")
+                self.trade_state.pop(secid, None)
+                print(f"🧹 TRADE_STATE_CLEAN | secid={secid} | price={price:.2f}")
                 return "EXIT"
 
             if t["mfe"] >= spread * 2:
@@ -496,11 +533,15 @@ class OptionsMomentumEngine:
             if t["profit_lock_armed"]:
                 giveback = t["best_price"] - price
                 if giveback >= t["mfe"] * 0.5:
-                    print(f"💰 PROFIT_GIVEBACK_EXIT | secid={secid} | mfe={t['mfe']:.3f}")
+                    print(f"💰 PROFIT_GIVEBACK_EXIT | secid={secid} | price={price:.2f} | mfe={t['mfe']:.3f}")
+                    print(f"🚪 EXIT_REASON | secid={secid} | price={price:.2f} | reason=PROFIT_GIVEBACK")
+                    self.trade_state.pop(secid, None)
+                    print(f"🧹 TRADE_STATE_CLEAN | secid={secid} | price={price:.2f}")
                     return "EXIT"
 
             opposite_turn_exit = (
                 prev_speed > 0
+                and speed < 0
                 and speed_ratio > self.TURN_SPEED_RATIO_THRESHOLD
                 and shrinking_range
                 and speed_collapse
@@ -508,9 +549,17 @@ class OptionsMomentumEngine:
             )
 
             if opposite_turn_exit:
+                print(
+                    f"⚠️ OPPOSITE_TURN_CHECK | secid={secid} | "
+                    f"speed={speed:.4f} | prev_speed={prev_speed:.4f} | "
+                    f"ratio={speed_ratio:.2f} | close={last['close']:.2f} | "
+                    f"midpoint_prev={midpoint_prev:.2f}"
+                )
                 t = self.active_trade[secid]
                 pnl = self._trade_pnl(t["side"], t["entry"], last["close"])
                 self.active_trade.pop(secid, None)
+                self.trade_state.pop(secid, None)
+                print(f"🧹 TRADE_STATE_CLEAN | secid={secid} | price={price:.2f}")
                 self.exits_taken += 1
                 self.total_hold_sec += max(float(last["ts"]) - float(t["ts"]), 0.0)
                 self.fees_paid += self.fee_per_trade
@@ -522,6 +571,7 @@ class OptionsMomentumEngine:
                     f"🔻 TURN_EXIT LONG | secid={secid} | close={last['close']:.2f} | "
                     "reason=OPPOSITE_TURN"
                 )
+                print(f"🚪 EXIT_REASON | secid={secid} | price={price:.2f} | reason=OPPOSITE_TURN")
                 return "EXIT"
 
         if secid in self.active_trade:
@@ -545,19 +595,16 @@ class OptionsMomentumEngine:
         down_exhaustion = exhaust_score >= 2
         reversal_confirm = float(last["close"]) > midpoint_prev
 
-        tf3_ok = False
-        if len(self.candles_3s[secid]) >= 2:
-            c3_last = self.candles_3s[secid][-1]
-            c3_prev = self.candles_3s[secid][-2]
-            tf3_ok = c3_last["close"] > c3_prev["close"]
+        tf3_ok = self.bias_filter.check(self.candles[secid], self.candles_3s[secid])
 
         print(
-            f"🧭 TF_CONFIRM | secid={secid} | "
+            f"🧭 TF_CONFIRM | secid={secid} | price={float(last['close']):.2f} | "
             f"1s_turn={prior_move_down and down_exhaustion and reversal_confirm} | "
             f"3s_ok={tf3_ok}"
         )
 
         pressure_ok = pressure_score > 0.12 or ofi > 150
+        print(f"🟢 ENTRY | secid={secid} | price={float(last['close']):.2f} | pressure_ok={pressure_ok}")
 
         if not (prior_move_down and down_exhaustion and reversal_confirm and tf3_ok and pressure_ok):
             print(
@@ -599,13 +646,20 @@ class OptionsMomentumEngine:
                 "entry_spread": float(last_tick.get("spread", 0) or 0),
                 "entry_pressure": pressure_score,
             }
+            self.trade_state[secid] = TradeState(
+                entry_price=float(last["close"]),
+                ts=float(last["ts"])
+            )
+            print(
+                f"📍 TRADE_STATE_INIT | secid={secid} | price={float(last['close']):.2f} | entry={last['close']:.2f}"
+            )
             self.entries_taken += 1
             self.last_action_sec[secid] = cur_sec
             print(
-                f"🟢 TURN_ENTRY LONG | secid={secid} | close={last['close']:.2f} | "
+                f"🟢 TURN_ENTRY | secid={secid} | price={float(last['close']):.2f} | side=LONG | "
                 f"speed_ratio={speed_ratio:.2f} | shrink={shrinking_range} | collapse={speed_collapse}"
             )
-            print(f"✅ ENTRY_ALLOWED | secid={secid} | speed_ratio={speed_ratio:.2f}")
+            print(f"✅ ENTRY_ALLOWED | secid={secid} | price={float(last['close']):.2f} | speed_ratio={speed_ratio:.2f}")
             return "TURN_ENTRY"
 
         return "NO_TRADE"
