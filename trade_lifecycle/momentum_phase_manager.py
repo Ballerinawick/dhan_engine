@@ -1,5 +1,4 @@
 class MomentumPhaseManager:
-
     """
     Momentum lifecycle controller.
 
@@ -10,38 +9,20 @@ class MomentumPhaseManager:
     EXPANSION_SEC = 120
 
     def get_phase(self, state):
-
         if state.seconds_in_trade < self.PROBE_SEC:
             return "PROBE"
-
         if state.seconds_in_trade < self.EXPANSION_SEC:
             return "EXPANSION"
-
         return "EXHAUSTION"
 
     def allow_failure_exit(self, state):
-
-        phase = self.get_phase(state)
-
-        if phase == "PROBE":
-            return False
-
-        return True
+        return self.get_phase(state) != "PROBE"
 
     def allow_turn_exit(self, state):
-
-        phase = self.get_phase(state)
-
-        if phase == "PROBE":
-            return False
-
-        return True
+        return self.get_phase(state) != "PROBE"
 
     def allow_trailing_exit(self, state):
+        return self.get_phase(state) in ("EXPANSION", "EXHAUSTION")
 
-        phase = self.get_phase(state)
-
-        if phase in ("EXPANSION", "EXHAUSTION"):
-            return True
-
-        return False
+    def allow_acceptance_reject_exit(self, state):
+        return self.get_phase(state) != "PROBE"
