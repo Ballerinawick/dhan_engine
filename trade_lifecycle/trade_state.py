@@ -19,8 +19,11 @@ class TradeState:
         self.accepted = False
 
     def update(self, price: float, ts: float):
-        dt = ts - self.entry_ts
-        self.seconds_in_trade = dt
+
+        dt = max(ts - self.last_ts, 0)
+        self.last_ts = ts
+
+        self.seconds_in_trade = ts - self.entry_ts
 
         if price > self.best_price:
             self.best_price = price
@@ -31,18 +34,13 @@ class TradeState:
         self.mfe = self.best_price - self.entry
         self.mae = self.entry - self.worst_price
 
-        delta = ts - self.last_ts
-
         if price < self.entry:
-            self.seconds_below_entry += delta
+            self.seconds_below_entry += dt
 
-        self.last_ts = ts
-
-        buffer = 0.05
-        if self.last_price >= self.entry + buffer and price < self.entry - buffer:
+        if self.last_price > self.entry and price < self.entry:
             self.retests += 1
 
-        if price > self.entry and dt > 2:
+        if self.seconds_in_trade > 6 and self.mfe > 0:
             self.accepted = True
 
         self.last_price = price
