@@ -9,6 +9,7 @@ from trade_lifecycle.trade_state import TradeState
 from trade_lifecycle.entry_acceptance_analyzer import EntryAcceptanceAnalyzer
 from trade_lifecycle.failure_analyzer import FailureAnalyzer
 from trade_lifecycle.multi_tf_bias_filter import MultiTimeframeBiasFilter
+from trade_lifecycle.momentum_phase_manager import MomentumPhaseManager
 
 
 class OptionsMomentumEngine:
@@ -49,6 +50,7 @@ class OptionsMomentumEngine:
         self.acceptance_analyzer = EntryAcceptanceAnalyzer()
         self.failure_analyzer = FailureAnalyzer()
         self.bias_filter = MultiTimeframeBiasFilter()
+        self.phase_manager = MomentumPhaseManager()
         self.last_action_sec = {}
 
         self.last_trade_pnl = defaultdict(float)
@@ -481,6 +483,13 @@ class OptionsMomentumEngine:
             state = self.trade_state.get(secid)
             if state:
                 state.update(price, last["ts"])
+                phase = self.phase_manager.get_phase(state)
+
+                print(
+                    f"🚀 MOMENTUM_PHASE | secid={secid} | phase={phase} | "
+                    f"seconds_in_trade={state.seconds_in_trade:.2f}"
+                )
+
                 print(
                     f"📊 TRADE_STATE_UPDATE | secid={secid} | price={price:.2f} | "
                     f"mfe={state.mfe:.3f} | mae={state.mae:.3f} | "
@@ -491,7 +500,7 @@ class OptionsMomentumEngine:
                 spread = max(t["entry_spread"], 0.05)
                 fail = self.failure_analyzer.check(state, spread)
 
-                if fail:
+                if fail and self.phase_manager.allow_failure_exit(state):
                     print(f"🚪 FAILURE_EXIT | secid={secid} | price={price:.2f} | reason={fail['reason']}")
                     print(f"🚪 EXIT_REASON | secid={secid} | price={price:.2f} | reason={fail['reason']}")
                     self.trade_state.pop(secid, None)
@@ -527,7 +536,7 @@ class OptionsMomentumEngine:
                     f"mfe={t['mfe']:.3f} | spread={spread:.3f}"
                 )
 
-            if t["profit_lock_armed"]:
+            if t["profit_lock_armed"] and self.phase_manager.allow_trailing_exit(state):
                 giveback = t["best_price"] - price
                 mfe = t["mfe"]
 
@@ -570,7 +579,11 @@ class OptionsMomentumEngine:
                     f"mfe={t['mfe']:.3f} | spread={spread:.3f}"
                 )
 
-            if opposite_turn_exit and momentum_confirmed:
+            if (
+                opposite_turn_exit
+                and momentum_confirmed
+                and self.phase_manager.allow_turn_exit(state)
+            ):
                 print(
                     f"⚠️ OPPOSITE_TURN_CHECK | secid={secid} | "
                     f"speed={speed:.4f} | prev_speed={prev_speed:.4f} | "
