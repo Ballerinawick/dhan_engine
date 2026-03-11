@@ -606,7 +606,20 @@ class OptionsMomentumEngine:
         pressure_ok = pressure_score > 0.12 or ofi > 150
         print(f"🟢 ENTRY | secid={secid} | price={float(last['close']):.2f} | pressure_ok={pressure_ok}")
 
-        if not (prior_move_down and down_exhaustion and reversal_confirm and tf3_ok and pressure_ok):
+        score = 0
+        score += 1 if prior_move_down else 0
+        score += 1 if down_exhaustion else 0
+        score += 1 if reversal_confirm else 0
+        score += 1 if tf3_ok else 0
+        score += 1 if pressure_ok else 0
+
+        print(
+            f"🧠 ENTRY_SCORE | secid={secid} | score={score} | "
+            f"prior={prior_move_down} exhaust={down_exhaustion} "
+            f"reversal={reversal_confirm} tf3={tf3_ok} pressure={pressure_ok}"
+        )
+
+        if score < 3:
             print(
                 f"🚫 ENTRY_REJECT | secid={secid} | "
                 f"prior_down={prior_move_down} | "
@@ -616,14 +629,19 @@ class OptionsMomentumEngine:
                 f"pressure_ok={pressure_ok}"
             )
 
-        if prior_move_down and down_exhaustion and reversal_confirm and tf3_ok and pressure_ok:
+        if score >= 3:
             print(
                 f"🧠 PRESSURE_CHECK | secid={secid} | "
                 f"pressure={pressure_score:.3f} | "
                 f"imb={imbalance:.3f} | flow={flow:.1f} | ofi={ofi:.1f}"
             )
             spread_value = float(last_tick.get("spread", 0) or 0)
-            expected_move = avg_range_5
+            expected_move = avg_range_5 * 3
+
+            print(
+                f"📊 EXPECTED_MOVE_CHECK | secid={secid} | "
+                f"expected_move={expected_move:.4f} | spread={spread_value:.4f}"
+            )
 
             if expected_move <= spread_value * 1.2:
                 print(
