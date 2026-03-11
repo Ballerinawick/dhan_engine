@@ -520,21 +520,31 @@ class OptionsMomentumEngine:
                 t["breakeven_armed"] = True
                 print(f"🛡 BREAKEVEN_ARMED | secid={secid} | price={price:.2f}")
 
-            if t["breakeven_armed"] and price <= entry:
-                print(f"🟡 BREAKEVEN_EXIT | secid={secid} | price={price:.2f}")
-                print(f"🚪 EXIT_REASON | secid={secid} | price={price:.2f} | reason=BREAKEVEN")
-                self.trade_state.pop(secid, None)
-                print(f"🧹 TRADE_STATE_CLEAN | secid={secid} | price={price:.2f}")
-                return "EXIT"
-
-            if t["mfe"] >= spread * 2:
+            if not t["profit_lock_armed"] and t["mfe"] >= spread * 3:
                 t["profit_lock_armed"] = True
+                print(
+                    f"🔒 PROFIT_LOCK_ARMED | secid={secid} | "
+                    f"mfe={t['mfe']:.3f} | spread={spread:.3f}"
+                )
 
             if t["profit_lock_armed"]:
                 giveback = t["best_price"] - price
-                if giveback >= t["mfe"] * 0.5:
-                    print(f"💰 PROFIT_GIVEBACK_EXIT | secid={secid} | price={price:.2f} | mfe={t['mfe']:.3f}")
-                    print(f"🚪 EXIT_REASON | secid={secid} | price={price:.2f} | reason=PROFIT_GIVEBACK")
+                mfe = t["mfe"]
+
+                if mfe < spread * 4:
+                    threshold = mfe * 0.60
+                elif mfe < spread * 8:
+                    threshold = mfe * 0.45
+                else:
+                    threshold = mfe * 0.35
+
+                if giveback >= threshold:
+                    print(
+                        f"📉 TRAILING_EXIT | secid={secid} | "
+                        f"price={price:.2f} | best={t['best_price']:.2f} | "
+                        f"mfe={t['mfe']:.3f}"
+                    )
+                    print(f"🚪 EXIT_REASON | secid={secid} | price={price:.2f} | reason=PROFIT_TRAIL")
                     self.trade_state.pop(secid, None)
                     print(f"🧹 TRADE_STATE_CLEAN | secid={secid} | price={price:.2f}")
                     return "EXIT"
