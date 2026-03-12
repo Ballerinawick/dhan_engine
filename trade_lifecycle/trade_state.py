@@ -1,11 +1,12 @@
 class TradeState:
     def __init__(self, entry_price: float, ts: float):
-        self.entry = entry_price
-        self.entry_ts = ts
-        self.last_ts = ts
+        self.entry = float(entry_price)
+        self.entry_ts = float(ts)
+        self.last_ts = float(ts)
 
-        self.best_price = entry_price
-        self.worst_price = entry_price
+        self.best_price = float(entry_price)
+        self.worst_price = float(entry_price)
+        self.last_price = float(entry_price)
 
         self.mfe = 0.0
         self.mae = 0.0
@@ -14,16 +15,15 @@ class TradeState:
         self.seconds_below_entry = 0.0
 
         self.retests = 0
-        self.last_price = entry_price
-
         self.accepted = False
 
     def update(self, price: float, ts: float):
+        price = float(price)
+        ts = float(ts)
 
-        dt = max(ts - self.last_ts, 0)
+        dt = max(ts - self.last_ts, 0.0)
         self.last_ts = ts
-
-        self.seconds_in_trade = ts - self.entry_ts
+        self.seconds_in_trade = max(ts - self.entry_ts, 0.0)
 
         if price > self.best_price:
             self.best_price = price
@@ -31,16 +31,16 @@ class TradeState:
         if price < self.worst_price:
             self.worst_price = price
 
-        self.mfe = self.best_price - self.entry
-        self.mae = self.entry - self.worst_price
+        self.mfe = max(self.best_price - self.entry, 0.0)
+        self.mae = max(self.entry - self.worst_price, 0.0)
 
         if price < self.entry:
             self.seconds_below_entry += dt
 
-        if self.last_price > self.entry and price < self.entry:
+        if self.last_price >= self.entry and price < self.entry:
             self.retests += 1
 
-        if self.seconds_in_trade > 6 and self.mfe > 0:
+        if self.seconds_in_trade >= 6.0 and self.mfe > 0:
             self.accepted = True
 
         self.last_price = price
