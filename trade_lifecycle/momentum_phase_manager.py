@@ -5,7 +5,7 @@ class MomentumPhaseManager:
     Prevents early exits during momentum discovery.
     """
 
-    PROBE_SEC = 15
+    PROBE_SEC = 120
     EXPANSION_SEC = 120
 
     def get_phase(self, state):
