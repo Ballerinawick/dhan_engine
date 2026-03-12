@@ -1,52 +1,42 @@
 class FailureAnalyzer:
+    """
+    Handles only hard failure logic.
+    Trailing/giveback logic must stay inside OptionsMomentumEngine
+    because engine has current price + best_price context.
+    """
 
     def check(self, state, spread):
+        spread = max(float(spread), 0.05)
 
-        # ------------------------------------------------
-        # 1️⃣ FAIL FAST
-        # Trade did not move at all after entry
-        # ------------------------------------------------
-        if state.seconds_in_trade > 5 and state.mfe < spread * 0.6:
-            print("⚠️ FAIL_FAST_EXIT")
-            return {"exit": True, "reason": "FAIL_FAST"}
-
-
-        # ------------------------------------------------
-        # 2️⃣ EARLY BREATHING ROOM
-        # Give trade time to stabilize
-        # ------------------------------------------------
-        if state.seconds_in_trade < 3:
+        # 1) Give first few seconds to breathe
+        if state.seconds_in_trade < 3.0:
             return None
 
+        # 2) Fail fast: after enough time, trade still did not expand
+        if state.seconds_in_trade >= 5.0 and state.mfe < spread * 0.6:
+            print(
+                f"⚠️ FAIL_FAST_EXIT | "
+                f"seconds_in_trade={state.seconds_in_trade:.2f} | "
+                f"mfe={state.mfe:.3f} | spread={spread:.3f}"
+            )
+            return {"exit": True, "reason": "FAIL_FAST"}
 
-        # ------------------------------------------------
-        # 3️⃣ MAE PROTECTION
-        # Only exit if loss becomes dangerous
-        # ------------------------------------------------
-        if state.mae > spread * 2.0 and state.seconds_in_trade > 3:
-            print("⚠️ MAE_LIMIT_EXIT")
+        # 3) Hard adverse excursion
+        if state.seconds_in_trade >= 3.0 and state.mae > spread * 2.0:
+            print(
+                f"⚠️ MAE_LIMIT_EXIT | "
+                f"seconds_in_trade={state.seconds_in_trade:.2f} | "
+                f"mae={state.mae:.3f} | spread={spread:.3f}"
+            )
             return {"exit": True, "reason": "MAE_LIMIT"}
 
-
-        # ------------------------------------------------
-        # 4️⃣ NEGATIVE DRIFT
-        # Price stays below entry too long
-        # ------------------------------------------------
-        if state.seconds_below_entry > 8 and state.mfe < spread * 0.5:
-            print("⚠️ NEGATIVE_DRIFT_EXIT")
+        # 4) Stayed weak below entry too long without proper expansion
+        if state.seconds_below_entry > 8.0 and state.mfe < spread * 0.5:
+            print(
+                f"⚠️ NEGATIVE_DRIFT_EXIT | "
+                f"seconds_below={state.seconds_below_entry:.2f} | "
+                f"mfe={state.mfe:.3f} | spread={spread:.3f}"
+            )
             return {"exit": True, "reason": "NEGATIVE_DRIFT"}
-
-
-        # ------------------------------------------------
-        # 5️⃣ MFE PULLBACK PROTECTION
-        # If trade moved well but retraced heavily
-        # ------------------------------------------------
-        if state.mfe > spread * 2:
-            giveback = state.mfe - (state.mfe - state.mae)
-
-            if giveback > state.mfe * 0.7:
-                print("⚠️ MFE_GIVEBACK_EXIT")
-                return {"exit": True, "reason": "MFE_GIVEBACK"}
-
 
         return None
