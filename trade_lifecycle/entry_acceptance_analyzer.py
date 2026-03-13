@@ -4,8 +4,8 @@ class EntryAcceptanceAnalyzer:
     Must allow early discovery phase so momentum can develop.
     """
 
-    DISCOVERY_SEC = 8.0
-    MAX_BELOW_ENTRY = 10.0
+    DISCOVERY_SEC = 12.0
+    MAX_BELOW_ENTRY = 20.0
     MAX_RETESTS = 4
 
     def evaluate(self, state):
