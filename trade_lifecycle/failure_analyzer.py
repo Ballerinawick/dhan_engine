@@ -6,7 +6,7 @@ class FailureAnalyzer:
     """
 
     MIN_WIGGLE = 2.0        # allow normal option movement
-    MIN_FAIL_TIME = 8.0     # allow discovery time
+    MIN_FAIL_TIME = 15.0     # allow discovery time
 
     def check(self, state, spread):
         spread = max(float(spread), 0.05)

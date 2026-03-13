@@ -532,6 +532,9 @@ class OptionsMomentumEngine:
                 )
 
             if state and t["profit_lock_armed"] and self.phase_manager.allow_trailing_exit(state):
+                if t["mfe"] < max(spread * 4, 2.0):
+                    return "NO_TRADE"
+
                 giveback = float(t["best_price"]) - price
                 mfe = float(t["mfe"])
 
