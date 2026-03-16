@@ -457,6 +457,19 @@ class OptionsMomentumEngine:
         )
 
         last_tick = self.tick_buffer[secid][-1] if self.tick_buffer[secid] else {}
+        tick_prices = [
+            float(t.get("ltp", 0) or 0)
+            for t in self.tick_buffer[secid]
+            if float(t.get("ltp", 0) or 0) > 0
+        ]
+        last_prices = tick_prices[-6:-1] if len(tick_prices) >= 6 else tick_prices[-5:]
+        if len(last_prices) < 5:
+            candle_closes = [float(x["close"]) for x in list(c)]
+            last_prices = candle_closes[-6:-1] if len(candle_closes) >= 6 else candle_closes[-5:]
+
+        recent_high = max(last_prices[-5:])
+        recent_low = min(last_prices[-5:])
+
         imbalance = float(last_tick.get("imbalance_5", 0) or 0)
         flow = float(last_tick.get("flow", 0) or 0)
         ofi = float(last_tick.get("ofi", 0) or 0)
@@ -662,7 +675,26 @@ class OptionsMomentumEngine:
         )
 
         spread_value = float(last_tick.get("spread", 0) or 0)
+        bid = float(last_tick.get("bid_price") or last_tick.get("bid") or 0)
+        ask = float(last_tick.get("ask_price") or last_tick.get("ask") or 0)
+        if spread_value <= 0 and bid > 0 and ask > 0:
+            spread_value = max(ask - bid, 0.0)
+        spread_value = max(spread_value, 0.01)
         expected_move = avg_range_5 * 3
+        micro_range = recent_high - recent_low
+
+        print(
+            f"ENTRY_FILTER | micro_range={micro_range:.3f} | "
+            f"recent_high={recent_high:.3f} | "
+            f"recent_low={recent_low:.3f}"
+        )
+
+        if micro_range < spread_value * 1.5:
+            return "NO_TRADE"
+
+        price = float(last["close"])
+        if price <= recent_high:
+            return "NO_TRADE"
 
         print(
             f"📊 EXPECTED_MOVE_CHECK | secid={secid} | "
