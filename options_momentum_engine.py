@@ -532,8 +532,28 @@ class OptionsMomentumEngine:
                 )
 
             if state and t["profit_lock_armed"] and self.phase_manager.allow_trailing_exit(state):
+                if t.get("locked_price") is None and t["mfe"] < max(spread * 5, 3.0):
+                    return "NO_TRADE"
+
                 if t["mfe"] < max(spread * 4, 2.0):
                     return "NO_TRADE"
+
+                trail_distance = max(spread * 2, 1.5)
+                locked_price = float(t["best_price"]) - trail_distance
+
+                if t.get("locked_price") is None:
+                    t["locked_price"] = locked_price
+                else:
+                    t["locked_price"] = max(t["locked_price"], locked_price)
+
+                t["locked_price"] = max(t["locked_price"], entry + spread)
+
+                if t.get("locked_price") is not None and price <= t["locked_price"]:
+                    print(
+                        f"🔐 LOCKED_PROFIT_EXIT | secid={secid} | "
+                        f"price={price:.2f} | locked_price={t['locked_price']:.2f}"
+                    )
+                    return self._close_trade(secid, price, cur_sec, "PROFIT_TRAIL")
 
                 giveback = float(t["best_price"]) - price
                 mfe = float(t["mfe"])
@@ -624,7 +644,7 @@ class OptionsMomentumEngine:
             f"reversal={reversal_confirm} tf3={tf3_ok} pressure={pressure_ok}"
         )
 
-        if score < 3:
+        if score < 4:
             print(
                 f"🚫 ENTRY_REJECT | secid={secid} | "
                 f"prior_down={prior_move_down} | "
@@ -665,6 +685,7 @@ class OptionsMomentumEngine:
             "best_price": float(last["close"]),
             "worst_price": float(last["close"]),
             "mfe": 0.0,
+            "locked_price": None,
             "mae": 0.0,
             "breakeven_armed": False,
             "profit_lock_armed": False,
