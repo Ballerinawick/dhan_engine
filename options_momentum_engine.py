@@ -557,11 +557,8 @@ class OptionsMomentumEngine:
                 return self._close_trade(secid, price, cur_sec, "PROFIT_PROTECTION")
 
             if state and t["profit_lock_armed"] and self.phase_manager.allow_trailing_exit(state):
-                if t.get("locked_price") is None and t["mfe"] < max(spread * 2, 1.2):
-                    return "NO_TRADE"
-
                 if t["mfe"] < max(spread * 2, 1.2):
-                    return "NO_TRADE"
+                    pass
 
                 trail_distance = max(spread * 2, 1.5)
                 locked_price = float(t["best_price"]) - trail_distance
@@ -684,7 +681,7 @@ class OptionsMomentumEngine:
             f"reversal={reversal_confirm} tf3={tf3_ok} pressure={pressure_ok}"
         )
 
-        if score < 3:
+        if score < 4:
             print(
                 f"🚫 ENTRY_REJECT | secid={secid} | "
                 f"prior_down={prior_move_down} | "
@@ -748,7 +745,7 @@ class OptionsMomentumEngine:
         if not (
             abs(speed) > 0.15
             and abs(imbalance) > 0.12
-            and flow > 2000
+            and flow > 800
         ):
             return "NO_TRADE"
 
