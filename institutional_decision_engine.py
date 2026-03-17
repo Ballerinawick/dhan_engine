@@ -134,10 +134,6 @@ class InstitutionalDecisionEngine:
         self._update_price_history(secid, now, ltp)
         struct_ok = self._structure_ok(secid)
 
-        print(
-            f"📡 DECISION_LAYER | secid={secid} | "
-            f"signal={signal} | struct_ok={struct_ok}"
-        )
 
         self._shadow_update(index, side, now, struct_ok)
 
