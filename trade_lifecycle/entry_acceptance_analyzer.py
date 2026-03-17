@@ -19,7 +19,10 @@ class EntryAcceptanceAnalyzer:
         # --------------------------------------------
         # 2. Too much time below entry (true rejection)
         # --------------------------------------------
-        if state.seconds_below_entry > self.MAX_BELOW_ENTRY:
+        if (
+            state.seconds_in_trade < 30.0 and
+            state.seconds_below_entry > self.MAX_BELOW_ENTRY
+        ):
             print(
                 f"⚠️ ENTRY_REJECT | reason=below_entry_time | "
                 f"seconds_below={state.seconds_below_entry:.2f}"
