@@ -14,7 +14,7 @@ class FailureAnalyzer:
         # ---------------------------------------------------
         # 1) Give initial breathing time
         # ---------------------------------------------------
-        if state.seconds_in_trade < 10.0:
+        if state.seconds_in_trade < 20.0:
             return None
 
         # ---------------------------------------------------
@@ -32,7 +32,9 @@ class FailureAnalyzer:
         # 3) Hard adverse excursion (true failure)
         # Allow realistic option wiggle
         # ---------------------------------------------------
-        if state.mfe > spread * 2:
+        if state.seconds_in_trade < 30:
+            mae_limit = max(spread * 8.0, self.MIN_WIGGLE * 1.5)
+        elif state.mfe > spread * 2:
             mae_limit = max(spread * 7.0, self.MIN_WIGGLE)
         else:
             mae_limit = max(spread * 5.0, self.MIN_WIGGLE)
