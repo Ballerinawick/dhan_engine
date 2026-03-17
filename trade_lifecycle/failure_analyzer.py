@@ -5,7 +5,7 @@ class FailureAnalyzer:
     because engine has current price + best_price context.
     """
 
-    MIN_WIGGLE = 2.0        # allow normal option movement
+    MIN_WIGGLE = 3.5        # allow normal option movement
     MIN_FAIL_TIME = 22.0     # allow discovery time
 
     def check(self, state, spread):
@@ -39,7 +39,7 @@ class FailureAnalyzer:
         else:
             mae_limit = max(spread * 5.0, self.MIN_WIGGLE)
 
-        if state.mae > mae_limit:
+        if state.mae > mae_limit and state.seconds_in_trade > 15:
             print(
                 f"⚠️ MAE_LIMIT_EXIT | "
                 f"seconds_in_trade={state.seconds_in_trade:.2f} | "
