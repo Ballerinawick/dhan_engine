@@ -139,7 +139,6 @@ class OptionsMomentumEngine:
         print(f"🗓️ {now.strftime('%H:%M:%S')} IST | {self.option_day_label()} | Regime:{self.time_regime()}")
 
     def on_tick(self, secid: int, tick: dict) -> str:
-        print(f"⚡ MOMENTUM_RECEIVED | secid={secid} | ltp={tick.get('ltp')} | ts={tick.get('ts')}")
         ts = tick.get("ts")
         ltp = float(tick.get("ltp", 0) or 0)
         if not ts or ltp <= 0:
