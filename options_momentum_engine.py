@@ -520,7 +520,7 @@ class OptionsMomentumEngine:
 
             spread = max(float(t["entry_spread"]), 0.05)
 
-            if state and state.seconds_in_trade < 12:
+            if state and state.seconds_in_trade < 20:
                 return "HOLD"
 
             if state:
@@ -549,9 +549,9 @@ class OptionsMomentumEngine:
 
             if (
                 state
-                and state.mfe > spread * 2.0
-                and state.seconds_in_trade > 8
-                and state.mae > state.mfe * 0.9
+                and state.seconds_in_trade > 20
+                and state.mfe > spread * 4.0
+                and state.mae > state.mfe * 0.7
             ):
                 print(f"🚨 PROFIT_PROTECTION_EXIT | secid={secid}")
                 return self._close_trade(secid, price, cur_sec, "PROFIT_PROTECTION")
@@ -681,7 +681,7 @@ class OptionsMomentumEngine:
             f"reversal={reversal_confirm} tf3={tf3_ok} pressure={pressure_ok}"
         )
 
-        if score < 4:
+        if score < 5:
             print(
                 f"🚫 ENTRY_REJECT | secid={secid} | "
                 f"prior_down={prior_move_down} | "
@@ -717,6 +717,10 @@ class OptionsMomentumEngine:
             f"recent_high={recent_high:.3f} | "
             f"recent_low={recent_low:.3f}"
         )
+
+        # --- PRE-ENTRY MOMENTUM CONFIRMATION ---
+        if avg_range_5 < spread_value * 1.8:
+            return "NO_TRADE"
 
         if micro_range < spread_value * 1.5:
             return "NO_TRADE"
