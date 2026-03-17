@@ -36,8 +36,11 @@ class TradeState:
 
         if price < self.entry:
             self.seconds_below_entry += dt
+        else:
+            self.seconds_below_entry = 0.0
 
-        if self.last_price >= self.entry and price < self.entry:
+        retest_buffer = max(self.entry * 0.002, 0.10)
+        if self.last_price >= self.entry and price < (self.entry - retest_buffer):
             self.retests += 1
 
         if self.seconds_in_trade >= 6.0 and self.mfe > 0:

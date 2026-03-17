@@ -545,7 +545,7 @@ class OptionsMomentumEngine:
                 )
 
             if state and t["profit_lock_armed"] and self.phase_manager.allow_trailing_exit(state):
-                if t.get("locked_price") is None and t["mfe"] < max(spread * 5, 3.0):
+                if t.get("locked_price") is None and t["mfe"] < max(spread * 3, 1.8):
                     return "NO_TRADE"
 
                 if t["mfe"] < max(spread * 4, 2.0):
@@ -651,13 +651,21 @@ class OptionsMomentumEngine:
         score += 1 if tf3_ok else 0
         score += 1 if pressure_ok else 0
 
+        flow = float(last_tick.get("flow", 0) or 0)
+        imbalance = abs(float(last_tick.get("imbalance_5", 0) or 0))
+        liquidity_impulse = (
+            flow > 300 or imbalance > 0.18
+        )
+        if not liquidity_impulse:
+            score -= 1
+
         print(
             f"🧠 ENTRY_SCORE | secid={secid} | score={score} | "
             f"prior={prior_move_down} exhaust={down_exhaustion} "
             f"reversal={reversal_confirm} tf3={tf3_ok} pressure={pressure_ok}"
         )
 
-        if score < 4:
+        if score < 3:
             print(
                 f"🚫 ENTRY_REJECT | secid={secid} | "
                 f"prior_down={prior_move_down} | "
