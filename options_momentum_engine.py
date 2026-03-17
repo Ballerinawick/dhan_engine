@@ -544,11 +544,15 @@ class OptionsMomentumEngine:
                     f"mfe={t['mfe']:.3f} | spread={spread:.3f}"
                 )
 
+            if state and state.mfe > spread * 1.5 and state.mae > state.mfe * 0.8:
+                print(f"🚨 PROFIT_PROTECTION_EXIT | secid={secid}")
+                return self._close_trade(secid, price, cur_sec, "PROFIT_PROTECTION")
+
             if state and t["profit_lock_armed"] and self.phase_manager.allow_trailing_exit(state):
-                if t.get("locked_price") is None and t["mfe"] < max(spread * 3, 1.8):
+                if t.get("locked_price") is None and t["mfe"] < max(spread * 2, 1.2):
                     return "NO_TRADE"
 
-                if t["mfe"] < max(spread * 4, 2.0):
+                if t["mfe"] < max(spread * 2, 1.2):
                     return "NO_TRADE"
 
                 trail_distance = max(spread * 2, 1.5)
@@ -715,6 +719,10 @@ class OptionsMomentumEngine:
                 f"expected_move={expected_move:.4f} | spread={spread_value:.4f}"
             )
             return "NO_TRADE"
+
+        if secid in self.last_action_sec:
+            if cur_sec - self.last_action_sec[secid] < 8:
+                return "NO_TRADE"
 
         self.active_trade[secid] = {
             "type": "TURN",
