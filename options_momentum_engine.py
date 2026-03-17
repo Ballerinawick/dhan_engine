@@ -520,6 +520,9 @@ class OptionsMomentumEngine:
 
             spread = max(float(t["entry_spread"]), 0.05)
 
+            if state and state.seconds_in_trade < 12:
+                return "HOLD"
+
             if state:
                 fail = self.failure_analyzer.check(state, spread)
                 if fail and self.phase_manager.allow_failure_exit(state):
@@ -544,7 +547,12 @@ class OptionsMomentumEngine:
                     f"mfe={t['mfe']:.3f} | spread={spread:.3f}"
                 )
 
-            if state and state.mfe > spread * 1.5 and state.mae > state.mfe * 0.8:
+            if (
+                state
+                and state.mfe > spread * 2.0
+                and state.seconds_in_trade > 8
+                and state.mae > state.mfe * 0.9
+            ):
                 print(f"🚨 PROFIT_PROTECTION_EXIT | secid={secid}")
                 return self._close_trade(secid, price, cur_sec, "PROFIT_PROTECTION")
 
@@ -625,6 +633,13 @@ class OptionsMomentumEngine:
         if not self._micro_ok(secid, last_tick, cur_sec):
             return "NO_TRADE"
 
+        current_time = datetime.fromtimestamp(float(last["ts"]), self.IST)
+        weekday = current_time.weekday()  # 0=Mon ... 6=Sun
+
+        # Avoid slow start day (low edge)
+        if weekday == 2:  # Wednesday
+            return "NO_TRADE"
+
         prior_move_down = prev_speed < 0
         exhaust_score = 0
 
@@ -695,6 +710,11 @@ class OptionsMomentumEngine:
         expected_move = avg_range_5 * 3
         micro_range = recent_high - recent_low
 
+        # Slight restriction on expiry volatility
+        if weekday == 1:  # Tuesday
+            if expected_move < spread_value * 3:
+                return "NO_TRADE"
+
         print(
             f"ENTRY_FILTER | micro_range={micro_range:.3f} | "
             f"recent_high={recent_high:.3f} | "
@@ -723,6 +743,19 @@ class OptionsMomentumEngine:
         if secid in self.last_action_sec:
             if cur_sec - self.last_action_sec[secid] < 8:
                 return "NO_TRADE"
+
+        # --- LIQUIDITY + IMPULSE FILTER ---
+        if not (
+            abs(speed) > 0.15
+            and abs(imbalance) > 0.12
+            and flow > 2000
+        ):
+            return "NO_TRADE"
+
+        # --- ATM FILTER ---
+        atm_strike = float(last_tick.get("atm_strike", price) or price)
+        if abs(price - atm_strike) > spread_value * 10:
+            return "NO_TRADE"
 
         self.active_trade[secid] = {
             "type": "TURN",
