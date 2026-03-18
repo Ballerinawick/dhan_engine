@@ -680,7 +680,7 @@ class OptionsMomentumEngine:
             f"reversal={reversal_confirm} tf3={tf3_ok} pressure={pressure_ok}"
         )
 
-        if score < 5:
+        if score < 4:
             print(
                 f"🚫 ENTRY_REJECT | secid={secid} | "
                 f"prior_down={prior_move_down} | "
@@ -718,14 +718,15 @@ class OptionsMomentumEngine:
         )
 
         # --- PRE-ENTRY MOMENTUM CONFIRMATION ---
-        if avg_range_5 < spread_value * 1.8:
+        if avg_range_5 < spread_value * 1.2:
             return "NO_TRADE"
 
-        if micro_range < spread_value * 1.5:
+        if micro_range < spread_value * 1.1:
             return "NO_TRADE"
 
         price = float(last["close"])
-        if price <= recent_high:
+        # Allow early breakout participation
+        if price < recent_high * 0.998:
             return "NO_TRADE"
 
         print(
@@ -746,9 +747,9 @@ class OptionsMomentumEngine:
 
         # --- LIQUIDITY + IMPULSE FILTER ---
         if not (
-            abs(speed) > 0.15
-            and abs(imbalance) > 0.12
-            and flow > 800
+            abs(speed) > 0.12
+            and abs(imbalance) > 0.08
+            and flow > 400
         ):
             return "NO_TRADE"
 
