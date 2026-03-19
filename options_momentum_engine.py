@@ -3,6 +3,7 @@ from datetime import datetime, time as dtime
 from statistics import median
 from zoneinfo import ZoneInfo
 import time
+import pytz
 
 from trade_lifecycle.trade_state import TradeState
 from trade_lifecycle.entry_acceptance_analyzer import EntryAcceptanceAnalyzer
@@ -43,6 +44,8 @@ class OptionsMomentumEngine:
     TURN_SPEED_RATIO_THRESHOLD = 1.2
 
     def __init__(self):
+        self.IST = pytz.timezone("Asia/Kolkata")
+
         self.tick_buffer = defaultdict(deque)
         self.candles = defaultdict(deque)
         self.candles_3s = defaultdict(deque)
@@ -404,6 +407,8 @@ class OptionsMomentumEngine:
 
         pnl = self._trade_pnl(trade["side"], float(trade["entry"]), float(exit_price))
         hold_sec = max(float(trade.get("last_ts", trade["ts"])) - float(trade["ts"]), 0.0)
+        exit_time = datetime.fromtimestamp(float(trade.get("last_ts", trade["ts"])), self.IST).strftime("%H:%M:%S")
+        entry_time = datetime.fromtimestamp(float(trade["ts"]), self.IST).strftime("%H:%M:%S")
 
         self.exits_taken += 1
         self.total_hold_sec += hold_sec
@@ -413,6 +418,16 @@ class OptionsMomentumEngine:
         self.last_trade_pnl[secid] = round(pnl, 2)
         self.cum_pnl[secid] += pnl
 
+        print(
+            f"📘 TRADE_SUMMARY | "
+            f"entry_time={entry_time} | "
+            f"exit_time={exit_time} | "
+            f"hold={hold_sec:.2f}s | "
+            f"entry={trade['entry']:.2f} | "
+            f"exit={exit_price:.2f} | "
+            f"pnl={pnl:.2f} | "
+            f"reason={reason}"
+        )
         print(f"🧹 TRADE_STATE_CLEAN | secid={secid} | price={exit_price:.2f}")
         print(f"🚪 EXIT_REASON | secid={secid} | price={exit_price:.2f} | reason={reason}")
         print(
@@ -519,8 +534,15 @@ class OptionsMomentumEngine:
 
             spread = max(float(t["entry_spread"]), 0.05)
 
-            if state and state.seconds_in_trade < 20:
+            if state and state.seconds_in_trade < 35:
+                if state.mae > spread * 3:
+                    print(f"🚪 EARLY_LOSS_CUT | secid={secid} | mae={state.mae:.2f}")
+                    return self._close_trade(secid, price, cur_sec, "EARLY_LOSS_CUT")
                 return "HOLD"
+
+            if state and state.seconds_in_trade > 35 and state.mfe < spread * 1.5:
+                print(f"🚫 NO_EXPANSION_EXIT | secid={secid} | mfe={state.mfe:.2f}")
+                return self._close_trade(secid, price, cur_sec, "NO_EXPANSION")
 
             if state:
                 fail = self.failure_analyzer.check(state, spread)
@@ -548,9 +570,9 @@ class OptionsMomentumEngine:
 
             if (
                 state
-                and state.seconds_in_trade > 20
-                and state.mfe > spread * 4.0
-                and state.mae > state.mfe * 0.7
+                and state.seconds_in_trade > 35
+                and state.mfe > spread * 6.0
+                and state.mae > state.mfe * 0.5
             ):
                 print(f"🚨 PROFIT_PROTECTION_EXIT | secid={secid}")
                 return self._close_trade(secid, price, cur_sec, "PROFIT_PROTECTION")
@@ -782,6 +804,13 @@ class OptionsMomentumEngine:
 
         print(
             f"📍 TRADE_STATE_INIT | secid={secid} | price={float(last['close']):.2f} | entry={last['close']:.2f}"
+        )
+        print(
+            f"🟢 ENTRY_LOG | "
+            f"time={datetime.fromtimestamp(last['ts'], self.IST).strftime('%H:%M:%S')} | "
+            f"secid={secid} | "
+            f"type={'CE' if 'CE' in str(secid) else 'PE'} | "
+            f"price={last['close']:.2f}"
         )
         self.entries_taken += 1
         self.last_action_sec[secid] = cur_sec
