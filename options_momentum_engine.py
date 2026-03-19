@@ -1,9 +1,8 @@
 from collections import defaultdict, deque
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone, timedelta
 from statistics import median
 from zoneinfo import ZoneInfo
 import time
-import pytz
 
 from trade_lifecycle.trade_state import TradeState
 from trade_lifecycle.entry_acceptance_analyzer import EntryAcceptanceAnalyzer
@@ -44,7 +43,7 @@ class OptionsMomentumEngine:
     TURN_SPEED_RATIO_THRESHOLD = 1.2
 
     def __init__(self):
-        self.IST = pytz.timezone("Asia/Kolkata")
+        self.IST = timezone(timedelta(hours=5, minutes=30))
 
         self.tick_buffer = defaultdict(deque)
         self.candles = defaultdict(deque)
