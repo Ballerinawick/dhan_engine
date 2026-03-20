@@ -536,22 +536,32 @@ class OptionsMomentumEngine:
             # --- SMART HOLD SYSTEM ---
             if state:
 
-                # 🚫 Ultra early noise protection (0–3 sec)
-                if state.seconds_in_trade < 3:
+                # 🟡 PROBE PHASE (0–15 sec)
+                if state.seconds_in_trade < 15:
+
+                    # Only exit if BOTH strong adverse move + no recovery attempt
+                    strong_adverse = state.mae > max(spread * 10, 2.0)
+
+                    no_bounce = (
+                        price < entry - (spread * 2)
+                        and state.mfe < spread * 0.3
+                    )
+
+                    if strong_adverse and no_bounce:
+                        print(f"🚪 EARLY_STRUCTURE_FAIL | secid={secid}")
+                        return self._close_trade(secid, price, cur_sec, "EARLY_STRUCTURE_FAIL")
+
                     return "HOLD"
 
-                # 🟡 PROBE PHASE (3–10 sec)
-                if state.seconds_in_trade < 10:
-                    if state.mae > max(spread * 6, 1.0):
-                        print(f"🚪 EARLY_SHOCK_EXIT | secid={secid} | mae={state.mae:.2f}")
-                        return self._close_trade(secid, price, cur_sec, "EARLY_SHOCK_EXIT")
+                # 🛡️ Minimum hold guarantee before any later exit
+                if state.seconds_in_trade < 20:
                     return "HOLD"
 
-                # 🟠 BUILD PHASE (10–60 sec)
+                # 🟠 BUILD PHASE (20–60 sec)
                 if state.seconds_in_trade < 60:
 
                     # Allow recovery zone
-                    if state.mae > max(spread * 8, 1.5):
+                    if state.mae > max(spread * 12, 2.5):
 
                         # Only exit if structure is clearly broken
                         if price < entry - (spread * 2):
