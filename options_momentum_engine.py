@@ -689,7 +689,43 @@ class OptionsMomentumEngine:
             exhaust_score += 1
 
         down_exhaustion = exhaust_score >= 2
-        reversal_confirm = float(last["close"]) > midpoint_prev
+        recent_high_5 = max(x["high"] for x in list(c)[-5:])
+        recent_low_5 = min(x["low"] for x in list(c)[-5:])
+
+        breakout_confirm = float(last["close"]) > recent_high_5
+
+        failed_breakdown = (
+            float(prev["low"]) < recent_low_5 and
+            float(last["close"]) > float(prev["close"])
+        )
+
+        reversal_confirm = breakout_confirm or failed_breakdown
+
+        strong_downtrend = (
+            prev_speed < 0 and
+            speed < 0 and
+            abs(speed) > avg_range_5 * 0.5
+        )
+
+        if strong_downtrend and not breakout_confirm:
+            return "NO_TRADE"
+
+        weak_bounce = (
+            prev_speed < 0 and
+            speed > 0 and
+            abs(speed) < avg_range_5 * 0.3
+        )
+
+        if weak_bounce and not breakout_confirm:
+            return "NO_TRADE"
+
+        base_formed = (
+            abs(float(last["close"]) - recent_low_5) < avg_range_5 * 1.5
+        )
+
+        if not base_formed and not breakout_confirm:
+            return "NO_TRADE"
+
         tf3_ok = self.bias_filter.check(self.candles[secid], self.candles_3s[secid])
 
         print(
@@ -722,7 +758,7 @@ class OptionsMomentumEngine:
             f"reversal={reversal_confirm} tf3={tf3_ok} pressure={pressure_ok}"
         )
 
-        if score < 4:
+        if score < 5:
             print(
                 f"🚫 ENTRY_REJECT | secid={secid} | "
                 f"prior_down={prior_move_down} | "
