@@ -533,13 +533,34 @@ class OptionsMomentumEngine:
 
             spread = max(float(t["entry_spread"]), 0.05)
 
-            if state and state.seconds_in_trade < 35:
-                if state.mae > spread * 3:
-                    print(f"🚪 EARLY_LOSS_CUT | secid={secid} | mae={state.mae:.2f}")
-                    return self._close_trade(secid, price, cur_sec, "EARLY_LOSS_CUT")
-                return "HOLD"
+            # --- SMART HOLD SYSTEM ---
+            if state:
 
-            if state and state.seconds_in_trade > 35 and state.mfe < spread * 1.5:
+                # 🚫 Ultra early noise protection (0–3 sec)
+                if state.seconds_in_trade < 3:
+                    return "HOLD"
+
+                # 🟡 PROBE PHASE (3–10 sec)
+                if state.seconds_in_trade < 10:
+                    if state.mae > max(spread * 6, 1.0):
+                        print(f"🚪 EARLY_SHOCK_EXIT | secid={secid} | mae={state.mae:.2f}")
+                        return self._close_trade(secid, price, cur_sec, "EARLY_SHOCK_EXIT")
+                    return "HOLD"
+
+                # 🟠 BUILD PHASE (10–60 sec)
+                if state.seconds_in_trade < 60:
+
+                    # Allow recovery zone
+                    if state.mae > max(spread * 8, 1.5):
+
+                        # Only exit if structure is clearly broken
+                        if price < entry - (spread * 2):
+                            print(f"🚪 STRUCTURE_FAIL_EXIT | secid={secid}")
+                            return self._close_trade(secid, price, cur_sec, "STRUCTURE_FAIL")
+
+                    return "HOLD"
+
+            if state and state.seconds_in_trade > 60 and state.mfe < spread * 1.5:
                 print(f"🚫 NO_EXPANSION_EXIT | secid={secid} | mfe={state.mfe:.2f}")
                 return self._close_trade(secid, price, cur_sec, "NO_EXPANSION")
 
@@ -569,7 +590,7 @@ class OptionsMomentumEngine:
 
             if (
                 state
-                and state.seconds_in_trade > 35
+                and state.seconds_in_trade > 60
                 and state.mfe > spread * 6.0
                 and state.mae > state.mfe * 0.5
             ):
