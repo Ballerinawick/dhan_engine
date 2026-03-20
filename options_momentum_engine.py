@@ -699,7 +699,28 @@ class OptionsMomentumEngine:
             float(last["close"]) > float(prev["close"])
         )
 
-        reversal_confirm = breakout_confirm or failed_breakdown
+        structure_reversal = breakout_confirm or failed_breakdown
+
+        snap_reversal = (
+            prev_speed < 0 and
+            speed > 0 and
+            abs(speed) > avg_range_5 * 0.8 and
+            float(last["close"]) > float(prev["close"]) and
+            float(last_tick.get("flow", 0) or 0) > 300
+        )
+
+        allow_snap = snap_reversal
+
+        weak_snap = (
+            prev_speed < 0 and
+            speed > 0 and
+            abs(speed) < avg_range_5 * 0.4
+        )
+
+        if weak_snap and not breakout_confirm:
+            return "NO_TRADE"
+
+        reversal_confirm = structure_reversal or allow_snap
 
         strong_downtrend = (
             prev_speed < 0 and
@@ -707,7 +728,7 @@ class OptionsMomentumEngine:
             abs(speed) > avg_range_5 * 0.5
         )
 
-        if strong_downtrend and not breakout_confirm:
+        if strong_downtrend and not breakout_confirm and not allow_snap:
             return "NO_TRADE"
 
         weak_bounce = (
@@ -723,7 +744,7 @@ class OptionsMomentumEngine:
             abs(float(last["close"]) - recent_low_5) < avg_range_5 * 1.5
         )
 
-        if not base_formed and not breakout_confirm:
+        if not base_formed and not breakout_confirm and not allow_snap:
             return "NO_TRADE"
 
         tf3_ok = self.bias_filter.check(self.candles[secid], self.candles_3s[secid])
@@ -758,7 +779,7 @@ class OptionsMomentumEngine:
             f"reversal={reversal_confirm} tf3={tf3_ok} pressure={pressure_ok}"
         )
 
-        if score < 5:
+        if score < 5 and not allow_snap:
             print(
                 f"🚫 ENTRY_REJECT | secid={secid} | "
                 f"prior_down={prior_move_down} | "
