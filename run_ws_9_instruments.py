@@ -22,6 +22,7 @@ from institutional_decision_engine import InstitutionalDecisionEngine
 from institutional_trailing_exit_engine import InstitutionalTrailingExitEngine
 from structure_exit_engine import StructureExitEngine
 from market_state_engine import MarketStateEngine
+from turn_detection_engine import TurnDetectionEngine
 
 try:
     from dhanhq.marketfeed import DhanFeed
@@ -227,6 +228,7 @@ def main():
     trailing_exit_engine = InstitutionalTrailingExitEngine(debug=True)
     structure_exit_engine = StructureExitEngine(debug=True)
     market_engine = MarketStateEngine()
+    turn_engine = TurnDetectionEngine()
 
     selector = OptionChainSelector(
         access_token=token,
@@ -255,9 +257,35 @@ def main():
             "underlying": None,
             "ce_id": None,
             "pe_id": None,
-            "ready_logged": False
+            "ready_logged": False,
+            "last_turn_signal": None
         }
     }
+
+    def underlying_poll_loop():
+        while True:
+            try:
+                if market_open():
+                    ltp_map = ltp_rest.fetch_ltp_map({
+                        "NSE_FNO": list(fut_secids.values())
+                    })
+                    if ltp_map:
+                        for idx, secid in fut_secids.items():
+                            if secid not in ltp_map:
+                                continue
+                            new_ltp = float(ltp_map[secid] or 0.0)
+                            old_ltp = float(fut_ltp.get(idx, 0.0) or 0.0)
+                            fut_ltp[idx] = new_ltp
+                            if idx in live_state:
+                                live_state[idx]["underlying"] = new_ltp
+                            if abs(new_ltp - old_ltp) > 0:
+                                print(f"📈 UNDERLYING_TICK | {idx} | old={old_ltp:.2f} | new={new_ltp:.2f}")
+                    time.sleep(1.2)
+                else:
+                    time.sleep(5)
+            except Exception as e:
+                print(f"❌ UNDERLYING_POLL_ERROR | {e}")
+                time.sleep(2)
 
     # ==================================================
     # OPTION DEPTH CALLBACK (INSTITUTIONAL FLOW)
@@ -310,6 +338,9 @@ def main():
                 # optional: keep last snapshot
                 if snapshot:
                     s["last_snapshot"] = snapshot
+                    turn_signal = turn_engine.update(snapshot)
+                    if turn_signal:
+                        live_state[idx]["last_turn_signal"] = turn_signal
 
             bid_price = float(raw.get("bid_price", 0.0) or 0.0)
             ask_price = float(raw.get("ask_price", 0.0) or 0.0)
@@ -464,6 +495,7 @@ def main():
 
             if all(fut_ltp[i] > 0 for i in INDEXES):
                 print("✅ Initial FUT LTP captured.")
+                threading.Thread(target=underlying_poll_loop, name="UnderlyingPoller", daemon=True).start()
                 break
 
         time.sleep(REST_POLL_INTERVAL_SEC)
