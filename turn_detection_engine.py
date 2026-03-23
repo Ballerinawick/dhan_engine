@@ -15,7 +15,8 @@ class TurnDetectionEngine:
     SUMMARY_INTERVAL_SEC = 30
     REGIME_SHIFT_COOLDOWN_SEC = 3
 
-    def __init__(self):
+    def __init__(self, debug=True):
+        self.debug = debug
         self.history = defaultdict(lambda: deque(maxlen=self.HISTORY_MAX))
         self.last_signal = {}
         self.last_signal_ts = {}
@@ -23,8 +24,17 @@ class TurnDetectionEngine:
         self.last_turn_state = {}
         self.last_regime = {}
         self.last_regime_log_ts = {}
-        self.last_summary_ts = {}
-        self.last_weak_input_ts = {}
+
+    def _log_event(self, **kwargs):
+        if not getattr(self, "debug", True):
+            return
+        base = {
+            "ts": int(time.time()),
+            "engine": self.__class__.__name__,
+        }
+        base.update(kwargs)
+        log_line = " | ".join([f"{k}={v}" for k, v in base.items()])
+        print(f"🔁 {log_line}")
 
     def _safe_float(self, value, default=0.0):
         try:
@@ -313,29 +323,20 @@ class TurnDetectionEngine:
         if prev_regime and prev_regime != regime:
             last_regime_log = self.last_regime_log_ts.get(index, 0)
             if ts - last_regime_log >= self.REGIME_SHIFT_COOLDOWN_SEC:
-                print(f"🧭 REGIME_SHIFT | {index} | {prev_regime} -> {regime}")
+                self._log_event(
+                    event="REGIME_SHIFT",
+                    index=index,
+                    from_regime=prev_regime,
+                    to_regime=regime,
+                )
                 self.last_regime_log_ts[index] = ts
         self.last_regime[index] = regime
 
-        summary_ts = self.last_summary_ts.get(index, 0)
-        if ts - summary_ts >= self.SUMMARY_INTERVAL_SEC:
-            last_sig = self.last_turn_state.get(index, {}).get("signal", "NEUTRAL")
-            print(
-                f"🧠 TURN_STATE | {index} | last={last_sig} | regime={regime} | "
-                f"dom={self._safe_float(snapshot.get('dominance_score')):.2f} | "
-                f"exh={self._safe_float(snapshot.get('exhaustion_score')):.2f} | "
-                f"comp={self._safe_float(snapshot.get('compression_score')):.2f}"
-            )
-            self.last_summary_ts[index] = ts
 
         if len(rows) < 2:
             return None
 
         if len(rows) < self.MIN_HISTORY_FOR_CONTINUATION:
-            last_weak = self.last_weak_input_ts.get(index, 0)
-            if ts - last_weak >= 15:
-                print(f"⚠️ TURN_INPUT_WEAK | {index} | reason=insufficient_history")
-                self.last_weak_input_ts[index] = ts
             return None
 
         latest = rows[-1]
@@ -347,7 +348,12 @@ class TurnDetectionEngine:
                     "regime": regime,
                     "bias": latest.get("bias"),
                 })
-                print(f"🌀 COMPRESSION | {index} | score={score:.2f} | bias={latest.get('bias', 'NEUTRAL')}")
+                self._log_event(
+                    event="COMPRESSION",
+                    index=index,
+                    score=round(score, 2),
+                    bias=latest.get("bias"),
+                )
                 self.last_signal[index] = event["signal"]
                 self.last_signal_ts[index] = ts
                 self.last_signal_confidence[index] = event["confidence"]
@@ -362,7 +368,12 @@ class TurnDetectionEngine:
                     "side": trend_side,
                     "regime": regime,
                 })
-                print(f"⚠️ EXHAUSTION | {index} | side={trend_side} | score={score:.2f}")
+                self._log_event(
+                    event="EXHAUSTION",
+                    index=index,
+                    side=trend_side,
+                    score=round(score, 2),
+                )
                 self.last_signal[index] = event["signal"]
                 self.last_signal_ts[index] = ts
                 self.last_signal_confidence[index] = event["confidence"]
@@ -370,15 +381,15 @@ class TurnDetectionEngine:
                 return event
 
         detectors = [
-            ("REAL_BULLISH_TURN", self._is_real_bullish_turn, "🔁 REAL_TURN"),
-            ("REAL_BEARISH_TURN", self._is_real_bearish_turn, "🔁 REAL_TURN"),
-            ("FAKE_BULLISH_TURN", self._is_fake_bullish_turn, "❌ FAKE_TURN"),
-            ("FAKE_BEARISH_TURN", self._is_fake_bearish_turn, "❌ FAKE_TURN"),
-            ("BULLISH_CONTINUATION", self._is_bullish_continuation, "🚀 CONTINUATION"),
-            ("BEARISH_CONTINUATION", self._is_bearish_continuation, "🚀 CONTINUATION"),
+            ("REAL_BULLISH_TURN", self._is_real_bullish_turn),
+            ("REAL_BEARISH_TURN", self._is_real_bearish_turn),
+            ("FAKE_BULLISH_TURN", self._is_fake_bullish_turn),
+            ("FAKE_BEARISH_TURN", self._is_fake_bearish_turn),
+            ("BULLISH_CONTINUATION", self._is_bullish_continuation),
+            ("BEARISH_CONTINUATION", self._is_bearish_continuation),
         ]
 
-        for signal, fn, log_prefix in detectors:
+        for signal, fn in detectors:
             ok, confidence, reasons = fn(rows)
             if not ok:
                 continue
@@ -393,7 +404,17 @@ class TurnDetectionEngine:
                 "compression_score": round(self._safe_float(latest.get("compression_score")), 2),
                 "exhaustion_score": round(self._safe_float(latest.get("exhaustion_score")), 2),
             })
-            print(f"{log_prefix} | {index} | {signal} | conf={event['confidence']:.2f} | reason={reason}")
+            self._log_event(
+                event=signal,
+                index=index,
+                confidence=event["confidence"],
+                reason=reason,
+                bias=latest.get("bias"),
+                dom=round(self._safe_float(latest.get("dominance_score")), 2),
+                flow=round(self._safe_float(latest.get("flow_diff")), 2),
+                pressure=round(self._safe_float(latest.get("pressure_diff")), 2),
+                regime=regime,
+            )
             self.last_signal[index] = signal
             self.last_signal_ts[index] = ts
             self.last_signal_confidence[index] = event["confidence"]
