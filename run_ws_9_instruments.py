@@ -21,6 +21,7 @@ from option_chain_selector import OptionChainSelector
 from institutional_decision_engine import InstitutionalDecisionEngine
 from institutional_trailing_exit_engine import InstitutionalTrailingExitEngine
 from structure_exit_engine import StructureExitEngine
+from market_state_engine import MarketStateEngine
 
 try:
     from dhanhq.marketfeed import DhanFeed
@@ -225,6 +226,7 @@ def main():
     decision_engine = InstitutionalDecisionEngine(debug=True)
     trailing_exit_engine = InstitutionalTrailingExitEngine(debug=True)
     structure_exit_engine = StructureExitEngine(debug=True)
+    market_engine = MarketStateEngine()
 
     selector = OptionChainSelector(
         access_token=token,
@@ -246,6 +248,16 @@ def main():
     zero_book_counter = {}
     zero_book_warned = set()
     last_depth_tick_log = {}
+    live_state = {
+        "NIFTY": {
+            "ce": None,
+            "pe": None,
+            "underlying": None,
+            "ce_id": None,
+            "pe_id": None,
+            "ready_logged": False
+        }
+    }
 
     # ==================================================
     # OPTION DEPTH CALLBACK (INSTITUTIONAL FLOW)
@@ -270,6 +282,34 @@ def main():
             raw = feature_builder.build(secid, bid, ask)
             if not raw:
                 return
+
+            idx = "NIFTY"
+
+            # Assign CE / PE raw
+            if secid == live_state[idx]["ce_id"]:
+                live_state[idx]["ce"] = raw
+            elif secid == live_state[idx]["pe_id"]:
+                live_state[idx]["pe"] = raw
+
+            s = live_state[idx]
+
+            # Log once when fully ready
+            if s["ce"] and s["pe"] and s["underlying"] and not s["ready_logged"]:
+                s["ready_logged"] = True
+                print(f"✅ PAIR_STATE_READY | {idx} | CE+PE+UNDERLYING LIVE")
+
+            # Build snapshot
+            if s["ce"] and s["pe"] and s["underlying"]:
+                snapshot = market_engine.update(
+                    idx,
+                    s["underlying"],
+                    s["ce"],
+                    s["pe"]
+                )
+
+                # optional: keep last snapshot
+                if snapshot:
+                    s["last_snapshot"] = snapshot
 
             bid_price = float(raw.get("bid_price", 0.0) or 0.0)
             ask_price = float(raw.get("ask_price", 0.0) or 0.0)
@@ -418,6 +458,9 @@ def main():
             for idx, secid in fut_secids.items():
                 if secid in ltp_map:
                     fut_ltp[idx] = float(ltp_map[secid] or 0.0)
+                    if idx in live_state:
+                        live_state[idx]["underlying"] = fut_ltp[idx]
+                        print(f"📈 UNDERLYING_UPDATE | {idx} | ltp={fut_ltp[idx]}")
 
             if all(fut_ltp[i] > 0 for i in INDEXES):
                 print("✅ Initial FUT LTP captured.")
@@ -437,15 +480,25 @@ def main():
 
             subs = []
             if "CE" in selection:
+                ce_secid = str(selection["CE"]["security_id"])
                 subs.append({
-                    "SecurityId": str(selection["CE"]["security_id"]),
+                    "SecurityId": ce_secid,
                     "tag": f"{idx}_CE"
                 })
+                live_state[idx]["ce_id"] = int(ce_secid)
             if "PE" in selection:
+                pe_secid = str(selection["PE"]["security_id"])
                 subs.append({
-                    "SecurityId": str(selection["PE"]["security_id"]),
+                    "SecurityId": pe_secid,
                     "tag": f"{idx}_PE"
                 })
+                live_state[idx]["pe_id"] = int(pe_secid)
+
+            if live_state[idx]["ce_id"] and live_state[idx]["pe_id"]:
+                print(
+                    f"🧩 PAIR_REGISTERED | {idx} | "
+                    f"CE={live_state[idx]['ce_id']} | PE={live_state[idx]['pe_id']}"
+                )
 
             if subs:
                 instruments = []
