@@ -149,8 +149,6 @@ class FullDepth:
 
             else:
 
-                print(f"📥 BIN_FRAME_RX size={len(data)}")
-
                 packets = self._parse_binary_message(data)
 
                 for packet in packets:

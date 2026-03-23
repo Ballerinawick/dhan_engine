@@ -249,7 +249,6 @@ def main():
     fut_ltp = {k: 0.0 for k in INDEXES}
     zero_book_counter = {}
     zero_book_warned = set()
-    last_depth_tick_log = {}
     live_state = {
         "NIFTY": {
             "ce": None,
@@ -294,18 +293,6 @@ def main():
         try:
             if not market_open():
                 return
-
-            bid_levels = len(bid.prices) if hasattr(bid, "prices") else len(bid)
-            ask_levels = len(ask.prices) if hasattr(ask, "prices") else len(ask)
-
-            now_ts = time.time()
-            last_log_ts = last_depth_tick_log.get(secid, 0.0)
-            if now_ts - last_log_ts >= 2.0 and bid_levels > 0 and ask_levels > 0:
-                print(
-                    f"📡 DEPTH_TICK | {tag} | secid={secid} | "
-                    f"bid0={bid.prices[0]:.2f} ask0={ask.prices[0]:.2f}"
-                )
-                last_depth_tick_log[secid] = now_ts
 
             raw = feature_builder.build(secid, bid, ask)
             if not raw:

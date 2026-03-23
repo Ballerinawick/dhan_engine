@@ -48,9 +48,16 @@ class InstitutionalDecisionEngine:
         })
 
     # --------------------------------------------------
-    def _log(self, msg):
-        if self.debug:
-            print(msg)
+    def _log_event(self, **kwargs):
+        if not getattr(self, "debug", True):
+            return
+        base = {
+            "ts": int(time.time()),
+            "engine": self.__class__.__name__,
+        }
+        base.update(kwargs)
+        log_line = " | ".join([f"{k}={v}" for k, v in base.items()])
+        print(f"🧠 {log_line}")
 
     def _index_from_tag(self, tag):
         return tag.split("_")[0].upper()
@@ -94,11 +101,6 @@ class InstitutionalDecisionEngine:
         ts = self.index_last_exit_ts.get(index)
         return ts is None or (now - ts) >= self.FLIP_COOLDOWN_SEC
 
-    def _reject_entry(self, index, tag, side, reason, secid, momentum_engine):
-        momentum_engine.active_trade.pop(secid, None)
-        self._log(f"🧯 ENTRY_REJECT | {index} | {tag} | side={side} | reason={reason}")
-        return {"entry_allowed": False}
-
     def _pressure_score(self, tick):
         score = 0
 
@@ -133,45 +135,87 @@ class InstitutionalDecisionEngine:
 
         self._update_price_history(secid, now, ltp)
         struct_ok = self._structure_ok(secid)
-
-
         self._shadow_update(index, side, now, struct_ok)
-
-        if signal in ("A_ENTRY", "B_ENTRY", "TURN_ENTRY", "EXIT"):
-            self._log(f"🧠 SIGNAL | {index} | {tag} | {signal} | ltp={ltp:.2f}")
 
         # ================= ENTRY =================
         if signal in ("A_ENTRY", "B_ENTRY", "TURN_ENTRY"):
             last_tick = momentum_engine.tick_buffer[secid][-1] if momentum_engine.tick_buffer[secid] else {}
-
             pressure = self._pressure_score(last_tick)
 
-            print(f"⚖️ PRESSURE_SCORE | {tag} | score={pressure}")
-
             if pressure < 3:
-                return self._reject_entry(index, tag, side, "WEAK_PRESSURE", secid, momentum_engine)
+                self._log_event(
+                    event="ENTRY",
+                    decision="REJECT",
+                    index=index,
+                    tag=tag,
+                    secid=secid,
+                    side=side,
+                    reason="WEAK_PRESSURE",
+                )
+                momentum_engine.active_trade.pop(secid, None)
+                return {"entry_allowed": False}
 
             trade = momentum_engine.active_trade.get(secid)
             if not trade:
                 return {"entry_allowed": False}
 
             if index in self.index_active_secid and self.index_active_secid[index] in paper_trader.positions:
-                return self._reject_entry(index, tag, side, "INDEX_LOCKED", secid, momentum_engine)
+                self._log_event(
+                    event="ENTRY",
+                    decision="REJECT",
+                    index=index,
+                    tag=tag,
+                    secid=secid,
+                    side=side,
+                    reason="INDEX_LOCKED",
+                )
+                momentum_engine.active_trade.pop(secid, None)
+                return {"entry_allowed": False}
 
             if not self._cooldown_ok(index, now):
-                return self._reject_entry(index, tag, side, "COOLDOWN", secid, momentum_engine)
+                self._log_event(
+                    event="ENTRY",
+                    decision="REJECT",
+                    index=index,
+                    tag=tag,
+                    secid=secid,
+                    side=side,
+                    reason="COOLDOWN",
+                )
+                momentum_engine.active_trade.pop(secid, None)
+                return {"entry_allowed": False}
 
             last_exit_side = self.index_last_exit_side.get(index)
             is_flip = last_exit_side and last_exit_side != side
 
             if is_flip and not self._shadow_confirmed(index, side, now):
-                return self._reject_entry(index, tag, side, "FLIP_NO_SHADOW", secid, momentum_engine)
+                self._log_event(
+                    event="ENTRY",
+                    decision="REJECT",
+                    index=index,
+                    tag=tag,
+                    secid=secid,
+                    side=side,
+                    reason="FLIP_NO_SHADOW",
+                )
+                momentum_engine.active_trade.pop(secid, None)
+                return {"entry_allowed": False}
 
             if not is_flip and self.REENTRY_ALLOW_WITHOUT_STRUCT:
                 struct_ok = True
 
             if not struct_ok:
-                return self._reject_entry(index, tag, side, "STRUCT_NOT_OK", secid, momentum_engine)
+                self._log_event(
+                    event="ENTRY",
+                    decision="REJECT",
+                    index=index,
+                    tag=tag,
+                    secid=secid,
+                    side=side,
+                    reason="STRUCT_NOT_OK",
+                )
+                momentum_engine.active_trade.pop(secid, None)
+                return {"entry_allowed": False}
 
             paper_trader.on_entry(
                 secid=secid,
@@ -179,7 +223,7 @@ class InstitutionalDecisionEngine:
                 side="LONG",
                 ltp=trade["entry"],
                 lots=1,
-                reason=signal
+                reason=signal,
             )
 
             self.index_active_side[index] = side
@@ -193,7 +237,15 @@ class InstitutionalDecisionEngine:
                 "disp_start": None,
             }
 
-            self._log(f"✅ ENTRY_COMMITTED | {index} | {tag}")
+            self._log_event(
+                event="ENTRY",
+                decision="ACCEPT",
+                index=index,
+                tag=tag,
+                secid=secid,
+                side=side,
+                ltp=f"{ltp:.2f}",
+            )
             return {"entry_allowed": True}
 
         # ================= EXIT =================
@@ -206,6 +258,14 @@ class InstitutionalDecisionEngine:
                 self.index_active_secid.pop(index, None)
                 self.index_last_exit_ts[index] = now
 
+            self._log_event(
+                event="EXIT",
+                index=index,
+                tag=tag,
+                secid=secid,
+                ltp=f"{ltp:.2f}",
+                reason="STRATEGY_EXIT",
+            )
             return {"exit_allowed": True}
 
         # ================= POST ENTRY =================
@@ -219,12 +279,17 @@ class InstitutionalDecisionEngine:
         ctx["accept"] += 1
         if ctx["mode"] == "SCALP" and ctx["accept"] >= self.MODE_UPGRADE_CONFIRM_TICKS:
             ctx["mode"] = "TREND"
-            self._log(f"🧭 MODE_UPGRADE | {index} | {tag}")
+            self._log_event(
+                event="MODE_SHIFT",
+                index=index,
+                tag=tag,
+                secid=secid,
+                mode="TREND",
+            )
 
         if ctx["mode"] == "TREND":
             return
 
-        # ✅ FIXED deque slicing
         recent = list(self.price_track[secid])[-5:]
         bal = sum(p for _, p in recent) / len(recent) if recent else ltp
         disp = abs(ltp - bal) / max(bal, 1e-6)
@@ -248,5 +313,11 @@ class InstitutionalDecisionEngine:
                 self.index_active_secid.pop(index, None)
                 self.index_last_exit_ts[index] = now
 
-            self._log(f"❌ POST_ENTRY_KILL | {index} | {tag}")
+            self._log_event(
+                event="POST_KILL",
+                index=index,
+                tag=tag,
+                secid=secid,
+                reason="ENTRY_INVALIDATED",
+            )
             return
