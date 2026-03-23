@@ -462,13 +462,6 @@ class OptionsMomentumEngine:
         avg_range_5, avg_vol_5 = self._avg_range_vol(last5)
         avg_range_20, avg_vol_20 = self._avg_range_vol(last20)
 
-        print(
-            f"🔎 TURN_CHECK | secid={secid} | "
-            f"speed={speed:.4f} | prev_speed={prev_speed:.4f} | "
-            f"speed_ratio={speed_ratio:.2f} | "
-            f"avg_range_5={avg_range_5:.4f}"
-        )
-
         last_tick = self.tick_buffer[secid][-1] if self.tick_buffer[secid] else {}
         tick_prices = [
             float(t.get("ltp", 0) or 0)
@@ -668,12 +661,6 @@ class OptionsMomentumEngine:
                 )
 
             if state and opposite_turn_exit and momentum_confirmed and self.phase_manager.allow_turn_exit(state):
-                print(
-                    f"⚠️ OPPOSITE_TURN_CHECK | secid={secid} | "
-                    f"speed={speed:.4f} | prev_speed={prev_speed:.4f} | "
-                    f"ratio={speed_ratio:.2f} | close={last['close']:.2f} | "
-                    f"midpoint_prev={midpoint_prev:.2f}"
-                )
                 return self._close_trade(secid, price, cur_sec, "OPPOSITE_TURN")
 
             return "NO_TRADE"
@@ -790,14 +777,6 @@ class OptionsMomentumEngine:
         )
 
         if score < 5 and not allow_snap:
-            print(
-                f"🚫 ENTRY_REJECT | secid={secid} | "
-                f"prior_down={prior_move_down} | "
-                f"exhaust={down_exhaustion} | "
-                f"reversal={reversal_confirm} | "
-                f"tf3={tf3_ok} | "
-                f"pressure_ok={pressure_ok}"
-            )
             return "NO_TRADE"
 
         print(
