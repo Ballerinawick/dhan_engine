@@ -328,6 +328,15 @@ def main():
                     turn_signal = turn_engine.update(snapshot)
                     if turn_signal:
                         live_state[idx]["last_turn_signal"] = turn_signal
+                        decision_engine.on_signal(
+                            secid=secid,
+                            tag=tag,
+                            ltp=raw["ltp"],
+                            signal=turn_signal["signal"],
+                            momentum_engine=momentum_engine,
+                            paper_trader=paper_trader,
+                            snapshot=snapshot
+                        )
 
             bid_price = float(raw.get("bid_price", 0.0) or 0.0)
             ask_price = float(raw.get("ask_price", 0.0) or 0.0)
@@ -388,16 +397,19 @@ def main():
             # 1️⃣ Momentum signal
             action = momentum_engine.on_tick(secid, raw)
 
-            # 2️⃣ Institutional decision layer (ENTRY gating etc)
-            decision = decision_engine.on_signal(
-                secid=secid,
-                tag=tag,
-                ltp=raw["ltp"],
-                signal=action,
-                momentum_engine=momentum_engine,
-                paper_trader=paper_trader,
-                snapshot=live_state.get(idx, {}).get("last_snapshot")
-            )
+            # 2️⃣ Institutional decision layer now handles entry routing via turn_engine.
+            # Momentum engine is only used for active trade management and exits.
+            decision = {"exit_allowed": True}
+            if action == "EXIT":
+                decision = decision_engine.on_signal(
+                    secid=secid,
+                    tag=tag,
+                    ltp=raw["ltp"],
+                    signal=action,
+                    momentum_engine=momentum_engine,
+                    paper_trader=paper_trader,
+                    snapshot=live_state.get(idx, {}).get("last_snapshot")
+                )
 
             # 3️⃣ Structure Exit (SCALP vs TREND)
             struct = structure_exit_engine.on_tick(
