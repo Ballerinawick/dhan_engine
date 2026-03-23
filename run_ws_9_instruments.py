@@ -361,7 +361,8 @@ def main():
                         ltp=raw["ltp"],
                         signal="EXIT",
                         momentum_engine=momentum_engine,
-                        paper_trader=paper_trader
+                        paper_trader=paper_trader,
+                        snapshot=live_state.get(idx, {}).get("last_snapshot")
                     )
                     if decision and decision.get("exit_allowed") is False:
                         return False
@@ -394,7 +395,8 @@ def main():
                 ltp=raw["ltp"],
                 signal=action,
                 momentum_engine=momentum_engine,
-                paper_trader=paper_trader
+                paper_trader=paper_trader,
+                snapshot=live_state.get(idx, {}).get("last_snapshot")
             )
 
             # 3️⃣ Structure Exit (SCALP vs TREND)

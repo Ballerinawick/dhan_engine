@@ -36,6 +36,7 @@ class InstitutionalDecisionEngine:
 
         self.trade_ctx = {}
         self.price_track = defaultdict(deque)
+        self.last_turn_signal = {}
 
         self.index_active_side = {}
         self.index_active_secid = {}
@@ -128,36 +129,77 @@ class InstitutionalDecisionEngine:
         return score
 
     # --------------------------------------------------
-    def on_signal(self, *, secid, tag, ltp, signal, momentum_engine, paper_trader):
+    def on_signal(self, *, secid, tag, ltp, signal, momentum_engine, paper_trader, snapshot=None):
         now = time.time()
         index = self._index_from_tag(tag)
         side = self._side_from_tag(tag)
+
+        if signal in ("REAL_BULLISH_TURN", "REAL_BEARISH_TURN"):
+            self.last_turn_signal[index] = signal
+            self._log_event(
+                event="TURN_CAPTURED",
+                index=index,
+                signal=signal,
+            )
+            return {"entry_allowed": False}
 
         self._update_price_history(secid, now, ltp)
         struct_ok = self._structure_ok(secid)
         self._shadow_update(index, side, now, struct_ok)
 
         # ================= ENTRY =================
-        if signal in ("A_ENTRY", "B_ENTRY", "TURN_ENTRY"):
+        if signal in (
+            "REAL_BULLISH_TURN",
+            "REAL_BEARISH_TURN",
+            "BULLISH_CONTINUATION",
+            "BEARISH_CONTINUATION",
+        ):
             last_tick = momentum_engine.tick_buffer[secid][-1] if momentum_engine.tick_buffer[secid] else {}
-            pressure = self._pressure_score(last_tick)
+            snapshot = snapshot or {}
+            last_turn = self.last_turn_signal.get(index)
 
-            if pressure < 3:
-                self._log_event(
-                    event="ENTRY",
-                    decision="REJECT",
-                    index=index,
-                    tag=tag,
-                    secid=secid,
-                    side=side,
-                    reason="WEAK_PRESSURE",
-                )
-                momentum_engine.active_trade.pop(secid, None)
+            entry_side = None
+            if signal == "BULLISH_CONTINUATION" and last_turn == "REAL_BULLISH_TURN":
+                entry_side = "CE"
+            elif signal == "BEARISH_CONTINUATION" and last_turn == "REAL_BEARISH_TURN":
+                entry_side = "PE"
+            else:
                 return {"entry_allowed": False}
 
-            trade = momentum_engine.active_trade.get(secid)
-            if not trade:
+            if entry_side != "CE":
                 return {"entry_allowed": False}
+
+            if snapshot.get("market_regime") == "COMPRESSED":
+                self._log_event(event="ENTRY_BLOCK", reason="COMPRESSION", index=index)
+                return {"entry_allowed": False}
+
+            if abs(snapshot.get("flow_diff", 0)) < 2000:
+                self._log_event(event="ENTRY_BLOCK", reason="LOW_FLOW", index=index)
+                return {"entry_allowed": False}
+
+            if abs(snapshot.get("dominance_score", 0)) < 0.25:
+                self._log_event(event="ENTRY_BLOCK", reason="LOW_DOM", index=index)
+                return {"entry_allowed": False}
+
+            if abs(snapshot.get("pressure_diff", 0)) < 0.15:
+                self._log_event(event="ENTRY_BLOCK", reason="LOW_PRESSURE", index=index)
+                return {"entry_allowed": False}
+
+            trade = {
+                "type": "TURN",
+                "side": "LONG",
+                "entry": float(ltp),
+                "ts": now,
+                "best_price": float(ltp),
+                "worst_price": float(ltp),
+                "mfe": 0.0,
+                "mae": 0.0,
+                "locked_price": None,
+                "breakeven_armed": False,
+                "profit_lock_armed": False,
+                "entry_spread": float(last_tick.get("spread", 0) or 0),
+            }
+            momentum_engine.active_trade[secid] = trade
 
             if index in self.index_active_secid and self.index_active_secid[index] in paper_trader.positions:
                 self._log_event(
@@ -166,7 +208,7 @@ class InstitutionalDecisionEngine:
                     index=index,
                     tag=tag,
                     secid=secid,
-                    side=side,
+                    side=entry_side,
                     reason="INDEX_LOCKED",
                 )
                 momentum_engine.active_trade.pop(secid, None)
@@ -179,23 +221,23 @@ class InstitutionalDecisionEngine:
                     index=index,
                     tag=tag,
                     secid=secid,
-                    side=side,
+                    side=entry_side,
                     reason="COOLDOWN",
                 )
                 momentum_engine.active_trade.pop(secid, None)
                 return {"entry_allowed": False}
 
             last_exit_side = self.index_last_exit_side.get(index)
-            is_flip = last_exit_side and last_exit_side != side
+            is_flip = last_exit_side and last_exit_side != entry_side
 
-            if is_flip and not self._shadow_confirmed(index, side, now):
+            if is_flip and not self._shadow_confirmed(index, entry_side, now):
                 self._log_event(
                     event="ENTRY",
                     decision="REJECT",
                     index=index,
                     tag=tag,
                     secid=secid,
-                    side=side,
+                    side=entry_side,
                     reason="FLIP_NO_SHADOW",
                 )
                 momentum_engine.active_trade.pop(secid, None)
@@ -211,7 +253,7 @@ class InstitutionalDecisionEngine:
                     index=index,
                     tag=tag,
                     secid=secid,
-                    side=side,
+                    side=entry_side,
                     reason="STRUCT_NOT_OK",
                 )
                 momentum_engine.active_trade.pop(secid, None)
@@ -221,12 +263,12 @@ class InstitutionalDecisionEngine:
                 secid=secid,
                 tag=tag,
                 side="LONG",
-                ltp=trade["entry"],
+                ltp=ltp,
                 lots=1,
-                reason=signal,
+                reason="TURN_CONTINUATION"
             )
 
-            self.index_active_side[index] = side
+            self.index_active_side[index] = entry_side
             self.index_active_secid[index] = secid
 
             self.trade_ctx[secid] = {
@@ -241,10 +283,12 @@ class InstitutionalDecisionEngine:
                 event="ENTRY",
                 decision="ACCEPT",
                 index=index,
-                tag=tag,
                 secid=secid,
-                side=side,
-                ltp=f"{ltp:.2f}",
+                side=entry_side,
+                flow=round(snapshot.get("flow_diff", 0), 2),
+                dom=round(snapshot.get("dominance_score", 0), 2),
+                pressure=round(snapshot.get("pressure_diff", 0), 2),
+                reason="TURN_CONTINUATION"
             )
             return {"entry_allowed": True}
 
