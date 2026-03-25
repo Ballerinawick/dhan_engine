@@ -1,5 +1,7 @@
 import time
+from datetime import datetime
 from collections import defaultdict, deque
+import pytz
 
 
 class TurnDetectionEngine:
@@ -28,6 +30,8 @@ class TurnDetectionEngine:
     def _log_event(self, **kwargs):
         if not getattr(self, "debug", True):
             return
+        if kwargs.get("event") not in {"REGIME_SHIFT", "COMPRESSION", "COMPRESSION_WITH_BIAS"}:
+            return
         base = {
             "ts": int(time.time()),
             "engine": self.__class__.__name__,
@@ -35,6 +39,20 @@ class TurnDetectionEngine:
         base.update(kwargs)
         log_line = " | ".join([f"{k}={v}" for k, v in base.items()])
         print(f"🔁 {log_line}")
+
+    def _ist_time(self):
+        return datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S")
+
+    def ist_time(self):
+        return self._ist_time()
+
+    def log_exit(self, index, entry_price, exit_price, qty, side):
+        pnl = (exit_price - entry_price) * qty if side == "LONG" else (entry_price - exit_price) * qty
+        print(
+            f"🔴 EXIT | {self._ist_time()} | {index} | "
+            f"Entry={entry_price} | Exit={exit_price} | Qty={qty} | "
+            f"PnL={round(pnl, 2)}"
+        )
 
     def _safe_float(self, value, default=0.0):
         try:
@@ -261,7 +279,13 @@ class TurnDetectionEngine:
         flow_ok = self._avg("flow_diff", rows[-3:]) > 0
         dom_ok = self._avg("dominance_score", rows[-3:]) > self.DOM_FLIP_THRESHOLD
         not_tired = self._safe_float(latest.get("exhaustion_score")) < self.EXHAUSTION_THRESHOLD
-        not_compressed = not self._is_compression(rows[-2:])
+        is_compressed = self._is_compression(rows[-2:])
+        strong_trend_inside_compression = (
+            latest.get("bias") == "BULLISH"
+            and self._avg("dominance_score", rows[-3:]) > 0.18
+            and self._avg("flow_diff", rows[-3:]) > 0
+        )
+        not_compressed = (not is_compressed) or strong_trend_inside_compression
         if strong_bias and flow_ok and dom_ok and not_tired and not_compressed:
             confidence = 0.58 + min(0.16, max(0.0, self._avg("dominance_score", rows[-3:])))
             if self._slope("flow_diff", rows[-4:]) > 0:
@@ -277,7 +301,13 @@ class TurnDetectionEngine:
         flow_ok = self._avg("flow_diff", rows[-3:]) < 0
         dom_ok = self._avg("dominance_score", rows[-3:]) < -self.DOM_FLIP_THRESHOLD
         not_tired = self._safe_float(latest.get("exhaustion_score")) < self.EXHAUSTION_THRESHOLD
-        not_compressed = not self._is_compression(rows[-2:])
+        is_compressed = self._is_compression(rows[-2:])
+        strong_trend_inside_compression = (
+            latest.get("bias") == "BEARISH"
+            and self._avg("dominance_score", rows[-3:]) < -0.18
+            and self._avg("flow_diff", rows[-3:]) < 0
+        )
+        not_compressed = (not is_compressed) or strong_trend_inside_compression
         if strong_bias and flow_ok and dom_ok and not_tired and not_compressed:
             confidence = 0.58 + min(0.16, max(0.0, -self._avg("dominance_score", rows[-3:])))
             if self._slope("flow_diff", rows[-4:]) < 0:
@@ -354,6 +384,14 @@ class TurnDetectionEngine:
                     score=round(score, 2),
                     bias=latest.get("bias"),
                 )
+                if latest.get("bias") in ["BULLISH", "BEARISH"]:
+                    self._log_event(
+                        event="COMPRESSION_WITH_BIAS",
+                        index=index,
+                        bias=latest.get("bias"),
+                        dom=round(self._safe_float(latest.get("dominance_score")), 2),
+                        flow=round(self._safe_float(latest.get("flow_diff")), 2),
+                    )
                 self.last_signal[index] = event["signal"]
                 self.last_signal_ts[index] = ts
                 self.last_signal_confidence[index] = event["confidence"]
@@ -404,17 +442,13 @@ class TurnDetectionEngine:
                 "compression_score": round(self._safe_float(latest.get("compression_score")), 2),
                 "exhaustion_score": round(self._safe_float(latest.get("exhaustion_score")), 2),
             })
-            self._log_event(
-                event=signal,
-                index=index,
-                confidence=event["confidence"],
-                reason=reason,
-                bias=latest.get("bias"),
-                dom=round(self._safe_float(latest.get("dominance_score")), 2),
-                flow=round(self._safe_float(latest.get("flow_diff")), 2),
-                pressure=round(self._safe_float(latest.get("pressure_diff")), 2),
-                regime=regime,
-            )
+            if signal.startswith("REAL_") or signal.endswith("_CONTINUATION"):
+                print(
+                    f"🟢 ENTRY | {self._ist_time()} | {signal} | "
+                    f"Price={snapshot.get('ce_ltp') or snapshot.get('pe_ltp')} | "
+                    f"Bias={snapshot.get('bias')} | "
+                    f"Confidence={round(confidence, 2)}"
+                )
             self.last_signal[index] = signal
             self.last_signal_ts[index] = ts
             self.last_signal_confidence[index] = event["confidence"]
