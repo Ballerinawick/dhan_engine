@@ -299,6 +299,7 @@ def main():
                 return
 
             idx = "NIFTY"
+            trade_id = idx
 
             # Assign CE / PE raw
             if secid == live_state[idx]["ce_id"]:
@@ -328,10 +329,17 @@ def main():
                     turn_signal = turn_engine.update(snapshot)
                     if turn_signal:
                         live_state[idx]["last_turn_signal"] = turn_signal
+                        signal_text = str(turn_signal.get("signal", "") or "")
+                        route_tag = "CE" if "BULLISH" in signal_text else ("PE" if "BEARISH" in signal_text else tag)
+                        route_ltp = raw["ltp"]
+                        if route_tag == "CE" and s.get("ce"):
+                            route_ltp = float(s["ce"].get("ltp", route_ltp) or route_ltp)
+                        elif route_tag == "PE" and s.get("pe"):
+                            route_ltp = float(s["pe"].get("ltp", route_ltp) or route_ltp)
                         decision_engine.on_signal(
-                            secid=secid,
-                            tag=tag,
-                            ltp=raw["ltp"],
+                            secid=trade_id,
+                            tag=route_tag,
+                            ltp=route_ltp,
                             signal=turn_signal["signal"],
                             momentum_engine=momentum_engine,
                             paper_trader=paper_trader,
@@ -358,14 +366,14 @@ def main():
             raw["ts"] = time.time()
 
             # 0️⃣ MTM update
-            paper_trader.on_tick(secid, raw["ltp"])
+            paper_trader.on_tick(trade_id, raw["ltp"])
 
             # -------------- unified exit (CRITICAL FIX) --------------
             def force_exit(reason: str):
                 # 1) decision engine must see EXIT to release locks/ctx safely
                 try:
                     decision = decision_engine.on_signal(
-                        secid=secid,
+                        secid=trade_id,
                         tag=tag,
                         ltp=raw["ltp"],
                         signal="EXIT",
@@ -379,7 +387,7 @@ def main():
                     print("❌ force_exit: decision_engine EXIT error:", e)
 
                 # 2) close paper position
-                paper_trader.on_exit(secid, raw["ltp"], reason=reason)
+                paper_trader.on_exit(trade_id, raw["ltp"], reason=reason)
 
                 # 3) CRITICAL: clear momentum trade state so entries can happen again
                 try:
@@ -402,7 +410,7 @@ def main():
             decision = {"exit_allowed": True}
             if action == "EXIT":
                 decision = decision_engine.on_signal(
-                    secid=secid,
+                    secid=trade_id,
                     tag=tag,
                     ltp=raw["ltp"],
                     signal=action,
