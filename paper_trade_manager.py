@@ -122,6 +122,7 @@ class PaperTradeManager:
             "entry_ts": now_ts,
             "entry_reason": reason,
         }
+        print(f"🔥 TRADE STORED CONFIRMED | {tag} | {ltp}")
 
         self.max_concurrent_open = max(self.max_concurrent_open, len(self.positions))
         self.open_positions_dirty = True
