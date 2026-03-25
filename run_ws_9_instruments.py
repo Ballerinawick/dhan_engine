@@ -330,12 +330,16 @@ def main():
                     if turn_signal:
                         live_state[idx]["last_turn_signal"] = turn_signal
                         signal_text = str(turn_signal.get("signal", "") or "")
-                        route_tag = "CE" if "BULLISH" in signal_text else ("PE" if "BEARISH" in signal_text else tag)
-                        route_ltp = raw["ltp"]
-                        if route_tag == "CE" and s.get("ce"):
-                            route_ltp = float(s["ce"].get("ltp", route_ltp) or route_ltp)
-                        elif route_tag == "PE" and s.get("pe"):
-                            route_ltp = float(s["pe"].get("ltp", route_ltp) or route_ltp)
+
+                        if "BULLISH" in signal_text:
+                            route_tag = f"{idx}_CE"
+                            route_ltp = float(s["ce"].get("ltp", raw["ltp"]) or raw["ltp"])
+                        elif "BEARISH" in signal_text:
+                            route_tag = f"{idx}_PE"
+                            route_ltp = float(s["pe"].get("ltp", raw["ltp"]) or raw["ltp"])
+                        else:
+                            route_tag = tag
+                            route_ltp = raw["ltp"]
                         decision_engine.on_signal(
                             secid=trade_id,
                             tag=route_tag,

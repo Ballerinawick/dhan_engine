@@ -166,8 +166,6 @@ class InstitutionalDecisionEngine:
             else:
                 return {"entry_allowed": False}
 
-            if entry_side != "CE":
-                return {"entry_allowed": False}
 
             if snapshot.get("market_regime") == "COMPRESSED":
                 self._log_event(event="ENTRY_BLOCK", reason="COMPRESSION", index=index)
