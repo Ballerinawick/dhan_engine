@@ -25,11 +25,21 @@ class TurnDetectionEngine:
         self.last_turn_state = {}
         self.last_regime = {}
         self.last_regime_log_ts = {}
+        self.active_trade = {}
 
     def _log_event(self, **kwargs):
         if not getattr(self, "debug", True):
             return
-        if kwargs.get("event") not in {"REGIME_SHIFT", "COMPRESSION", "COMPRESSION_WITH_BIAS"}:
+        if kwargs.get("event") not in {
+            "REGIME_SHIFT",
+            "COMPRESSION",
+            "COMPRESSION_WITH_BIAS",
+            "EXHAUSTION",
+            "REAL_BULLISH_TURN",
+            "REAL_BEARISH_TURN",
+            "BULLISH_CONTINUATION",
+            "BEARISH_CONTINUATION",
+        }:
             return
         base = {
             "ts": int(time.time()),
@@ -326,6 +336,53 @@ class TurnDetectionEngine:
             "state": state,
         }
 
+    def _track_entry(self, snapshot, signal):
+        bullish_signal = signal in {"REAL_BULLISH_TURN", "BULLISH_CONTINUATION"}
+        side = "LONG" if bullish_signal else "SHORT"
+        premium_type = "CE" if bullish_signal else "PE"
+        entry_price = self._safe_float(snapshot.get("ce_ltp" if bullish_signal else "pe_ltp"))
+        trade = {
+            "signal": signal,
+            "side": side,
+            "entry_price": entry_price,
+            "entry_time_ist": self._ist_time(),
+            "ts": int(self._safe_float(snapshot.get("ts"), time.time())),
+            "qty": int(snapshot.get("qty", 1) or 1),
+            "premium_type": premium_type,
+        }
+        self.active_trade[snapshot.get("index", "UNKNOWN")] = trade
+        print(
+            f"🟢 ENTRY | {trade['entry_time_ist']} | {snapshot.get('index', 'UNKNOWN')} | "
+            f"{signal} | {premium_type} | {entry_price}"
+        )
+        return trade
+
+    def close_trade(self, index, exit_price, reason="manual_exit"):
+        trade = self.active_trade.get(index)
+        if not trade:
+            return None
+        exit_px = self._safe_float(exit_price)
+        qty = int(trade.get("qty", 1) or 1)
+        hold_sec = max(0, int(time.time()) - int(trade.get("ts", time.time())))
+        if trade.get("side") == "LONG":
+            pnl = (exit_px - trade.get("entry_price", 0.0)) * qty
+        else:
+            pnl = (trade.get("entry_price", 0.0) - exit_px) * qty
+        print(
+            f"🔴 EXIT | {self._ist_time()} | {index} | {trade.get('signal')} | "
+            f"{trade.get('premium_type')} | {trade.get('entry_price')} | {exit_px} | "
+            f"{round(pnl, 2)} | {hold_sec} | {reason}"
+        )
+        closed = dict(trade)
+        closed.update({
+            "exit_price": exit_px,
+            "pnl": round(pnl, 2),
+            "hold_sec": hold_sec,
+            "reason": reason,
+        })
+        self.active_trade.pop(index, None)
+        return closed
+
     def _should_emit_signal(self, index, signal, ts, confidence):
         last_signal = self.last_signal.get(index)
         last_ts = self.last_signal_ts.get(index, 0)
@@ -371,10 +428,11 @@ class TurnDetectionEngine:
 
         latest = rows[-1]
 
+        compression_event = None
         if self._is_compression(rows[-3:]):
             score = self._safe_float(latest.get("compression_score"))
             if score >= self.COMPRESSION_THRESHOLD and self._should_emit_signal(index, "COMPRESSION_WARNING", ts, score):
-                event = self._emit(latest, "COMPRESSION_WARNING", score, "compression_building", {
+                compression_event = self._emit(latest, "COMPRESSION_WARNING", score, "compression_building", {
                     "regime": regime,
                     "bias": latest.get("bias"),
                 })
@@ -392,11 +450,10 @@ class TurnDetectionEngine:
                         dom=round(self._safe_float(latest.get("dominance_score")), 2),
                         flow=round(self._safe_float(latest.get("flow_diff")), 2),
                     )
-                self.last_signal[index] = event["signal"]
+                self.last_signal[index] = compression_event["signal"]
                 self.last_signal_ts[index] = ts
-                self.last_signal_confidence[index] = event["confidence"]
-                self.last_turn_state[index] = event
-                return event
+                self.last_signal_confidence[index] = compression_event["confidence"]
+                self.last_turn_state[index] = compression_event
 
         trend_side = latest.get("bias") if latest.get("bias") in {"BULLISH", "BEARISH"} else latest.get("dominance_side", "NEUTRAL")
         if self._is_exhaustion(rows[-5:], trend_side):
@@ -443,11 +500,12 @@ class TurnDetectionEngine:
                 "exhaustion_score": round(self._safe_float(latest.get("exhaustion_score")), 2),
             })
             if signal.startswith("REAL_") or signal.endswith("_CONTINUATION"):
-                print(
-                    f"🟢 ENTRY | {self._ist_time()} | {signal} | "
-                    f"Price={snapshot.get('ce_ltp') or snapshot.get('pe_ltp')} | "
-                    f"Bias={snapshot.get('bias')} | "
-                    f"Confidence={round(confidence, 2)}"
+                self._track_entry(snapshot, signal)
+                self._log_event(
+                    event=signal,
+                    index=index,
+                    confidence=round(confidence, 2),
+                    bias=latest.get("bias"),
                 )
             self.last_signal[index] = signal
             self.last_signal_ts[index] = ts
@@ -455,4 +513,4 @@ class TurnDetectionEngine:
             self.last_turn_state[index] = event
             return event
 
-        return None
+        return compression_event
