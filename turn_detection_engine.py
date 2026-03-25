@@ -1,7 +1,6 @@
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
-import pytz
 
 
 class TurnDetectionEngine:
@@ -41,7 +40,8 @@ class TurnDetectionEngine:
         print(f"🔁 {log_line}")
 
     def _ist_time(self):
-        return datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S")
+        ist = timezone(timedelta(hours=5, minutes=30))
+        return datetime.now(ist).strftime("%H:%M:%S")
 
     def ist_time(self):
         return self._ist_time()
