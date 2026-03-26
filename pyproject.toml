@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dhan-engine"
+version = "0.1.0"
+description = "Institutional-grade trading runtime for Dhan market data and strategy orchestration."
+requires-python = ">=3.10"
+dependencies = [
+  "dhanhq",
+  "pandas",
+  "python-dotenv",
+  "requests",
+  "websocket-client",
+  "websockets",
+]
+
+[tool.setuptools]
+packages = [
+  "dhan_engine",
+  "dhan_engine.application",
+  "dhan_engine.config",
+  "dhan_engine.domain",
+  "dhan_engine.domain.features",
+  "dhan_engine.domain.market",
+  "dhan_engine.domain.strategy",
+  "dhan_engine.domain.trade_lifecycle",
+  "dhan_engine.infrastructure",
+  "dhan_engine.infrastructure.dhan",
+  "dhan_engine.interfaces",
+  "dhan_engine.interfaces.cli",
+  "dhan_engine.simulations",
+]

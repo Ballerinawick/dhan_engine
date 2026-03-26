@@ -1,0 +1,458 @@
+import logging
+import os
+import threading
+import time
+from datetime import datetime
+from typing import Dict, Optional
+
+import requests
+
+from dhan_engine.application.market_data import FutureQuoteStream, OptionDepthStream, RestLtpStreamer
+from dhan_engine.config.settings import RuntimeSettings
+from dhan_engine.domain.features.depth_micro_features import DepthMicroFeatureBuilder
+from dhan_engine.domain.market.market_state_engine import MarketStateEngine
+from dhan_engine.domain.market.turn_detection_engine import TurnDetectionEngine
+from dhan_engine.domain.state import PairRuntimeState
+from dhan_engine.domain.strategy.institutional_decision_engine import InstitutionalDecisionEngine
+from dhan_engine.domain.strategy.institutional_trailing_exit_engine import InstitutionalTrailingExitEngine
+from dhan_engine.domain.strategy.options_momentum_engine import OptionsMomentumEngine
+from dhan_engine.domain.strategy.structure_exit_engine import StructureExitEngine
+from dhan_engine.infrastructure.dhan.full_market_quote_sampler import FullMarketQuoteSampler
+from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
+from dhan_engine.infrastructure.dhan.ltp_rest_engine import DhanLtpRestEngine
+from dhan_engine.infrastructure.dhan.option_chain_selector import OptionChainSelector
+from dhan_engine.simulations.paper_trade_manager import PaperTradeManager
+
+
+logger = logging.getLogger(__name__)
+
+
+def download_master_csv(csv_url: str, save_path: str) -> None:
+    response = requests.get(csv_url, timeout=30)
+    response.raise_for_status()
+    with open(save_path, "wb") as handle:
+        handle.write(response.content)
+    logger.info(
+        "Master CSV refreshed | path=%s | size_kb=%.2f",
+        os.path.abspath(save_path),
+        os.path.getsize(save_path) / 1024.0,
+    )
+
+
+class TradingRuntimeCoordinator:
+    """Coordinates market-data streams and strategy execution."""
+
+    def __init__(
+        self,
+        *,
+        settings: RuntimeSettings,
+        master: InstrumentMaster,
+        feature_builder: DepthMicroFeatureBuilder,
+        momentum_engine: OptionsMomentumEngine,
+        paper_trader: PaperTradeManager,
+        decision_engine: InstitutionalDecisionEngine,
+        trailing_exit_engine: InstitutionalTrailingExitEngine,
+        structure_exit_engine: StructureExitEngine,
+        market_engine: MarketStateEngine,
+        turn_engine: TurnDetectionEngine,
+        selector: OptionChainSelector,
+        ltp_streamer: RestLtpStreamer,
+        future_quote_stream: Optional[FutureQuoteStream],
+        option_depth_stream: Optional[OptionDepthStream],
+    ):
+        self.settings = settings
+        self.master = master
+        self.feature_builder = feature_builder
+        self.momentum_engine = momentum_engine
+        self.paper_trader = paper_trader
+        self.decision_engine = decision_engine
+        self.trailing_exit_engine = trailing_exit_engine
+        self.structure_exit_engine = structure_exit_engine
+        self.market_engine = market_engine
+        self.turn_engine = turn_engine
+        self.selector = selector
+        self.ltp_streamer = ltp_streamer
+        self.future_quote_stream = future_quote_stream
+        self.option_depth_stream = option_depth_stream
+
+        self._lock = threading.RLock()
+        self._future_ready = threading.Event()
+        self._zero_book_counter: Dict[int, int] = {}
+        self._zero_book_warned = set()
+
+        self.pairs = {index: PairRuntimeState(index=index) for index in self.settings.indexes}
+        self.future_secids: Dict[str, int] = {}
+        self.future_index_by_secid: Dict[int, str] = {}
+        self.option_index_by_secid: Dict[int, str] = {}
+        self.full_quote_secid_tag: Dict[int, str] = {}
+
+    def run(self) -> None:
+        logger.info("MODE: FUTURE_WS_STREAM + OPTION_DEPTH_STREAM + OPTION_PREMIUM_ENRICHMENT")
+
+        self._configure_underlying_contracts()
+        if self.future_quote_stream is None:
+            raise RuntimeError("Future quote stream is not configured")
+        self.future_quote_stream.start()
+        self.future_quote_stream.subscribe(
+            [(secid, f"{index}_FUT") for index, secid in self.future_secids.items()]
+        )
+
+        self.ltp_streamer.register_channel("option_premium", self._on_option_premium_ltp)
+        if self.option_depth_stream is None:
+            raise RuntimeError("Option depth stream is not configured")
+        self.option_depth_stream.start()
+
+        self._wait_for_underlyings()
+        self._select_and_subscribe_option_pairs()
+        self._start_optional_full_quote_sampler()
+        self._heartbeat_loop()
+
+    def market_open(self) -> bool:
+        now = datetime.now(self.settings.timezone)
+        if now.weekday() >= 5:
+            return False
+        return self.settings.market_start <= now.time() <= self.settings.market_end
+
+    def _configure_underlying_contracts(self) -> None:
+        for index in self.settings.indexes:
+            future_contract = self.master.get_nearest_future(index)
+            secid = int(future_contract["security_id"])
+            self.future_secids[index] = secid
+            self.future_index_by_secid[secid] = index
+            self.pairs[index].future_id = secid
+            logger.info(
+                "Underlying future registered | index=%s | secid=%s | symbol=%s",
+                index,
+                secid,
+                future_contract["symbol"],
+            )
+
+    def _wait_for_underlyings(self) -> None:
+        logger.info("Waiting for future websocket LTP stream")
+        while not self._all_underlyings_ready():
+            self._future_ready.wait(timeout=self.settings.startup_wait_sec)
+            if self._all_underlyings_ready():
+                break
+            logger.info("FUTURE_WS_STARTUP_RETRY")
+        logger.info("Future websocket LTP stream ready")
+
+    def _all_underlyings_ready(self) -> bool:
+        with self._lock:
+            return all(self.pairs[index].underlying_ltp for index in self.settings.indexes)
+
+    def _select_and_subscribe_option_pairs(self) -> None:
+        premium_secids = []
+
+        for index in self.settings.indexes:
+            underlying_ltp = self.pairs[index].underlying_ltp
+            selection = self.selector.select_best(index, underlying_ltp_override=underlying_ltp)
+            if not selection:
+                logger.warning("Option selection returned no contracts | index=%s", index)
+                continue
+
+            subscriptions = []
+            pair = self.pairs[index]
+
+            if "CE" in selection:
+                ce_id = int(selection["CE"]["security_id"])
+                pair.ce_id = ce_id
+                self.option_index_by_secid[ce_id] = index
+                subscriptions.append((ce_id, f"{index}_CE"))
+                premium_secids.append(ce_id)
+
+            if "PE" in selection:
+                pe_id = int(selection["PE"]["security_id"])
+                pair.pe_id = pe_id
+                self.option_index_by_secid[pe_id] = index
+                subscriptions.append((pe_id, f"{index}_PE"))
+                premium_secids.append(pe_id)
+
+            if pair.ce_id and pair.pe_id:
+                logger.info("PAIR_REGISTERED | %s | CE=%s | PE=%s", index, pair.ce_id, pair.pe_id)
+
+            if subscriptions:
+                self.option_depth_stream.subscribe(subscriptions)
+                for secid, tag in subscriptions:
+                    self.full_quote_secid_tag[secid] = tag
+
+        if self.settings.option_premium_stream_enabled and premium_secids:
+            self.ltp_streamer.update_subscription("option_premium", {"NSE_FNO": premium_secids})
+            self.ltp_streamer.start()
+            logger.info("Option premium LTP stream registered | instruments=%s", len(premium_secids))
+
+    def on_future_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
+        with self._lock:
+            index = self.future_index_by_secid.get(int(secid))
+            if index is None:
+                return
+            self.pairs[index].update_underlying_quote(
+                {
+                    "secid": int(secid),
+                    "tag": str(tag),
+                    "ltp": float(ltp),
+                    "source": "FUTURE_WS",
+                    "ts": getattr(depth, "ts", time.time()),
+                    "bid_price": list(getattr(depth, "bid_price", []) or []),
+                    "bid_qty": list(getattr(depth, "bid_qty", []) or []),
+                    "ask_price": list(getattr(depth, "ask_price", []) or []),
+                    "ask_qty": list(getattr(depth, "ask_qty", []) or []),
+                }
+            )
+            if self._all_underlyings_ready():
+                self._future_ready.set()
+
+    def _on_option_premium_ltp(self, prices: Dict[int, float]) -> None:
+        with self._lock:
+            for secid, ltp in prices.items():
+                index = self.option_index_by_secid.get(secid)
+                if index is None:
+                    continue
+                self.pairs[index].update_option_ltp(secid, ltp)
+
+    def on_option_depth(self, secid: int, tag: str, bid, ask) -> None:
+        if not self.market_open():
+            return
+
+        raw = self.feature_builder.build(secid, bid, ask)
+        if not raw:
+            return
+
+        raw["secid"] = int(secid)
+        raw["tag"] = str(tag)
+        raw["ts"] = time.time()
+
+        index = self.option_index_by_secid.get(int(secid))
+        if index is None:
+            index = str(tag).split("_")[0].upper()
+        pair = self.pairs.get(index)
+        if pair is None:
+            return
+
+        with self._lock:
+            premium_ltp = pair.ce_ltp if secid == pair.ce_id else pair.pe_ltp if secid == pair.pe_id else None
+            if premium_ltp and premium_ltp > 0:
+                raw["ltp"] = float(premium_ltp)
+                raw["ltp_source"] = "REST_OPTION_PREMIUM"
+
+            pair.update_option_depth(secid, raw)
+            self._track_zero_book(secid, tag, raw)
+            self.paper_trader.on_tick(secid, raw["ltp"])
+
+            if pair.is_ready() and not pair.ready_logged:
+                pair.ready_logged = True
+                logger.info("PAIR_STATE_READY | %s | CE+PE+UNDERLYING LIVE", index)
+
+            if pair.is_ready():
+                self._update_market_snapshot(pair, raw, secid, tag)
+
+            self._process_exit_engines(pair, secid, tag, raw)
+
+    def _update_market_snapshot(self, pair: PairRuntimeState, raw: dict, secid: int, tag: str) -> None:
+        ce_input, pe_input = pair.build_market_inputs()
+        if ce_input is None or pe_input is None or pair.underlying_ltp is None:
+            return
+
+        snapshot = self.market_engine.update(pair.index, pair.underlying_ltp, ce_input, pe_input)
+        if not snapshot:
+            return
+
+        snapshot["underlying_ltp"] = float(pair.underlying_ltp)
+        pair.last_snapshot = snapshot
+
+        turn_signal = self.turn_engine.update(snapshot)
+        if not turn_signal:
+            return
+
+        pair.last_turn_signal = turn_signal
+        route_secid, route_tag, route_ltp = pair.route_for_signal(turn_signal.get("signal"), tag, raw["ltp"])
+        if route_secid is None:
+            return
+
+        self.decision_engine.on_signal(
+            secid=route_secid,
+            tag=route_tag,
+            ltp=route_ltp,
+            signal=turn_signal["signal"],
+            momentum_engine=self.momentum_engine,
+            paper_trader=self.paper_trader,
+            snapshot=snapshot,
+        )
+
+    def _process_exit_engines(self, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
+        action = self.momentum_engine.on_tick(secid, raw)
+        decision = {"exit_allowed": True}
+
+        if action == "EXIT":
+            decision = self.decision_engine.on_signal(
+                secid=secid,
+                tag=tag,
+                ltp=raw["ltp"],
+                signal=action,
+                momentum_engine=self.momentum_engine,
+                paper_trader=self.paper_trader,
+                snapshot=pair.last_snapshot,
+            )
+
+        structure = self.structure_exit_engine.on_tick(
+            secid=secid,
+            tag=tag,
+            ltp=raw["ltp"],
+            paper_trader=self.paper_trader,
+            decision_engine=self.decision_engine,
+        )
+        if structure and structure.get("exit"):
+            logger.info("EXIT_OVERRIDE | %s | reason=%s", tag, structure["reason"])
+            self._force_exit(pair, secid, tag, raw["ltp"], structure["reason"])
+            return
+
+        trail = self.trailing_exit_engine.on_tick(
+            secid=secid,
+            tag=tag,
+            ltp=raw["ltp"],
+            paper_trader=self.paper_trader,
+            momentum_engine=self.momentum_engine,
+        )
+        if trail and trail.get("exit"):
+            logger.info("EXIT_OVERRIDE | %s | reason=%s", tag, trail["reason"])
+            self._force_exit(pair, secid, tag, raw["ltp"], trail["reason"])
+            return
+
+        if action == "EXIT":
+            if decision and decision.get("exit_allowed") is False:
+                return
+            reason = decision.get("exit_reason", self.momentum_engine.last_exit_reason.get(secid, action))
+            self._force_exit(pair, secid, tag, raw["ltp"], reason)
+
+    def _force_exit(self, pair: PairRuntimeState, secid: int, tag: str, ltp: float, reason: str) -> bool:
+        try:
+            decision = self.decision_engine.on_signal(
+                secid=secid,
+                tag=tag,
+                ltp=ltp,
+                signal="EXIT",
+                momentum_engine=self.momentum_engine,
+                paper_trader=self.paper_trader,
+                snapshot=pair.last_snapshot,
+            )
+            if decision and decision.get("exit_allowed") is False:
+                return False
+        except Exception:
+            logger.exception("force_exit decision engine failure | secid=%s | reason=%s", secid, reason)
+
+        self.paper_trader.on_exit(secid, ltp, reason=reason)
+        if hasattr(self.momentum_engine, "clear_trade"):
+            self.momentum_engine.clear_trade(secid, reason)
+        else:
+            self.momentum_engine.active_trade.pop(secid, None)
+        return True
+
+    def _track_zero_book(self, secid: int, tag: str, raw: dict) -> None:
+        bid_price = float(raw.get("bid_price", 0.0) or 0.0)
+        ask_price = float(raw.get("ask_price", 0.0) or 0.0)
+        if bid_price == 0.0 and ask_price == 0.0:
+            count = self._zero_book_counter.get(secid, 0) + 1
+            self._zero_book_counter[secid] = count
+            if count >= 20 and secid not in self._zero_book_warned:
+                logger.warning(
+                    "ZERO_BOOK | tag=%s | secid=%s | depth prices are 0 - check Dhan depth entitlement/segment/subscription",
+                    tag,
+                    secid,
+                )
+                self._zero_book_warned.add(secid)
+        else:
+            self._zero_book_counter[secid] = 0
+            self._zero_book_warned.discard(secid)
+
+    def _start_optional_full_quote_sampler(self) -> None:
+        if not (self.settings.full_quote_sampler_enabled and self.full_quote_secid_tag):
+            return
+        try:
+            sampler = FullMarketQuoteSampler(
+                client_id=self.settings.credentials.client_id,
+                token=self.settings.credentials.access_token,
+                secid_tag_map=self.full_quote_secid_tag,
+                settings=self.settings,
+            )
+            threading.Thread(target=sampler.run, name="FullQuoteSampler", daemon=True).start()
+            logger.info("Full marketfeed sampler started | instruments=%s", len(self.full_quote_secid_tag))
+        except Exception:
+            logger.exception("Full marketfeed sampler not started")
+
+    def _heartbeat_loop(self) -> None:
+        last_heartbeat = 0.0
+        logger.info("LIVE: INSTITUTIONAL OPTIONS ENGINE ACTIVE")
+        while True:
+            if not self.market_open():
+                logger.info("Market closed. Sleeping.")
+                time.sleep(60.0)
+                continue
+
+            now = time.time()
+            if now - last_heartbeat >= self.settings.heartbeat_sec:
+                last_heartbeat = now
+                logger.info("%s ENGINE_RUNNING", datetime.now(self.settings.timezone).strftime("%H:%M:%S"))
+
+            time.sleep(1.0)
+
+
+def build_runtime(settings: RuntimeSettings) -> TradingRuntimeCoordinator:
+    try:
+        download_master_csv(settings.master_url, settings.csv_file)
+    except Exception:
+        logger.exception("CSV download failed. Continuing with existing file.")
+
+    master = InstrumentMaster(settings.csv_file, debug=False)
+    feature_builder = DepthMicroFeatureBuilder()
+    momentum_engine = OptionsMomentumEngine()
+    paper_trader = PaperTradeManager(capital=settings.capital)
+    decision_engine = InstitutionalDecisionEngine(debug=True)
+    trailing_exit_engine = InstitutionalTrailingExitEngine(debug=True)
+    structure_exit_engine = StructureExitEngine(debug=True)
+    market_engine = MarketStateEngine()
+    turn_engine = TurnDetectionEngine()
+    selector = OptionChainSelector(
+        access_token=settings.credentials.access_token,
+        client_id=settings.credentials.client_id,
+        instrument_master=master,
+        strike_step_map=settings.strike_step,
+        mode=settings.selector_mode,
+        max_steps_each_side=settings.selector_steps_each_side,
+        debug=True,
+    )
+    ltp_client = DhanLtpRestEngine(
+        access_token=settings.credentials.access_token,
+        client_id=settings.credentials.client_id,
+        debug=True,
+    )
+    ltp_streamer = RestLtpStreamer(ltp_client, poll_interval_sec=settings.ltp_poll_sec)
+
+    coordinator = TradingRuntimeCoordinator(
+        settings=settings,
+        master=master,
+        feature_builder=feature_builder,
+        momentum_engine=momentum_engine,
+        paper_trader=paper_trader,
+        decision_engine=decision_engine,
+        trailing_exit_engine=trailing_exit_engine,
+        structure_exit_engine=structure_exit_engine,
+        market_engine=market_engine,
+        turn_engine=turn_engine,
+        selector=selector,
+        ltp_streamer=ltp_streamer,
+        future_quote_stream=None,
+        option_depth_stream=None,
+    )
+    coordinator.future_quote_stream = FutureQuoteStream(
+        client_id=settings.credentials.client_id,
+        token=settings.credentials.access_token,
+        exchange_segment=settings.future_exchange_segment,
+        on_quote=coordinator.on_future_quote,
+        debug=settings.future_quote_stream_debug,
+    )
+    coordinator.option_depth_stream = OptionDepthStream(
+        client_id=settings.credentials.client_id,
+        token=settings.credentials.access_token,
+        exchange_segment=settings.option_exchange_segment,
+        on_depth=coordinator.on_option_depth,
+    )
+    return coordinator
