@@ -12,7 +12,6 @@ load_dotenv()
 
 from instrument_master import InstrumentMaster
 from dhan_async_depth_adapter import DhanAsyncDepthAdapter
-from ltp_rest_engine import DhanLtpRestEngine
 
 from depth_micro_features import DepthMicroFeatureBuilder
 from options_momentum_engine import OptionsMomentumEngine
@@ -38,8 +37,6 @@ STRIKE_STEP = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
 
 OPT_EXCHANGE_SEGMENT_20D = "NSE_FNO"
 
-REST_POLL_INTERVAL_SEC = 1.1
-REST_MAX_WAIT_SEC = 45
 HEARTBEAT_SEC = 30.0
 FULL_QUOTE_REQ_CODE = 21
 FULL_QUOTE_SEGMENT = 2
@@ -200,7 +197,7 @@ class FullMarketQuoteSampler:
 
 # ================= MAIN =================
 def main():
-    print("🚀 MODE: WS_OPTIONS + REST_UNDERLYING_ONLY")
+    print("🚀 MODE: PURE_WS (FUT + OPTIONS)")
 
     token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
     client_id = os.getenv("DHAN_CLIENT_ID", "").strip()
@@ -214,12 +211,6 @@ def main():
 
     # -------- Core objects --------
     master = InstrumentMaster(CSV_FILE)
-
-    ltp_rest = DhanLtpRestEngine(
-        access_token=token,
-        client_id=client_id,
-        debug=True
-    )
 
     feature_builder = DepthMicroFeatureBuilder()
     momentum_engine = OptionsMomentumEngine()
@@ -255,7 +246,6 @@ def main():
     fut_ltp = {k: 0.0 for k in INDEXES}
     zero_book_counter = {}
     zero_book_warned = set()
-    underlying_poll_started = threading.Event()
     live_state = {
         "NIFTY": {
             "ce": None,
@@ -267,39 +257,6 @@ def main():
             "last_turn_signal": None
         }
     }
-
-    def fetch_underlying_updates():
-        fut_values = []
-
-        for idx in INDEXES:
-            rest_targets = [
-                (fut_secids[idx], f"{idx}_FUT"),
-            ]
-            for secid, tag in rest_targets:
-                # Hard block option secids from REST LTP path.
-                if "CE" in tag or "PE" in tag:
-                    continue
-                fut_values.append(int(secid))
-
-        # REST LTP is restricted to underlying futures only.
-        payload = {
-            "NSE_FNO": fut_values
-        } if fut_values else {}
-
-        ltp_map = ltp_rest.fetch_ltp_map(payload) or {}
-        if not ltp_map:
-            print("⚠️ REST_EMPTY_SKIP")
-            return {}
-        updates = {}
-
-        for idx in INDEXES:
-            fut_secid = fut_secids[idx]
-            fut_price = float(ltp_map.get(fut_secid, 0.0) or 0.0)
-
-            if fut_price > 0.0:
-                updates[idx] = {"ltp": fut_price, "source": "FUT", "secid": fut_secid}
-
-        return updates
 
     def seed_underlying_from_selection(idx: str, selection: dict):
         if float(fut_ltp.get(idx, 0.0) or 0.0) > 0.0:
@@ -327,76 +284,30 @@ def main():
             f"secid={spot_secids[idx]} | new={chain_ltp:.2f}"
         )
 
-    def apply_underlying_updates(updates: dict, event_name: str):
-        for idx, info in updates.items():
-            new_ltp = float(info["ltp"])
-            source = str(info["source"])
-            secid = int(info["secid"])
-            old_ltp = float(fut_ltp.get(idx, 0.0) or 0.0)
-            old_source = underlying_source.get(idx)
-
-            fut_ltp[idx] = new_ltp
-            underlying_source[idx] = source
-
-            if idx in live_state:
-                live_state[idx]["underlying"] = new_ltp
-
-            if old_source != source or abs(new_ltp - old_ltp) > 0:
-                print(
-                    f"UNDERLYING {event_name} | {idx} | src={source} | secid={secid} | "
-                    f"old={old_ltp:.2f} | new={new_ltp:.2f}"
-                )
-
-    def _legacy_underlying_poll_loop():
-        while True:
-            try:
-                if market_open():
-                    ltp_map = ltp_rest.fetch_ltp_map({
-                        "NSE_FNO": list(fut_secids.values())
-                    })
-                    if ltp_map:
-                        for idx, secid in fut_secids.items():
-                            if secid not in ltp_map:
-                                continue
-                            new_ltp = float(ltp_map[secid] or 0.0)
-                            old_ltp = float(fut_ltp.get(idx, 0.0) or 0.0)
-                            fut_ltp[idx] = new_ltp
-                            if idx in live_state:
-                                live_state[idx]["underlying"] = new_ltp
-                            if abs(new_ltp - old_ltp) > 0:
-                                print(f"📈 UNDERLYING_TICK | {idx} | old={old_ltp:.2f} | new={new_ltp:.2f}")
-                    time.sleep(1.2)
-                else:
-                    time.sleep(5)
-            except Exception as e:
-                print(f"❌ UNDERLYING_POLL_ERROR | {e}")
-                time.sleep(2)
-
-    def underlying_poll_loop():
-        while True:
-            try:
-                if market_open():
-                    updates = fetch_underlying_updates()
-                    if updates:
-                        apply_underlying_updates(updates, "TICK")
-                    time.sleep(1.2)
-                else:
-                    time.sleep(5)
-            except Exception as e:
-                print(f"❌ UNDERLYING_POLL_ERROR | {e}")
-                time.sleep(2)
-
-    def start_underlying_poller():
-        if underlying_poll_started.is_set():
-            return
-        underlying_poll_started.set()
-        threading.Thread(target=underlying_poll_loop, name="UnderlyingPoller", daemon=True).start()
-
     # ==================================================
     # OPTION DEPTH CALLBACK (INSTITUTIONAL FLOW)
     # ==================================================
     def on_opt_depth(secid: int, tag: str, bid, ask):
         try:
+            # FUTURE PRICE FEED
+            if "FUT" in tag:
+                best_bid = float(bid.prices[0] if bid.prices else 0)
+                best_ask = float(ask.prices[0] if ask.prices else 0)
+
+                if best_bid > 0 and best_ask > 0:
+                    fut_price = (best_bid + best_ask) / 2
+
+                    idx = tag.replace("FUT", "")
+
+                    old_price = fut_ltp.get(idx, 0.0)
+                    fut_ltp[idx] = fut_price
+                    live_state[idx]["underlying"] = fut_price
+
+                    if abs(fut_price - old_price) > 0:
+                        print(f"📈 FUT_WS | {idx} | {fut_price:.2f}")
+
+                return
+
             if not market_open():
                 return
 
@@ -581,61 +492,26 @@ def main():
 
     depth_adapter.start()
 
+    fut_instruments = []
+    for idx in INDEXES:
+        fut_secid = str(fut_secids[idx])
+        fut_instruments.append((2, fut_secid, f"{idx}FUT"))
+
+    print("📡 Subscribing FUTURE first...")
+    depth_adapter.subscribe(fut_instruments)
+
     # ================= FUT LTP =================
-    print("\n⏳ Fetching initial underlying LTP...")
-    t0 = time.time()
-    last_hb = 0.0
-
-    while True:
-        now = time.time()
-
-        if now - last_hb >= HEARTBEAT_SEC:
-            last_hb = now
-            print(
-                f"🫀 {datetime.now(IST).strftime('%H:%M:%S')} HEARTBEAT | "
-                + " | ".join([
-                    f"{k}:{fut_ltp[k]:.2f}({underlying_source.get(k, 'NA')})"
-                    for k in INDEXES
-                ])
-            )
-
-        if now - t0 > REST_MAX_WAIT_SEC:
-            print("⚠️ Underlying LTP timeout | continuing with option-chain bootstrap")
-            start_underlying_poller()
-            break
-
-        updates = fetch_underlying_updates()
-        if updates:
-            apply_underlying_updates(updates, "UPDATE")
-
-            if all(fut_ltp[i] > 0 for i in INDEXES):
-                print("✅ Initial underlying LTP captured.")
-                start_underlying_poller()
-                break
-
-            time.sleep(REST_POLL_INTERVAL_SEC)
-            continue
-
-        ltp_map = ltp_rest.fetch_ltp_map({
-            "NSE_FNO": list(fut_secids.values())
-        })
-
-        if ltp_map:
-            for idx, secid in fut_secids.items():
-                if secid in ltp_map:
-                    fut_ltp[idx] = float(ltp_map[secid] or 0.0)
-                    if idx in live_state:
-                        live_state[idx]["underlying"] = fut_ltp[idx]
-                        print(f"📈 UNDERLYING_UPDATE | {idx} | ltp={fut_ltp[idx]}")
-
-            if all(fut_ltp[i] > 0 for i in INDEXES):
-                print("✅ Initial underlying LTP captured.")
-                start_underlying_poller()
-                break
-
-        time.sleep(REST_POLL_INTERVAL_SEC)
 
     # ================= OPTION SUBSCRIPTION =================
+    print("\n⏳ Waiting for FUTURE price before selecting options...")
+
+    while True:
+        ready = all(fut_ltp[idx] > 0 for idx in INDEXES)
+        if ready:
+            print("✅ FUTURE price ready — selecting options...")
+            break
+        time.sleep(0.5)
+
     print("\n🎯 Subscribing OPTIONS...")
     full_quote_secid_tag = {}
 
