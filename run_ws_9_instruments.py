@@ -240,11 +240,15 @@ def main():
         debug=True
     )
 
-    # -------- FUT security IDs --------
+    # -------- Underlying routes --------
     fut_secids = {}
+    spot_secids = {}
+    underlying_source = {}
     for idx in INDEXES:
         fut = master.get_nearest_future(idx)
         fut_secids[idx] = int(fut["security_id"])
+        spot_secids[idx] = int(master.get_index_security_id(idx))
+        underlying_source[idx] = "INIT"
 
     fut_ltp = {k: 0.0 for k in INDEXES}
     zero_book_counter = {}
@@ -261,7 +265,62 @@ def main():
         }
     }
 
-    def underlying_poll_loop():
+    def fetch_underlying_updates():
+        fut_values = []
+        spot_values = []
+
+        for idx in INDEXES:
+            if underlying_source.get(idx) == "SPOT":
+                spot_values.append(spot_secids[idx])
+                continue
+
+            fut_values.append(fut_secids[idx])
+            spot_values.append(spot_secids[idx])
+
+        payload = {}
+        if fut_values:
+            payload["NSE_FNO"] = fut_values
+        if spot_values:
+            payload["IDX_I"] = spot_values
+
+        ltp_map = ltp_rest.fetch_ltp_map(payload) or {}
+        updates = {}
+
+        for idx in INDEXES:
+            fut_secid = fut_secids[idx]
+            spot_secid = spot_secids[idx]
+
+            fut_price = float(ltp_map.get(fut_secid, 0.0) or 0.0)
+            spot_price = float(ltp_map.get(spot_secid, 0.0) or 0.0)
+
+            if fut_price > 0.0:
+                updates[idx] = {"ltp": fut_price, "source": "FUT", "secid": fut_secid}
+            elif spot_price > 0.0:
+                updates[idx] = {"ltp": spot_price, "source": "SPOT", "secid": spot_secid}
+
+        return updates
+
+    def apply_underlying_updates(updates: dict, event_name: str):
+        for idx, info in updates.items():
+            new_ltp = float(info["ltp"])
+            source = str(info["source"])
+            secid = int(info["secid"])
+            old_ltp = float(fut_ltp.get(idx, 0.0) or 0.0)
+            old_source = underlying_source.get(idx)
+
+            fut_ltp[idx] = new_ltp
+            underlying_source[idx] = source
+
+            if idx in live_state:
+                live_state[idx]["underlying"] = new_ltp
+
+            if old_source != source or abs(new_ltp - old_ltp) > 0:
+                print(
+                    f"UNDERLYING {event_name} | {idx} | src={source} | secid={secid} | "
+                    f"old={old_ltp:.2f} | new={new_ltp:.2f}"
+                )
+
+    def _legacy_underlying_poll_loop():
         while True:
             try:
                 if market_open():
@@ -279,6 +338,20 @@ def main():
                                 live_state[idx]["underlying"] = new_ltp
                             if abs(new_ltp - old_ltp) > 0:
                                 print(f"📈 UNDERLYING_TICK | {idx} | old={old_ltp:.2f} | new={new_ltp:.2f}")
+                    time.sleep(1.2)
+                else:
+                    time.sleep(5)
+            except Exception as e:
+                print(f"❌ UNDERLYING_POLL_ERROR | {e}")
+                time.sleep(2)
+
+    def underlying_poll_loop():
+        while True:
+            try:
+                if market_open():
+                    updates = fetch_underlying_updates()
+                    if updates:
+                        apply_underlying_updates(updates, "TICK")
                     time.sleep(1.2)
                 else:
                     time.sleep(5)
@@ -476,7 +549,7 @@ def main():
     depth_adapter.start()
 
     # ================= FUT LTP =================
-    print("\n⏳ Fetching initial FUT LTP...")
+    print("\n⏳ Fetching initial underlying LTP...")
     t0 = time.time()
     last_hb = 0.0
 
@@ -487,12 +560,27 @@ def main():
             last_hb = now
             print(
                 f"🫀 {datetime.now(IST).strftime('%H:%M:%S')} HEARTBEAT | "
-                + " | ".join([f"{k}:{fut_ltp[k]:.2f}" for k in INDEXES])
+                + " | ".join([
+                    f"{k}:{fut_ltp[k]:.2f}({underlying_source.get(k, 'NA')})"
+                    for k in INDEXES
+                ])
             )
 
         if now - t0 > REST_MAX_WAIT_SEC:
-            print("⚠️ FUT LTP timeout")
+            print("⚠️ Underlying LTP timeout")
             break
+
+        updates = fetch_underlying_updates()
+        if updates:
+            apply_underlying_updates(updates, "UPDATE")
+
+            if all(fut_ltp[i] > 0 for i in INDEXES):
+                print("✅ Initial underlying LTP captured.")
+                threading.Thread(target=underlying_poll_loop, name="UnderlyingPoller", daemon=True).start()
+                break
+
+            time.sleep(REST_POLL_INTERVAL_SEC)
+            continue
 
         ltp_map = ltp_rest.fetch_ltp_map({
             "NSE_FNO": list(fut_secids.values())
@@ -507,7 +595,7 @@ def main():
                         print(f"📈 UNDERLYING_UPDATE | {idx} | ltp={fut_ltp[idx]}")
 
             if all(fut_ltp[i] > 0 for i in INDEXES):
-                print("✅ Initial FUT LTP captured.")
+                print("✅ Initial underlying LTP captured.")
                 threading.Thread(target=underlying_poll_loop, name="UnderlyingPoller", daemon=True).start()
                 break
 
