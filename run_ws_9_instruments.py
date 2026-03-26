@@ -265,6 +265,40 @@ def main():
         }
     }
     state_store = {"future": None}
+    underlying_poller_started = False
+
+    def fetch_underlying_updates():
+        rest_payload = {"NSE_FNO": [fut_secids[idx] for idx in INDEXES]}
+        ltp_map = ltp_rest.fetch_ltp_map(rest_payload) or {}
+        updates = {}
+        for idx in INDEXES:
+            fut_price = float(ltp_map.get(fut_secids[idx], 0.0) or 0.0)
+            if fut_price > 0:
+                updates[idx] = fut_price
+        return updates
+
+    def apply_underlying_updates(updates: dict):
+        applied = False
+        for idx, fut_price in updates.items():
+            fut_ltp[idx] = float(fut_price)
+            live_state[idx]["underlying"] = float(fut_price)
+            state_store["future"] = {"ltp": float(fut_price), "pressure_score": 0.0}
+            underlying_source[idx] = "REST_FUT"
+            applied = True
+        return applied
+
+    def underlying_captured() -> bool:
+        return all(fut_ltp[idx] > 0 for idx in INDEXES)
+
+    def underlying_poll_loop():
+        while True:
+            try:
+                updates = fetch_underlying_updates()
+                if updates:
+                    apply_underlying_updates(updates)
+            except Exception as e:
+                print("⚠️ UNDERLYING_POLL_ERROR:", e)
+            time.sleep(3.2)
 
     # ==================================================
     # OPTION DEPTH CALLBACK (INSTITUTIONAL FLOW)
@@ -463,22 +497,25 @@ def main():
 
     # ================= FUT LTP (REST) =================
     print("\n⏳ Fetching FUTURE LTP via REST before selecting options...")
-    rest_payload = {"NSE_FNO": [fut_secids[idx] for idx in INDEXES]}
-
+    print("✅ UNDERLYING_REST_SINGLE_PATH_ENABLED")
     while True:
-        ltp_map = ltp_rest.fetch_ltp_map(rest_payload) or {}
-        for idx in INDEXES:
-            fut_price = float(ltp_map.get(fut_secids[idx], 0.0) or 0.0)
-            if fut_price > 0:
-                fut_ltp[idx] = fut_price
-                live_state[idx]["underlying"] = fut_price
-                state_store["future"] = {"ltp": fut_price, "pressure_score": 0.0}
+        updates = fetch_underlying_updates()
+        if updates:
+            apply_underlying_updates(updates)
 
-        ready = all(fut_ltp[idx] > 0 for idx in INDEXES)
-        if ready:
+        if underlying_captured():
             print("✅ FUTURE REST price ready — selecting options...")
+            if not underlying_poller_started:
+                threading.Thread(
+                    target=underlying_poll_loop,
+                    name="UnderlyingPollLoop",
+                    daemon=True
+                ).start()
+                underlying_poller_started = True
+                print("✅ UNDERLYING_POLLER_STARTED")
             break
-        time.sleep(0.5)
+        print("⏳ UNDERLYING_STARTUP_RETRY")
+        time.sleep(3.2)
 
     # ================= OPTION SUBSCRIPTION =================
 
@@ -550,15 +587,7 @@ def main():
             last_hb = now
             print(f"🫀 {datetime.now(IST).strftime('%H:%M:%S')} ENGINE_RUNNING")
 
-        ltp_map = ltp_rest.fetch_ltp_map(rest_payload) or {}
-        for idx in INDEXES:
-            fut_price = float(ltp_map.get(fut_secids[idx], 0.0) or 0.0)
-            if fut_price > 0:
-                fut_ltp[idx] = fut_price
-                live_state[idx]["underlying"] = fut_price
-                state_store["future"] = {"ltp": fut_price, "pressure_score": 0.0}
-
-        time.sleep(2.5)
+        time.sleep(1.0)
 
 
 if __name__ == "__main__":
