@@ -67,6 +67,18 @@ class OptionChainSelector:
             "client-id": self.client_id,
         })
 
+    @staticmethod
+    def _extract_live_security_id(leg: dict):
+        for key in ("security_id", "securityId", "sec_id", "SecurityId"):
+            raw = leg.get(key)
+            if raw is None:
+                continue
+            try:
+                return int(raw)
+            except Exception:
+                continue
+        return None
+
     # --------------------------------------------------
     # Rate limit: 1 call / 3 seconds (Dhan rule)
     # --------------------------------------------------
@@ -367,25 +379,42 @@ class OptionChainSelector:
             base_score, r = self._score_with_reason(ce_leg)
             s = base_score - (ce_meta["premium_penalty"] * wp) - (ce_meta["delta_penalty"] * wd)
             if not best_ce or s > best_ce["score"]:
-                best_ce = dict(score=s, strike=strike, reason=r, **ce_meta)
+                best_ce = dict(
+                    score=s,
+                    strike=strike,
+                    reason=r,
+                    live_security_id=self._extract_live_security_id(ce_leg),
+                    **ce_meta,
+                )
 
         for strike, pe_leg, pe_meta in pe_candidates:
             base_score, r = self._score_with_reason(pe_leg)
             s = base_score - (pe_meta["premium_penalty"] * wp) - (pe_meta["delta_penalty"] * wd)
             if not best_pe or s > best_pe["score"]:
-                best_pe = dict(score=s, strike=strike, reason=r, **pe_meta)
+                best_pe = dict(
+                    score=s,
+                    strike=strike,
+                    reason=r,
+                    live_security_id=self._extract_live_security_id(pe_leg),
+                    **pe_meta,
+                )
 
         out = {}
 
         def build(side, obj):
             if not obj:
                 return None
-            secid = self.im.find_option_security_id(index, expiry, obj["strike"], side)
+            secid = obj.get("live_security_id")
+            secid_source = "optionchain"
+            if not secid:
+                secid = self.im.find_option_security_id(index, expiry, obj["strike"], side)
+                secid_source = "csv"
             payload = {
                 "index": index,
                 "side": side,
                 "strike": obj["strike"],
-                "security_id": secid,
+                "security_id": int(secid),
+                "security_id_source": secid_source,
                 "score": round(obj["score"], 3),
                 "expiry": expiry_str,
                 "atm": atm,
@@ -398,6 +427,11 @@ class OptionChainSelector:
                     "delta": round(float(obj["delta"]), 4),
                     "spread_pct": round(float(obj["spread_pct"]), 6),
                 })
+                if secid_source != "optionchain":
+                    print(
+                        f"⚠️ SECURITY_ID_FALLBACK | {index} {side} {obj['strike']} "
+                        f"| using CSV lookup because option-chain security_id was missing"
+                    )
             return payload
 
         ce = build("CE", best_ce)
