@@ -200,6 +200,8 @@ class FullMarketQuoteSampler:
 
 # ================= MAIN =================
 def main():
+    print("🚀 MODE: WS_OPTIONS + REST_UNDERLYING_ONLY")
+
     token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
     client_id = os.getenv("DHAN_CLIENT_ID", "").strip()
     if not token or not client_id:
@@ -268,36 +270,34 @@ def main():
 
     def fetch_underlying_updates():
         fut_values = []
-        spot_values = []
 
         for idx in INDEXES:
-            if underlying_source.get(idx) == "SPOT":
-                spot_values.append(spot_secids[idx])
-                continue
+            rest_targets = [
+                (fut_secids[idx], f"{idx}_FUT"),
+            ]
+            for secid, tag in rest_targets:
+                # Hard block option secids from REST LTP path.
+                if "CE" in tag or "PE" in tag:
+                    continue
+                fut_values.append(int(secid))
 
-            fut_values.append(fut_secids[idx])
-            spot_values.append(spot_secids[idx])
-
-        payload = {}
-        if fut_values:
-            payload["NSE_FNO"] = fut_values
-        if spot_values:
-            payload["IDX_I"] = spot_values
+        # REST LTP is restricted to underlying futures only.
+        payload = {
+            "NSE_FNO": fut_values
+        } if fut_values else {}
 
         ltp_map = ltp_rest.fetch_ltp_map(payload) or {}
+        if not ltp_map:
+            print("⚠️ REST_EMPTY_SKIP")
+            return {}
         updates = {}
 
         for idx in INDEXES:
             fut_secid = fut_secids[idx]
-            spot_secid = spot_secids[idx]
-
             fut_price = float(ltp_map.get(fut_secid, 0.0) or 0.0)
-            spot_price = float(ltp_map.get(spot_secid, 0.0) or 0.0)
 
             if fut_price > 0.0:
                 updates[idx] = {"ltp": fut_price, "source": "FUT", "secid": fut_secid}
-            elif spot_price > 0.0:
-                updates[idx] = {"ltp": spot_price, "source": "SPOT", "secid": spot_secid}
 
         return updates
 

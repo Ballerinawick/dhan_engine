@@ -115,6 +115,10 @@ class DhanLtpRestEngine:
                 print("⚠️ LTP REST failed this cycle (will retry next second)")
             time.sleep(1.0)
             return {}
+        if not ltp_map:
+            print("⚠️ REST_EMPTY_SKIP")
+            time.sleep(1.0)
+            return {}
 
         # Respect 1 req/sec
         time.sleep(1.0)
