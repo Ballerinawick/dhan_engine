@@ -253,6 +253,7 @@ def main():
     fut_ltp = {k: 0.0 for k in INDEXES}
     zero_book_counter = {}
     zero_book_warned = set()
+    underlying_poll_started = threading.Event()
     live_state = {
         "NIFTY": {
             "ce": None,
@@ -299,6 +300,32 @@ def main():
                 updates[idx] = {"ltp": spot_price, "source": "SPOT", "secid": spot_secid}
 
         return updates
+
+    def seed_underlying_from_selection(idx: str, selection: dict):
+        if float(fut_ltp.get(idx, 0.0) or 0.0) > 0.0:
+            return
+
+        leg = selection.get("CE") or selection.get("PE") or selection.get("BEST")
+        if not leg:
+            return
+
+        try:
+            chain_ltp = float(leg.get("underlying_ltp") or 0.0)
+        except Exception:
+            return
+
+        if chain_ltp <= 0.0:
+            return
+
+        fut_ltp[idx] = chain_ltp
+        underlying_source[idx] = "CHAIN"
+        if idx in live_state:
+            live_state[idx]["underlying"] = chain_ltp
+
+        print(
+            f"UNDERLYING CHAIN_BOOTSTRAP | {idx} | src=CHAIN | "
+            f"secid={spot_secids[idx]} | new={chain_ltp:.2f}"
+        )
 
     def apply_underlying_updates(updates: dict, event_name: str):
         for idx, info in updates.items():
@@ -358,6 +385,12 @@ def main():
             except Exception as e:
                 print(f"❌ UNDERLYING_POLL_ERROR | {e}")
                 time.sleep(2)
+
+    def start_underlying_poller():
+        if underlying_poll_started.is_set():
+            return
+        underlying_poll_started.set()
+        threading.Thread(target=underlying_poll_loop, name="UnderlyingPoller", daemon=True).start()
 
     # ==================================================
     # OPTION DEPTH CALLBACK (INSTITUTIONAL FLOW)
@@ -567,7 +600,8 @@ def main():
             )
 
         if now - t0 > REST_MAX_WAIT_SEC:
-            print("⚠️ Underlying LTP timeout")
+            print("⚠️ Underlying LTP timeout | continuing with option-chain bootstrap")
+            start_underlying_poller()
             break
 
         updates = fetch_underlying_updates()
@@ -576,7 +610,7 @@ def main():
 
             if all(fut_ltp[i] > 0 for i in INDEXES):
                 print("✅ Initial underlying LTP captured.")
-                threading.Thread(target=underlying_poll_loop, name="UnderlyingPoller", daemon=True).start()
+                start_underlying_poller()
                 break
 
             time.sleep(REST_POLL_INTERVAL_SEC)
@@ -596,7 +630,7 @@ def main():
 
             if all(fut_ltp[i] > 0 for i in INDEXES):
                 print("✅ Initial underlying LTP captured.")
-                threading.Thread(target=underlying_poll_loop, name="UnderlyingPoller", daemon=True).start()
+                start_underlying_poller()
                 break
 
         time.sleep(REST_POLL_INTERVAL_SEC)
@@ -610,6 +644,8 @@ def main():
             selection = selector.select_best(idx)
             if not selection:
                 continue
+
+            seed_underlying_from_selection(idx, selection)
 
             subs = []
             if "CE" in selection:

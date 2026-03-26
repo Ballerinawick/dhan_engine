@@ -29,6 +29,7 @@ class FullDepth:
 
         self._first_binary_logged = False
         self._last_message_ts = 0.0
+        self._connected_ts = 0.0
 
     @staticmethod
     def _normalize_exchange_segment(segment) -> str:
@@ -118,7 +119,8 @@ class FullDepth:
             try:
                 item = await asyncio.wait_for(self._queue.get(), timeout=65.0)
             except asyncio.TimeoutError:
-                idle_for = time.time() - self._last_message_ts if self._last_message_ts else 0.0
+                idle_anchor = self._last_message_ts or self._connected_ts
+                idle_for = time.time() - idle_anchor if idle_anchor else 0.0
                 if self._connected_evt.is_set():
                     print(
                         "WARNING DEPTH feed idle"
@@ -160,6 +162,7 @@ class FullDepth:
 
     def _on_open(self, ws):
         self._connected_evt.set()
+        self._connected_ts = time.time()
         print("DEPTH WS CONNECTED")
 
         if self._subscribed:
@@ -196,6 +199,7 @@ class FullDepth:
 
     def _on_close(self, ws, code, reason):
         self._connected_evt.clear()
+        self._connected_ts = 0.0
         print(f"WARNING DEPTH WS closed | code={code} | reason={reason}")
 
     def _push_async(self, payload):
