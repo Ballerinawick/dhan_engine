@@ -257,6 +257,7 @@ def main():
             "last_turn_signal": None
         }
     }
+    state_store = {"future": None}
 
     def seed_underlying_from_selection(idx: str, selection: dict):
         if float(fut_ltp.get(idx, 0.0) or 0.0) > 0.0:
@@ -290,6 +291,23 @@ def main():
     def on_opt_depth(secid: int, tag: str, bid, ask):
         try:
             # FUTURE PRICE FEED
+            if tag == "FUT":
+                future_features = feature_builder.build(secid, bid, ask)
+                if not future_features:
+                    return
+
+                state_store["future"] = future_features
+
+                fut_price = float(future_features.get("ltp") or 0.0)
+                if fut_price > 0:
+                    fut_ltp["NIFTY"] = fut_price
+                    live_state["NIFTY"]["underlying"] = fut_price
+                    print(
+                        f"📊 FUTURE_UPDATE | ltp={future_features['ltp']} "
+                        f"pressure={future_features['pressure_score']}"
+                    )
+                return
+
             if "FUT" in tag:
                 best_bid = float(bid.prices[0] if bid.prices else 0)
                 best_ask = float(ask.prices[0] if ask.prices else 0)
@@ -333,6 +351,10 @@ def main():
 
             # Build snapshot
             if s["ce"] and s["pe"] and s["underlying"]:
+                fut = state_store.get("future")
+                if not fut:
+                    return
+
                 snapshot = market_engine.update(
                     idx,
                     s["underlying"],
@@ -342,6 +364,8 @@ def main():
 
                 # optional: keep last snapshot
                 if snapshot:
+                    snapshot["underlying_ltp"] = fut.get("ltp")
+                    snapshot["market_pressure"] = fut.get("pressure_score")
                     s["last_snapshot"] = snapshot
                     turn_signal = turn_engine.update(snapshot)
                     if turn_signal:
@@ -547,6 +571,9 @@ def main():
 
             if subs:
                 instruments = []
+                if idx == "NIFTY":
+                    fut = master.get_nearest_future("NIFTY")
+                    instruments.append((2, str(fut["security_id"]), "FUT"))
                 for s in subs:
                     instruments.append((2, s["SecurityId"], s["tag"]))
                     full_quote_secid_tag[int(s["SecurityId"])] = s["tag"]
