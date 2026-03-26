@@ -404,17 +404,23 @@ class OptionChainSelector:
         def build(side, obj):
             if not obj:
                 return None
-            secid = obj.get("live_security_id")
-            secid_source = "optionchain"
-            if not secid:
-                secid = self.im.find_option_security_id(index, expiry, obj["strike"], side)
-                secid_source = "csv"
+            secid = int(self.im.find_option_security_id(index, expiry, obj["strike"], side))
+            live_secid = obj.get("live_security_id")
+            if self.debug and live_secid:
+                try:
+                    live_secid = int(live_secid)
+                    if live_secid != secid:
+                        print(
+                            f"⚠️ OPTIONCHAIN_SECURITY_ID_MISMATCH | {index} {side} {obj['strike']} "
+                            f"| exp={expiry_str} | optionchain={live_secid} | csv={secid} | using CSV"
+                        )
+                except Exception:
+                    pass
             payload = {
                 "index": index,
                 "side": side,
                 "strike": obj["strike"],
-                "security_id": int(secid),
-                "security_id_source": secid_source,
+                "security_id": secid,
                 "score": round(obj["score"], 3),
                 "expiry": expiry_str,
                 "atm": atm,
@@ -427,11 +433,6 @@ class OptionChainSelector:
                     "delta": round(float(obj["delta"]), 4),
                     "spread_pct": round(float(obj["spread_pct"]), 6),
                 })
-                if secid_source != "optionchain":
-                    print(
-                        f"⚠️ SECURITY_ID_FALLBACK | {index} {side} {obj['strike']} "
-                        f"| using CSV lookup because option-chain security_id was missing"
-                    )
             return payload
 
         ce = build("CE", best_ce)
