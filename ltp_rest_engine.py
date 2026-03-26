@@ -84,6 +84,19 @@ class DhanLtpRestEngine:
                     except Exception:
                         continue
 
+            if self.debug:
+                requested = {int(secid) for secids in payload.values() for secid in secids}
+                received = set(out.keys())
+                missing = sorted(requested - received)
+
+                if not out:
+                    print(f"LTP REST success but no instruments returned | payload={payload}")
+                elif missing:
+                    print(f"LTP REST missing secids | secids={missing}")
+
+                if out and all(float(price or 0.0) <= 0.0 for price in out.values()):
+                    print(f"LTP REST returned only zero prices | secids={sorted(received)}")
+
             return out
 
         except requests.RequestException as e:
