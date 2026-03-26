@@ -76,7 +76,11 @@ class DhanAsyncDepthAdapter:
 
     async def _run(self):
         self._loop = asyncio.get_running_loop()
-        await self.full_depth.connect()
+        while True:
+            connected = await self.full_depth.connect()
+            if connected:
+                break
+            await asyncio.sleep(2.0)
         print("✅ ASYNC_20DEPTH_CONNECTED")
         self._connected_evt.set()
 
