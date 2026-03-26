@@ -61,7 +61,8 @@ class FullDepth:
                 connected = await asyncio.to_thread(self._connected_evt.wait, 8.0)
                 if not connected:
                     print("WARNING DEPTH WS connect wait timed out")
-            return
+                return connected
+            return True
 
         self._stop_evt.clear()
         self._connected_evt.clear()
@@ -75,6 +76,7 @@ class FullDepth:
         connected = await asyncio.to_thread(self._connected_evt.wait, 8.0)
         if not connected:
             print("WARNING DEPTH WS connect wait timed out")
+        return connected
 
     async def subscribe_async(self, instruments):
         self._subscribed = list(instruments or [])
@@ -144,7 +146,7 @@ class FullDepth:
             self._ws = ws
 
             try:
-                ws.run_forever(ping_interval=10, ping_timeout=40)
+                ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as exc:
                 print(f"ERROR DEPTH WS exception: {exc}")
             finally:

@@ -212,7 +212,7 @@ class DhanDepth20Client:
             on_error=self._on_error,
             on_close=self._on_close,
         )
-        self.ws.run_forever(ping_interval=10, ping_timeout=40)
+        self.ws.run_forever(ping_interval=20, ping_timeout=10)
 
     def subscribe_many(self, instruments: List[dict]):
         """
