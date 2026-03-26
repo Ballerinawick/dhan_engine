@@ -22,6 +22,7 @@ from institutional_trailing_exit_engine import InstitutionalTrailingExitEngine
 from structure_exit_engine import StructureExitEngine
 from market_state_engine import MarketStateEngine
 from turn_detection_engine import TurnDetectionEngine
+from ltp_rest_engine import DhanLtpRestEngine
 
 try:
     from dhanhq.marketfeed import DhanFeed
@@ -197,7 +198,7 @@ class FullMarketQuoteSampler:
 
 # ================= MAIN =================
 def main():
-    print("🚀 MODE: PURE_WS (FUT + OPTIONS)")
+    print("✅ MODE: REST_UNDERLYING + WS_OPTIONS (STABLE)")
 
     token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
     client_id = os.getenv("DHAN_CLIENT_ID", "").strip()
@@ -233,6 +234,12 @@ def main():
         debug=True
     )
 
+    ltp_rest = DhanLtpRestEngine(
+        access_token=token,
+        client_id=client_id,
+        debug=True
+    )
+
     # -------- Underlying routes --------
     fut_secids = {}
     spot_secids = {}
@@ -259,73 +266,11 @@ def main():
     }
     state_store = {"future": None}
 
-    def seed_underlying_from_selection(idx: str, selection: dict):
-        if float(fut_ltp.get(idx, 0.0) or 0.0) > 0.0:
-            return
-
-        leg = selection.get("CE") or selection.get("PE") or selection.get("BEST")
-        if not leg:
-            return
-
-        try:
-            chain_ltp = float(leg.get("underlying_ltp") or 0.0)
-        except Exception:
-            return
-
-        if chain_ltp <= 0.0:
-            return
-
-        fut_ltp[idx] = chain_ltp
-        underlying_source[idx] = "CHAIN"
-        if idx in live_state:
-            live_state[idx]["underlying"] = chain_ltp
-
-        print(
-            f"UNDERLYING CHAIN_BOOTSTRAP | {idx} | src=CHAIN | "
-            f"secid={spot_secids[idx]} | new={chain_ltp:.2f}"
-        )
-
     # ==================================================
     # OPTION DEPTH CALLBACK (INSTITUTIONAL FLOW)
     # ==================================================
     def on_opt_depth(secid: int, tag: str, bid, ask):
         try:
-            # FUTURE PRICE FEED
-            if tag == "FUT":
-                future_features = feature_builder.build(secid, bid, ask)
-                if not future_features:
-                    return
-
-                state_store["future"] = future_features
-
-                fut_price = float(future_features.get("ltp") or 0.0)
-                if fut_price > 0:
-                    fut_ltp["NIFTY"] = fut_price
-                    live_state["NIFTY"]["underlying"] = fut_price
-                    print(
-                        f"📊 FUTURE_UPDATE | ltp={future_features['ltp']} "
-                        f"pressure={future_features['pressure_score']}"
-                    )
-                return
-
-            if "FUT" in tag:
-                best_bid = float(bid.prices[0] if bid.prices else 0)
-                best_ask = float(ask.prices[0] if ask.prices else 0)
-
-                if best_bid > 0 and best_ask > 0:
-                    fut_price = (best_bid + best_ask) / 2
-
-                    idx = tag.replace("FUT", "")
-
-                    old_price = fut_ltp.get(idx, 0.0)
-                    fut_ltp[idx] = fut_price
-                    live_state[idx]["underlying"] = fut_price
-
-                    if abs(fut_price - old_price) > 0:
-                        print(f"📈 FUT_WS | {idx} | {fut_price:.2f}")
-
-                return
-
             if not market_open():
                 return
 
@@ -516,25 +461,26 @@ def main():
 
     depth_adapter.start()
 
-    fut_instruments = []
-    for idx in INDEXES:
-        fut_secid = str(fut_secids[idx])
-        fut_instruments.append((2, fut_secid, f"{idx}FUT"))
-
-    print("📡 Subscribing FUTURE first...")
-    depth_adapter.subscribe(fut_instruments)
-
-    # ================= FUT LTP =================
-
-    # ================= OPTION SUBSCRIPTION =================
-    print("\n⏳ Waiting for FUTURE price before selecting options...")
+    # ================= FUT LTP (REST) =================
+    print("\n⏳ Fetching FUTURE LTP via REST before selecting options...")
+    rest_payload = {"NSE_FNO": [fut_secids[idx] for idx in INDEXES]}
 
     while True:
+        ltp_map = ltp_rest.fetch_ltp_map(rest_payload) or {}
+        for idx in INDEXES:
+            fut_price = float(ltp_map.get(fut_secids[idx], 0.0) or 0.0)
+            if fut_price > 0:
+                fut_ltp[idx] = fut_price
+                live_state[idx]["underlying"] = fut_price
+                state_store["future"] = {"ltp": fut_price, "pressure_score": 0.0}
+
         ready = all(fut_ltp[idx] > 0 for idx in INDEXES)
         if ready:
-            print("✅ FUTURE price ready — selecting options...")
+            print("✅ FUTURE REST price ready — selecting options...")
             break
         time.sleep(0.5)
+
+    # ================= OPTION SUBSCRIPTION =================
 
     print("\n🎯 Subscribing OPTIONS...")
     full_quote_secid_tag = {}
@@ -544,8 +490,6 @@ def main():
             selection = selector.select_best(idx)
             if not selection:
                 continue
-
-            seed_underlying_from_selection(idx, selection)
 
             subs = []
             if "CE" in selection:
@@ -571,9 +515,6 @@ def main():
 
             if subs:
                 instruments = []
-                if idx == "NIFTY":
-                    fut = master.get_nearest_future("NIFTY")
-                    instruments.append((2, str(fut["security_id"]), "FUT"))
                 for s in subs:
                     instruments.append((2, s["SecurityId"], s["tag"]))
                     full_quote_secid_tag[int(s["SecurityId"])] = s["tag"]
@@ -609,7 +550,15 @@ def main():
             last_hb = now
             print(f"🫀 {datetime.now(IST).strftime('%H:%M:%S')} ENGINE_RUNNING")
 
-        time.sleep(0.2)
+        ltp_map = ltp_rest.fetch_ltp_map(rest_payload) or {}
+        for idx in INDEXES:
+            fut_price = float(ltp_map.get(fut_secids[idx], 0.0) or 0.0)
+            if fut_price > 0:
+                fut_ltp[idx] = fut_price
+                live_state[idx]["underlying"] = fut_price
+                state_store["future"] = {"ltp": fut_price, "pressure_score": 0.0}
+
+        time.sleep(2.5)
 
 
 if __name__ == "__main__":
