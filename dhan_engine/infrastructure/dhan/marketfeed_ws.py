@@ -1,5 +1,4 @@
 import json
-import struct
 import threading
 import time
 from dataclasses import dataclass
@@ -7,9 +6,13 @@ from typing import Callable, Dict, List, Optional
 
 import websocket
 
+try:
+    from dhanhq.marketfeed import DhanFeed
+except Exception:  # pragma: no cover - optional dependency path
+    DhanFeed = None
+
 
 REQ_FULL = 21
-RESP_FULL = 8
 
 
 @dataclass
@@ -51,6 +54,16 @@ class DhanLiveMarketFeedWS:
         self._tags: Dict[int, str] = {}
         self._reconnect_attempt = 0
         self._lock = threading.Lock()
+        self._feed_parser = (
+            DhanFeed(
+                client_id=self.client_id,
+                access_token=self.token,
+                instruments=[],
+                version="v2",
+            )
+            if DhanFeed is not None
+            else None
+        )
 
     def connect(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -116,7 +129,7 @@ class DhanLiveMarketFeedWS:
             return
 
         payload = {
-            "RequestCode": REQ_FULL,
+            "RequestCode": REQ_FULL,  # must stay 21 (FULL quote mode)
             "InstrumentCount": len(self._subs),
             "InstrumentList": [
                 {
@@ -150,86 +163,50 @@ class DhanLiveMarketFeedWS:
         if self.debug:
             print(f"WS_FULLQUOTE_CLOSED | code={code} | message={message}")
 
+    def process_data(self, data: bytes):
+        if self._feed_parser is None:
+            raise RuntimeError("dhanhq is not installed. Run: pip install dhanhq")
+        return self._feed_parser.process_data(data)
+
     def _on_message(self, ws, message) -> None:
-        print("📥 WS RAW MESSAGE RECEIVED | type=", type(message))
-        if isinstance(message, str):
-            return
-
-        data = message
-        offset = 0
-        total = len(data)
-
-        while offset + 8 <= total:
-            feed_code = data[offset]
-            msg_len = struct.unpack_from("<h", data, offset + 1)[0]
-            secid = struct.unpack_from("<i", data, offset + 4)[0]
-
-            packet_len = 8 + msg_len
-            if packet_len <= 8 or offset + packet_len > total:
-                break
-
-            packet = data[offset : offset + packet_len]
-            offset += packet_len
-
-            print("📦 WS PACKET | code=", feed_code, "| secid=", secid)
-
-            if feed_code == RESP_FULL:
-                self._parse_full(secid, packet)
-
-    def _parse_full(self, secid: int, packet: bytes) -> None:
-        if len(packet) < 12:
-            print("❌ INVALID PACKET LENGTH")
-            return
-
         try:
-            ltp = struct.unpack_from("<f", packet, 8)[0]
+            if not isinstance(message, (bytes, bytearray)):
+                print("⚠️ NON-BINARY MESSAGE")
+                return
+
+            parsed = self.process_data(bytes(message))
+
+            if parsed:
+                print("✅ PARSED DATA:", parsed)
+
+                if parsed.get("type") == "Full Data":
+                    secid = int(parsed.get("security_id"))
+                    ltp = float(parsed.get("LTP"))
+                    tag = self._tags.get(secid, str(secid))
+
+                    depth = parsed.get("depth") or []
+                    bid_price = [float(item.get("bid_price", 0.0)) for item in depth]
+                    bid_qty = [int(item.get("bid_quantity", 0)) for item in depth]
+                    ask_price = [float(item.get("ask_price", 0.0)) for item in depth]
+                    ask_qty = [int(item.get("ask_quantity", 0)) for item in depth]
+
+                    print("🔥 FUTURE LTP:", secid, ltp)
+
+                    if self.on_full:
+                        self.on_full(
+                            secid,
+                            tag,
+                            ltp,
+                            QuoteDepth(
+                                bid_price=bid_price,
+                                bid_qty=bid_qty,
+                                ask_price=ask_price,
+                                ask_qty=ask_qty,
+                                ts=time.time(),
+                            ),
+                        )
         except Exception as e:
-            print("❌ LTP PARSE FAILED", e)
-            return
+            print("❌ WS ERROR:", e)
+            import traceback
 
-        depth_start = 8 + 62
-
-        bid_price: List[float] = []
-        bid_qty: List[int] = []
-        ask_price: List[float] = []
-        ask_qty: List[int] = []
-
-        try:
-            if len(packet) >= depth_start + (5 * 20):
-                for i in range(5):
-                    base = depth_start + (i * 20)
-
-                    bid_q = struct.unpack_from("<i", packet, base)[0]
-                    ask_q = struct.unpack_from("<i", packet, base + 4)[0]
-
-                    bid_p = struct.unpack_from("<f", packet, base + 12)[0]
-                    ask_p = struct.unpack_from("<f", packet, base + 16)[0]
-
-                    bid_price.append(float(bid_p))
-                    bid_qty.append(int(bid_q))
-
-                    ask_price.append(float(ask_p))
-                    ask_qty.append(int(ask_q))
-        except Exception as e:
-            print("❌ DEPTH PARSE ERROR", e)
-
-        tag = self._tags.get(secid, str(secid))
-
-        print("✅ FULL_WS_TICK RECEIVED | secid=", secid, "| ltp=", ltp)
-
-        if self.on_full:
-            try:
-                self.on_full(
-                    secid,
-                    tag,
-                    float(ltp),
-                    QuoteDepth(
-                        bid_price=bid_price,
-                        bid_qty=bid_qty,
-                        ask_price=ask_price,
-                        ask_qty=ask_qty,
-                        ts=time.time(),
-                    ),
-                )
-            except Exception as exc:
-                print("❌ CALLBACK ERROR", exc)
+            traceback.print_exc()
