@@ -73,7 +73,6 @@ class PairRuntimeState:
         payload = dict(depth_payload)
         if premium_ltp and premium_ltp > 0:
             payload["ltp"] = float(premium_ltp)
-            payload["ltp_source"] = "REST_OPTION_PREMIUM"
         return payload
 
 

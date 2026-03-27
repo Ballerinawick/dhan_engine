@@ -39,7 +39,7 @@ class RuntimeSettings:
     capital: float = 100000.0
     ltp_poll_sec: float = 1.05
     startup_wait_sec: float = 1.0
-    option_premium_stream_enabled: bool = True
+    option_premium_stream_enabled: bool = False
     full_quote_sampler_enabled: bool = True
     future_quote_stream_debug: bool = False
     timezone_name: str = "Asia/Kolkata"
@@ -73,5 +73,5 @@ def load_settings() -> RuntimeSettings:
         csv_file=_csv_file(),
         indexes=_indexes(),
         full_quote_sampler_enabled=os.getenv("ENABLE_FULL_QUOTE_SAMPLER", "1").strip() != "0",
-        option_premium_stream_enabled=os.getenv("ENABLE_OPTION_PREMIUM_STREAM", "1").strip() != "0",
+        option_premium_stream_enabled=os.getenv("ENABLE_OPTION_PREMIUM_STREAM", "0").strip() != "0",
     )
