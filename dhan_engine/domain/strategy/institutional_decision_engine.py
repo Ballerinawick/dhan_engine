@@ -167,20 +167,104 @@ class InstitutionalDecisionEngine:
                 return {"entry_allowed": False}
 
 
-            if snapshot.get("market_regime") == "COMPRESSED":
-                self._log_event(event="ENTRY_BLOCK", reason="COMPRESSION", index=index)
-                return {"entry_allowed": False}
+            print(
+                "ENTRY_CHECK →",
+                "regime=", snapshot.get("market_regime"),
+                "flow=", snapshot.get("flow_diff"),
+                "dom=", snapshot.get("dominance_score"),
+                "pressure=", snapshot.get("pressure_diff")
+            )
 
-            if abs(snapshot.get("flow_diff", 0)) < 2000:
+            # Allow strong trend inside compression
+            if snapshot.get("market_regime") == "COMPRESSED":
+                if abs(snapshot.get("dominance_score", 0)) < 0.20:
+                    self._log_event(event="ENTRY_BLOCK", reason="WEAK_COMPRESSION", index=index)
+                    return {"entry_allowed": False}
+
+            if abs(snapshot.get("flow_diff", 0)) < 1200:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_FLOW", index=index)
                 return {"entry_allowed": False}
 
-            if abs(snapshot.get("dominance_score", 0)) < 0.25:
+            if abs(snapshot.get("dominance_score", 0)) < 0.18:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_DOM", index=index)
                 return {"entry_allowed": False}
 
-            if abs(snapshot.get("pressure_diff", 0)) < 0.15:
+            if abs(snapshot.get("pressure_diff", 0)) < 0.10:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_PRESSURE", index=index)
+                return {"entry_allowed": False}
+
+            if index in self.index_active_secid and self.index_active_secid[index] in paper_trader.positions:
+                self._log_event(
+                    event="ENTRY",
+                    decision="REJECT",
+                    index=index,
+                    tag=tag,
+                    secid=secid,
+                    side=entry_side,
+                    reason="INDEX_LOCKED",
+                )
+                return {"entry_allowed": False}
+
+            if not self._cooldown_ok(index, now):
+                self._log_event(
+                    event="ENTRY",
+                    decision="REJECT",
+                    index=index,
+                    tag=tag,
+                    secid=secid,
+                    side=entry_side,
+                    reason="COOLDOWN",
+                )
+                return {"entry_allowed": False}
+
+            last_exit_side = self.index_last_exit_side.get(index)
+            is_flip = last_exit_side and last_exit_side != entry_side
+
+            if is_flip and not self._shadow_confirmed(index, entry_side, now):
+                self._log_event(
+                    event="ENTRY",
+                    decision="REJECT",
+                    index=index,
+                    tag=tag,
+                    secid=secid,
+                    side=entry_side,
+                    reason="FLIP_NO_SHADOW",
+                )
+                return {"entry_allowed": False}
+
+            if not is_flip and self.REENTRY_ALLOW_WITHOUT_STRUCT:
+                struct_ok = True
+
+            if not struct_ok:
+                self._log_event(
+                    event="ENTRY",
+                    decision="REJECT",
+                    index=index,
+                    tag=tag,
+                    secid=secid,
+                    side=entry_side,
+                    reason="STRUCT_NOT_OK",
+                )
+                return {"entry_allowed": False}
+
+            entry_accepted = paper_trader.on_entry(
+                secid=secid,
+                tag=tag,
+                side="LONG",
+                ltp=ltp,
+                lots=1,
+                reason="TURN_CONTINUATION"
+            )
+            if entry_accepted is False:
+                self._log_event(
+                    event="ENTRY",
+                    decision="REJECT",
+                    index=index,
+                    tag=tag,
+                    secid=secid,
+                    side=entry_side,
+                    reason="PAPER_TRADER_REJECT",
+                )
                 return {"entry_allowed": False}
 
             trade = {
@@ -201,100 +285,6 @@ class InstitutionalDecisionEngine:
                 momentum_engine.register_trade(secid, trade)
             else:
                 momentum_engine.active_trade[secid] = trade
-
-            if index in self.index_active_secid and self.index_active_secid[index] in paper_trader.positions:
-                self._log_event(
-                    event="ENTRY",
-                    decision="REJECT",
-                    index=index,
-                    tag=tag,
-                    secid=secid,
-                    side=entry_side,
-                    reason="INDEX_LOCKED",
-                )
-                if hasattr(momentum_engine, "clear_trade"):
-                    momentum_engine.clear_trade(secid)
-                else:
-                    momentum_engine.active_trade.pop(secid, None)
-                return {"entry_allowed": False}
-
-            if not self._cooldown_ok(index, now):
-                self._log_event(
-                    event="ENTRY",
-                    decision="REJECT",
-                    index=index,
-                    tag=tag,
-                    secid=secid,
-                    side=entry_side,
-                    reason="COOLDOWN",
-                )
-                if hasattr(momentum_engine, "clear_trade"):
-                    momentum_engine.clear_trade(secid)
-                else:
-                    momentum_engine.active_trade.pop(secid, None)
-                return {"entry_allowed": False}
-
-            last_exit_side = self.index_last_exit_side.get(index)
-            is_flip = last_exit_side and last_exit_side != entry_side
-
-            if is_flip and not self._shadow_confirmed(index, entry_side, now):
-                self._log_event(
-                    event="ENTRY",
-                    decision="REJECT",
-                    index=index,
-                    tag=tag,
-                    secid=secid,
-                    side=entry_side,
-                    reason="FLIP_NO_SHADOW",
-                )
-                if hasattr(momentum_engine, "clear_trade"):
-                    momentum_engine.clear_trade(secid)
-                else:
-                    momentum_engine.active_trade.pop(secid, None)
-                return {"entry_allowed": False}
-
-            if not is_flip and self.REENTRY_ALLOW_WITHOUT_STRUCT:
-                struct_ok = True
-
-            if not struct_ok:
-                self._log_event(
-                    event="ENTRY",
-                    decision="REJECT",
-                    index=index,
-                    tag=tag,
-                    secid=secid,
-                    side=entry_side,
-                    reason="STRUCT_NOT_OK",
-                )
-                if hasattr(momentum_engine, "clear_trade"):
-                    momentum_engine.clear_trade(secid)
-                else:
-                    momentum_engine.active_trade.pop(secid, None)
-                return {"entry_allowed": False}
-
-            entry_accepted = paper_trader.on_entry(
-                secid=secid,
-                tag=tag,
-                side="LONG",
-                ltp=ltp,
-                lots=1,
-                reason="TURN_CONTINUATION"
-            )
-            if entry_accepted is False:
-                if hasattr(momentum_engine, "clear_trade"):
-                    momentum_engine.clear_trade(secid)
-                else:
-                    momentum_engine.active_trade.pop(secid, None)
-                self._log_event(
-                    event="ENTRY",
-                    decision="REJECT",
-                    index=index,
-                    tag=tag,
-                    secid=secid,
-                    side=entry_side,
-                    reason="PAPER_TRADER_REJECT",
-                )
-                return {"entry_allowed": False}
 
             self.index_active_side[index] = entry_side
             self.index_active_secid[index] = secid
