@@ -134,14 +134,39 @@ class InstitutionalDecisionEngine:
         index = self._index_from_tag(tag)
         side = self._side_from_tag(tag)
 
-        if signal in ("REAL_BULLISH_TURN", "REAL_BEARISH_TURN"):
+        if signal == "REAL_BULLISH_TURN":
             self.last_turn_signal[index] = signal
             self._log_event(
                 event="TURN_CAPTURED",
                 index=index,
                 signal=signal,
             )
-            return {"entry_allowed": False}
+            entry_side = "CE"
+        elif signal == "REAL_BEARISH_TURN":
+            self.last_turn_signal[index] = signal
+            self._log_event(
+                event="TURN_CAPTURED",
+                index=index,
+                signal=signal,
+            )
+            entry_side = "PE"
+        else:
+            entry_side = None
+
+        if entry_side:
+            print("⚠️ FORCE ENTRY ON TURN (DEBUG MODE)")
+            print("BEFORE_PAPER_ENTRY →", secid, tag, ltp)
+            entry_accepted = paper_trader.on_entry(
+                secid=secid,
+                tag=tag,
+                side="LONG",
+                ltp=ltp,
+                lots=1,
+                reason="FORCED_TURN_ENTRY"
+            )
+            print("AFTER_PAPER_ENTRY →", entry_accepted)
+            print("POSITIONS_NOW →", paper_trader.positions)
+            return {"entry_allowed": entry_accepted}
 
         self._update_price_history(secid, now, ltp)
         struct_ok = self._structure_ok(secid)
@@ -247,6 +272,7 @@ class InstitutionalDecisionEngine:
                 )
                 return {"entry_allowed": False}
 
+            print("BEFORE_PAPER_ENTRY →", secid, tag, ltp)
             entry_accepted = paper_trader.on_entry(
                 secid=secid,
                 tag=tag,
@@ -255,6 +281,8 @@ class InstitutionalDecisionEngine:
                 lots=1,
                 reason="TURN_CONTINUATION"
             )
+            print("AFTER_PAPER_ENTRY →", entry_accepted)
+            print("POSITIONS_NOW →", paper_trader.positions)
             if entry_accepted is False:
                 self._log_event(
                     event="ENTRY",

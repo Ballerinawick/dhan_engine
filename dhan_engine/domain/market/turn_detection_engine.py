@@ -352,7 +352,7 @@ class TurnDetectionEngine:
         }
         self.active_trade[snapshot.get("index", "UNKNOWN")] = trade
         print(
-            f"🟢 ENTRY | {trade['entry_time_ist']} | {snapshot.get('index', 'UNKNOWN')} | "
+            f"🟢 TURN_SIGNAL | {trade['entry_time_ist']} | {snapshot.get('index', 'UNKNOWN')} | "
             f"{signal} | {premium_type} | {entry_price}"
         )
         return trade
@@ -500,7 +500,7 @@ class TurnDetectionEngine:
                 "exhaustion_score": round(self._safe_float(latest.get("exhaustion_score")), 2),
             })
             if signal.startswith("REAL_") or signal.endswith("_CONTINUATION"):
-                self._track_entry(snapshot, signal)
+                print("TURN_SIGNAL →", signal)
                 self._log_event(
                     event=signal,
                     index=index,
