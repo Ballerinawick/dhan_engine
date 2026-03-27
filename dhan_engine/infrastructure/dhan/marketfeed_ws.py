@@ -131,6 +131,7 @@ class DhanLiveMarketFeedWS:
             print("WS_FULLQUOTE_SUB", payload)
 
         try:
+            print("📤 WS SUB PAYLOAD:", payload)
             self._ws.send(json.dumps(payload))
         except Exception as exc:
             print(f"FULLQUOTE_WS_SUBSCRIBE_ERROR | error={exc}")
@@ -138,8 +139,7 @@ class DhanLiveMarketFeedWS:
     def _on_open(self, ws) -> None:
         self._connected.set()
         self._reconnect_attempt = 0
-        if self.debug:
-            print("WS_FULLQUOTE_CONNECTED")
+        print("🔥 WS CONNECTED — READY TO SUBSCRIBE")
         self._send_subscribe()
 
     def _on_error(self, ws, error) -> None:
@@ -151,6 +151,7 @@ class DhanLiveMarketFeedWS:
             print(f"WS_FULLQUOTE_CLOSED | code={code} | message={message}")
 
     def _on_message(self, ws, message) -> None:
+        print("📥 WS RAW MESSAGE RECEIVED | type=", type(message))
         if isinstance(message, str):
             return
 
@@ -170,14 +171,22 @@ class DhanLiveMarketFeedWS:
             packet = data[offset : offset + packet_len]
             offset += packet_len
 
+            print("📦 WS PACKET | code=", feed_code, "| secid=", secid)
+
             if feed_code == RESP_FULL:
                 self._parse_full(secid, packet)
 
     def _parse_full(self, secid: int, packet: bytes) -> None:
         if len(packet) < 12:
+            print("❌ INVALID PACKET LENGTH")
             return
 
-        ltp = struct.unpack_from("<f", packet, 8)[0]
+        try:
+            ltp = struct.unpack_from("<f", packet, 8)[0]
+        except Exception as e:
+            print("❌ LTP PARSE FAILED", e)
+            return
+
         depth_start = 8 + 62
 
         bid_price: List[float] = []
@@ -185,19 +194,29 @@ class DhanLiveMarketFeedWS:
         ask_price: List[float] = []
         ask_qty: List[int] = []
 
-        if len(packet) >= depth_start + 100:
-            for index in range(5):
-                base = depth_start + (index * 20)
-                price = struct.unpack_from("<f", packet, base)[0]
-                qty = struct.unpack_from("<i", packet, base + 4)[0]
-                if index < 2:
-                    bid_price.append(float(price))
-                    bid_qty.append(int(qty))
-                else:
-                    ask_price.append(float(price))
-                    ask_qty.append(int(qty))
+        try:
+            if len(packet) >= depth_start + (5 * 20):
+                for i in range(5):
+                    base = depth_start + (i * 20)
+
+                    bid_q = struct.unpack_from("<i", packet, base)[0]
+                    ask_q = struct.unpack_from("<i", packet, base + 4)[0]
+
+                    bid_p = struct.unpack_from("<f", packet, base + 12)[0]
+                    ask_p = struct.unpack_from("<f", packet, base + 16)[0]
+
+                    bid_price.append(float(bid_p))
+                    bid_qty.append(int(bid_q))
+
+                    ask_price.append(float(ask_p))
+                    ask_qty.append(int(ask_q))
+        except Exception as e:
+            print("❌ DEPTH PARSE ERROR", e)
 
         tag = self._tags.get(secid, str(secid))
+
+        print("✅ FULL_WS_TICK RECEIVED | secid=", secid, "| ltp=", ltp)
+
         if self.on_full:
             try:
                 self.on_full(
@@ -213,4 +232,4 @@ class DhanLiveMarketFeedWS:
                     ),
                 )
             except Exception as exc:
-                print(f"FULLQUOTE_WS_CALLBACK_ERROR | secid={secid} | tag={tag} | error={exc}")
+                print("❌ CALLBACK ERROR", exc)

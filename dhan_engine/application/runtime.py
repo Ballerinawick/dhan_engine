@@ -92,9 +92,9 @@ class TradingRuntimeCoordinator:
         if self.future_quote_stream is None:
             raise RuntimeError("Future quote stream is not configured")
         self.future_quote_stream.start()
-        self.future_quote_stream.subscribe(
-            [(secid, f"{index}_FUT") for index, secid in self.future_secids.items()]
-        )
+        subscriptions = [(secid, f"{index}_FUT") for index, secid in self.future_secids.items()]
+        print("🚀 SUBSCRIBING FUTURE:", subscriptions)
+        self.future_quote_stream.subscribe(subscriptions)
 
         if self.option_quote_stream is None:
             raise RuntimeError("Option quote stream is not configured")
