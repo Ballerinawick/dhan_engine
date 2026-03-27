@@ -7,7 +7,7 @@ from typing import Dict, Optional
 
 import requests
 
-from dhan_engine.application.market_data import FutureQuoteStream, OptionDepthStream, RestLtpStreamer
+from dhan_engine.application.market_data import FutureQuoteStream, OptionDepthStream
 from dhan_engine.config.settings import RuntimeSettings
 from dhan_engine.domain.features.depth_micro_features import DepthMicroFeatureBuilder
 from dhan_engine.domain.market.market_state_engine import MarketStateEngine
@@ -19,7 +19,6 @@ from dhan_engine.domain.strategy.options_momentum_engine import OptionsMomentumE
 from dhan_engine.domain.strategy.structure_exit_engine import StructureExitEngine
 from dhan_engine.infrastructure.dhan.full_market_quote_sampler import FullMarketQuoteSampler
 from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
-from dhan_engine.infrastructure.dhan.ltp_rest_engine import DhanLtpRestEngine
 from dhan_engine.infrastructure.dhan.option_chain_selector import OptionChainSelector
 from dhan_engine.simulations.paper_trade_manager import PaperTradeManager
 
@@ -56,8 +55,8 @@ class TradingRuntimeCoordinator:
         market_engine: MarketStateEngine,
         turn_engine: TurnDetectionEngine,
         selector: OptionChainSelector,
-        ltp_streamer: RestLtpStreamer,
         future_quote_stream: Optional[FutureQuoteStream],
+        option_quote_stream: Optional[FutureQuoteStream],
         option_depth_stream: Optional[OptionDepthStream],
     ):
         self.settings = settings
@@ -71,8 +70,8 @@ class TradingRuntimeCoordinator:
         self.market_engine = market_engine
         self.turn_engine = turn_engine
         self.selector = selector
-        self.ltp_streamer = ltp_streamer
         self.future_quote_stream = future_quote_stream
+        self.option_quote_stream = option_quote_stream
         self.option_depth_stream = option_depth_stream
 
         self._lock = threading.RLock()
@@ -87,7 +86,7 @@ class TradingRuntimeCoordinator:
         self.full_quote_secid_tag: Dict[int, str] = {}
 
     def run(self) -> None:
-        logger.info("MODE: FUTURE_WS_STREAM + OPTION_DEPTH_STREAM + OPTION_PREMIUM_ENRICHMENT")
+        logger.info("MODE: FUTURE_WS_STREAM + OPTION_WS_STREAM + OPTION_DEPTH_STREAM")
 
         self._configure_underlying_contracts()
         if self.future_quote_stream is None:
@@ -97,7 +96,9 @@ class TradingRuntimeCoordinator:
             [(secid, f"{index}_FUT") for index, secid in self.future_secids.items()]
         )
 
-        self.ltp_streamer.register_channel("option_premium", self._on_option_premium_ltp)
+        if self.option_quote_stream is None:
+            raise RuntimeError("Option quote stream is not configured")
+        self.option_quote_stream.start()
         if self.option_depth_stream is None:
             raise RuntimeError("Option depth stream is not configured")
         self.option_depth_stream.start()
@@ -141,8 +142,6 @@ class TradingRuntimeCoordinator:
             return all(self.pairs[index].underlying_ltp for index in self.settings.indexes)
 
     def _select_and_subscribe_option_pairs(self) -> None:
-        premium_secids = []
-
         for index in self.settings.indexes:
             underlying_ltp = self.pairs[index].underlying_ltp
             selection = self.selector.select_best(index, underlying_ltp_override=underlying_ltp)
@@ -158,27 +157,21 @@ class TradingRuntimeCoordinator:
                 pair.ce_id = ce_id
                 self.option_index_by_secid[ce_id] = index
                 subscriptions.append((ce_id, f"{index}_CE"))
-                premium_secids.append(ce_id)
 
             if "PE" in selection:
                 pe_id = int(selection["PE"]["security_id"])
                 pair.pe_id = pe_id
                 self.option_index_by_secid[pe_id] = index
                 subscriptions.append((pe_id, f"{index}_PE"))
-                premium_secids.append(pe_id)
 
             if pair.ce_id and pair.pe_id:
                 logger.info("PAIR_REGISTERED | %s | CE=%s | PE=%s", index, pair.ce_id, pair.pe_id)
 
             if subscriptions:
                 self.option_depth_stream.subscribe(subscriptions)
+                self.option_quote_stream.subscribe(subscriptions)
                 for secid, tag in subscriptions:
                     self.full_quote_secid_tag[secid] = tag
-
-        if self.settings.option_premium_stream_enabled and premium_secids:
-            self.ltp_streamer.update_subscription("option_premium", {"NSE_FNO": premium_secids})
-            self.ltp_streamer.start()
-            logger.info("Option premium LTP stream registered | instruments=%s", len(premium_secids))
 
     def on_future_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
         with self._lock:
@@ -201,13 +194,25 @@ class TradingRuntimeCoordinator:
             if self._all_underlyings_ready():
                 self._future_ready.set()
 
-    def _on_option_premium_ltp(self, prices: Dict[int, float]) -> None:
+    def _on_option_full_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
         with self._lock:
-            for secid, ltp in prices.items():
-                index = self.option_index_by_secid.get(secid)
-                if index is None:
-                    continue
-                self.pairs[index].update_option_ltp(secid, ltp)
+            index = self.option_index_by_secid.get(int(secid))
+            if index is None:
+                index = str(tag).split("_")[0].upper()
+            pair = self.pairs.get(index)
+            if pair is None:
+                return
+            pair.update_option_ltp(int(secid), float(ltp))
+
+            existing = pair.ce_depth if int(secid) == pair.ce_id else pair.pe_depth if int(secid) == pair.pe_id else None
+            if not existing:
+                return
+            raw = dict(existing)
+            raw["ltp"] = float(ltp)
+            raw["secid"] = int(secid)
+            raw["tag"] = str(tag)
+            raw["ts"] = time.time()
+            self._process_option_update(index, pair, int(secid), str(tag), raw)
 
     def on_option_depth(self, secid: int, tag: str, bid, ask) -> None:
         if not self.market_open():
@@ -229,23 +234,24 @@ class TradingRuntimeCoordinator:
             return
 
         with self._lock:
-            premium_ltp = pair.ce_ltp if secid == pair.ce_id else pair.pe_ltp if secid == pair.pe_id else None
-            if premium_ltp and premium_ltp > 0:
-                raw["ltp"] = float(premium_ltp)
-                raw["ltp_source"] = "REST_OPTION_PREMIUM"
-
+            ws_ltp = pair.ce_ltp if secid == pair.ce_id else pair.pe_ltp if secid == pair.pe_id else None
+            if ws_ltp and ws_ltp > 0:
+                raw["ltp"] = float(ws_ltp)
             pair.update_option_depth(secid, raw)
-            self._track_zero_book(secid, tag, raw)
-            self.paper_trader.on_tick(secid, raw["ltp"])
+            self._process_option_update(index, pair, secid, tag, raw)
 
-            if pair.is_ready() and not pair.ready_logged:
-                pair.ready_logged = True
-                logger.info("PAIR_STATE_READY | %s | CE+PE+UNDERLYING LIVE", index)
+    def _process_option_update(self, index: str, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
+        self._track_zero_book(secid, tag, raw)
+        self.paper_trader.on_tick(secid, raw["ltp"])
 
-            if pair.is_ready():
-                self._update_market_snapshot(pair, raw, secid, tag)
+        if pair.is_ready() and not pair.ready_logged:
+            pair.ready_logged = True
+            logger.info("PAIR_STATE_READY | %s | CE+PE+UNDERLYING LIVE", index)
 
-            self._process_exit_engines(pair, secid, tag, raw)
+        if pair.is_ready():
+            self._update_market_snapshot(pair, raw, secid, tag)
+
+        self._process_exit_engines(pair, secid, tag, raw)
 
     def _update_market_snapshot(self, pair: PairRuntimeState, raw: dict, secid: int, tag: str) -> None:
         ce_input, pe_input = pair.build_market_inputs()
@@ -419,13 +425,6 @@ def build_runtime(settings: RuntimeSettings) -> TradingRuntimeCoordinator:
         max_steps_each_side=settings.selector_steps_each_side,
         debug=True,
     )
-    ltp_client = DhanLtpRestEngine(
-        access_token=settings.credentials.access_token,
-        client_id=settings.credentials.client_id,
-        debug=True,
-    )
-    ltp_streamer = RestLtpStreamer(ltp_client, poll_interval_sec=settings.ltp_poll_sec)
-
     coordinator = TradingRuntimeCoordinator(
         settings=settings,
         master=master,
@@ -438,8 +437,8 @@ def build_runtime(settings: RuntimeSettings) -> TradingRuntimeCoordinator:
         market_engine=market_engine,
         turn_engine=turn_engine,
         selector=selector,
-        ltp_streamer=ltp_streamer,
         future_quote_stream=None,
+        option_quote_stream=None,
         option_depth_stream=None,
     )
     coordinator.future_quote_stream = FutureQuoteStream(
@@ -448,6 +447,13 @@ def build_runtime(settings: RuntimeSettings) -> TradingRuntimeCoordinator:
         exchange_segment=settings.future_exchange_segment,
         on_quote=coordinator.on_future_quote,
         debug=settings.future_quote_stream_debug,
+    )
+    coordinator.option_quote_stream = FutureQuoteStream(
+        client_id=settings.credentials.client_id,
+        token=settings.credentials.access_token,
+        exchange_segment=settings.option_exchange_segment,
+        on_quote=coordinator._on_option_full_quote,
+        debug=False,
     )
     coordinator.option_depth_stream = OptionDepthStream(
         client_id=settings.credentials.client_id,
