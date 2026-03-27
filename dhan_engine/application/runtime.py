@@ -274,7 +274,7 @@ class TradingRuntimeCoordinator:
         if route_secid is None:
             return
 
-        self.decision_engine.on_signal(
+        decision = self.decision_engine.on_signal(
             secid=route_secid,
             tag=route_tag,
             ltp=route_ltp,
@@ -283,6 +283,7 @@ class TradingRuntimeCoordinator:
             paper_trader=self.paper_trader,
             snapshot=snapshot,
         )
+        print("DECISION_RESULT →", decision)
 
     def _process_exit_engines(self, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
         action = self.momentum_engine.on_tick(secid, raw)
