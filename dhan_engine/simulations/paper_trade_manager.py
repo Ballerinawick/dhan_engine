@@ -57,6 +57,8 @@ class PaperTradeManager:
         self.current_day = datetime.now().date()
         self.opened_today = 0
         self.closed_today = 0
+        self.last_trade_summary = None
+        self.enable_parsed_logs = False   # 🔥 toggle for debug logs
 
     # --------------------------------------------------
     # INTERNAL HELPERS
@@ -136,6 +138,7 @@ class PaperTradeManager:
             f"Entry:{ltp:.2f} | "
             f"RoundTripFee:{self.ROUND_TRIP_FEE}"
         )
+        self._log_consolidated()
         return True
 
     # --------------------------------------------------
@@ -166,6 +169,22 @@ class PaperTradeManager:
         now_ts = time.time()
         hold_sec = now_ts - pos["entry_ts"]
         self.total_hold_seconds += hold_sec
+        self.last_trade_summary = {
+            "tag": pos["tag"],
+            "side": pos["side"],
+            "lots": pos["lots"],
+            "qty": qty,
+            "entry": float(entry),
+            "exit": float(ltp),
+            "gross_pnl": float(gross_pnl),
+            "fee": float(fee),
+            "net_pnl": float(net_pnl),
+            "hold_sec": float(hold_sec),
+            "entry_reason": pos.get("entry_reason"),
+            "exit_reason": reason,
+            "entry_time": datetime.fromtimestamp(pos["entry_ts"]).strftime("%H:%M:%S"),
+            "exit_time": datetime.fromtimestamp(now_ts).strftime("%H:%M:%S"),
+        }
 
         self.exits_total += 1
         idx = self._extract_index(pos["tag"])
@@ -191,6 +210,15 @@ class PaperTradeManager:
             f"Hold:{self._fmt_duration(hold_sec)} | "
             f"Reason:{reason}"
         )
+        print(
+            f"📘 TRADE_SUMMARY | {pos['tag']} | "
+            f"Entry:{entry:.2f} | Exit:{ltp:.2f} | "
+            f"GrossPnL:{gross_pnl:+.2f} | Fee:{fee:.2f} | NetPnL:{net_pnl:+.2f} | "
+            f"Hold:{self._fmt_duration(hold_sec)} | "
+            f"EntryTime:{self.last_trade_summary['entry_time']} | ExitTime:{self.last_trade_summary['exit_time']} | "
+            f"EntryReason:{pos.get('entry_reason')} | ExitReason:{reason}"
+        )
+        self._log_consolidated()
 
     # --------------------------------------------------
     # TICK UPDATE
@@ -199,10 +227,9 @@ class PaperTradeManager:
         if secid in self.positions:
             self.positions[secid]["ltp"] = float(ltp)
 
-        now = time.time()
-        if now - self.last_log_ts >= self.log_interval:
-            self.last_log_ts = now
-            self._log_consolidated()
+        # 🔥 OPTIONAL DEBUG LOG (OFF BY DEFAULT)
+        if self.enable_parsed_logs:
+            print(f"📡 TICK | {secid} | LTP:{ltp}")
 
     # --------------------------------------------------
     # CONSOLIDATED PORTFOLIO LOG
