@@ -1,5 +1,6 @@
 import time
 from collections import deque
+from config.trading_config import CONFIG
 
 
 class StructureExitEngine:
@@ -41,9 +42,17 @@ class StructureExitEngine:
     # Visuals
     TIMELINE_MAX = 20
 
-    def __init__(self, debug=True):
+    def init(self, debug=True):
         self.debug = debug
         self.ctx = {}
+
+        # CONFIG LOAD
+        self.MIN_PROFIT_TO_EXIT_EARLY_PCT = CONFIG["exit"]["min_profit_pct"]
+        self.FEE_MULTIPLIER = CONFIG["exit"]["fee_multiplier"]
+        self.LOCKED_PROFIT_TREND_PCT = CONFIG["exit"]["trend_locked_profit_pct"]
+
+    def __init__(self, debug=True):
+        self.init(debug=debug)
 
     def _log(self, msg):
         if self.debug:
@@ -126,6 +135,10 @@ class StructureExitEngine:
             return decision_engine.trade_ctx.get(secid, {}).get("mode", "SCALP")
         except Exception:
             return "SCALP"
+
+    def _min_profit_pct_required(self, entry_price: float, lot_size: int = 65) -> float:
+        fee = 60.0
+        return (fee / (entry_price * lot_size)) * 100.0
 
     # ================= MAIN =================
     def on_tick(self, *, secid, tag, ltp, paper_trader, decision_engine):
@@ -225,10 +238,20 @@ class StructureExitEngine:
                     self._log(f"📉 EXIT_STRUCT | {tag} | TREND_LL_FAIL | pnl={pnl_pct:+.2f}%")
                     return {"exit": True, "reason": "STRUCT_TREND_FAILURE"}
 
-            # SCALP unchanged
-            if mode == "SCALP" and last == "LH" and pnl_pct > self.MIN_PROFIT_TO_EXIT_EARLY_PCT:
-                c["last_exit_ts"] = now
-                self._log(f"📉 EXIT_STRUCT | {tag} | SCALP_LH_PROFIT | pnl={pnl_pct:+.2f}%")
-                return {"exit": True, "reason": "STRUCT_SCALP_PROFIT"}
+            if mode == "SCALP" and last == "LH":
+
+                min_fee_pct = self._min_profit_pct_required(entry)
+                required_pct = max(
+                    self.MIN_PROFIT_TO_EXIT_EARLY_PCT,
+                    min_fee_pct * self.FEE_MULTIPLIER
+                )
+
+                if pnl_pct > required_pct:
+                    c["last_exit_ts"] = now
+                    self._log(
+                        f"📉 EXIT_STRUCT | {tag} | SCALP_LH_PROFIT | "
+                        f"pnl={pnl_pct:+.2f}% | required={required_pct:.2f}%"
+                    )
+                    return {"exit": True, "reason": "STRUCT_SCALP_PROFIT"}
 
         return None

@@ -220,6 +220,32 @@ class PaperTradeManager:
         )
         self._log_consolidated()
 
+    def _log_open_positions(self):
+        if not self.positions:
+            return
+
+        now_ts = time.time()
+
+        for secid, pos in self.positions.items():
+            entry = float(pos["entry"])
+            ltp = float(pos.get("ltp", entry))
+            qty = int(pos["qty"])
+
+            if pos["side"] == "LONG":
+                pnl = (ltp - entry) * qty
+            else:
+                pnl = (entry - ltp) * qty
+
+            pnl_pct = ((ltp - entry) / entry) * 100 if entry > 0 else 0.0
+            hold_sec = now_ts - pos["entry_ts"]
+
+            print(
+                f"📊 OPEN_POSITION | {pos['tag']} | "
+                f"Entry:{entry:.2f} | LTP:{ltp:.2f} | "
+                f"PnL:{pnl:+.2f} ({pnl_pct:+.2f}%) | "
+                f"Hold:{self._fmt_duration(hold_sec)}"
+            )
+
     # --------------------------------------------------
     # TICK UPDATE
     # --------------------------------------------------
@@ -227,9 +253,24 @@ class PaperTradeManager:
         if secid in self.positions:
             self.positions[secid]["ltp"] = float(ltp)
 
-        # 🔥 OPTIONAL DEBUG LOG (OFF BY DEFAULT)
+        # OPTIONAL DEBUG LOG
         if self.enable_parsed_logs:
             print(f"📡 TICK | {secid} | LTP:{ltp}")
+
+        # OPEN POSITION TRACKING (THROTTLED)
+        if not hasattr(self, "_last_open_log_ts"):
+            self._last_open_log_ts = 0
+
+        interval = 10
+        try:
+            from config.trading_config import CONFIG
+            interval = CONFIG["logging"]["open_position_interval_sec"]
+        except Exception:
+            pass
+
+        if time.time() - self._last_open_log_ts > interval:
+            self._log_open_positions()
+            self._last_open_log_ts = time.time()
 
     # --------------------------------------------------
     # CONSOLIDATED PORTFOLIO LOG
