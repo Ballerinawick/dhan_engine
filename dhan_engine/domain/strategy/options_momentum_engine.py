@@ -542,8 +542,28 @@ class OptionsMomentumEngine:
 
             spread = max(float(t["entry_spread"]), 0.05)
 
+            if cur_sec % 10 == 0:
+                pnl = price - entry
+                hold = state.seconds_in_trade if state else 0
+
+                print(
+                    f"📊 OPEN_POSITION | secid={secid} | "
+                    f"Entry:{entry:.2f} | LTP:{price:.2f} | "
+                    f"PnL:{pnl:+.2f} | Hold:{hold:.1f}s"
+                )
+
             # --- SMART HOLD SYSTEM ---
             if state:
+
+                # --- RECOVERY WINDOW (CONTROLLED HOLD) ---
+                if state.seconds_in_trade < 90:
+                    extreme_fail = state.mae > max(spread * 20, 5.0)
+
+                    if extreme_fail:
+                        print(f"🚨 EXTREME_FAIL_EXIT | secid={secid}")
+                        return self._close_trade(secid, price, cur_sec, "EXTREME_FAIL")
+
+                    return "HOLD"
 
                 # 🟡 PROBE PHASE (0–15 sec)
                 if state.seconds_in_trade < 15:
@@ -579,22 +599,12 @@ class OptionsMomentumEngine:
 
                     return "HOLD"
 
-            if state and state.seconds_in_trade > 60 and state.mfe < spread * 1.5:
-                print(f"🚫 NO_EXPANSION_EXIT | secid={secid} | mfe={state.mfe:.2f}")
-                return self._close_trade(secid, price, cur_sec, "NO_EXPANSION")
-
             if state:
-                fail = self.failure_analyzer.check(state, spread)
-                if fail and self.phase_manager.allow_failure_exit(state):
-                    print(f"🚪 FAILURE_EXIT | secid={secid} | price={price:.2f} | reason={fail['reason']}")
-                    return self._close_trade(secid, price, cur_sec, fail["reason"])
-
                 acc = self.acceptance_analyzer.evaluate(state)
                 print(f"✅ ACCEPTANCE_STATUS | secid={secid} | price={price:.2f} | status={acc}")
 
                 if acc == "REJECTED" and self.phase_manager.allow_acceptance_reject_exit(state):
                     print(f"🚪 ENTRY_REJECTION_EXIT | secid={secid} | price={price:.2f}")
-                    return self._close_trade(secid, price, cur_sec, "ENTRY_REJECTED")
 
             if not t["breakeven_armed"] and t["mfe"] >= spread:
                 t["breakeven_armed"] = True
@@ -676,8 +686,17 @@ class OptionsMomentumEngine:
                     f"mfe={t['mfe']:.3f} | spread={spread:.3f}"
                 )
 
-            if state and opposite_turn_exit and momentum_confirmed and self.phase_manager.allow_turn_exit(state):
-                return self._close_trade(secid, price, cur_sec, "OPPOSITE_TURN")
+            strong_flip = abs(speed) > abs(prev_speed) * 1.5
+
+            if (
+                state
+                and opposite_turn_exit
+                and momentum_confirmed
+                and strong_flip
+                and t["mfe"] >= spread * 2
+                and self.phase_manager.allow_turn_exit(state)
+            ):
+                return self._close_trade(secid, price, cur_sec, "OPPOSITE_TURN_STRONG")
 
             return "NO_TRADE"
 

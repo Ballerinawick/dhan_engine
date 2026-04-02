@@ -232,7 +232,7 @@ class StructureExitEngine:
             if mode == "TREND" and last == "LL":
                 if (
                     (c["last_confirmed_hl"] and ltp < c["last_confirmed_hl"])
-                    or pnl_pct >= self.LOCKED_PROFIT_TREND_PCT
+                    or pnl_pct >= self.LOCKED_PROFIT_TREND_PCT * 1.5
                 ):
                     c["last_exit_ts"] = now
                     self._log(f"📉 EXIT_STRUCT | {tag} | TREND_LL_FAIL | pnl={pnl_pct:+.2f}%")

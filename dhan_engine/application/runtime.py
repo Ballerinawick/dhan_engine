@@ -300,17 +300,21 @@ class TradingRuntimeCoordinator:
                 snapshot=pair.last_snapshot,
             )
 
-        structure = self.structure_exit_engine.on_tick(
-            secid=secid,
-            tag=tag,
-            ltp=raw["ltp"],
-            paper_trader=self.paper_trader,
-            decision_engine=self.decision_engine,
-        )
-        if structure and structure.get("exit"):
-            logger.info("EXIT_OVERRIDE | %s | reason=%s", tag, structure["reason"])
-            self._force_exit(pair, secid, tag, raw["ltp"], structure["reason"])
-            return
+        # STRUCTURE EXIT ONLY WHEN NO ACTIVE MOMENTUM TRADE
+        if secid not in self.momentum_engine.active_trade:
+
+            structure = self.structure_exit_engine.on_tick(
+                secid=secid,
+                tag=tag,
+                ltp=raw["ltp"],
+                paper_trader=self.paper_trader,
+                decision_engine=self.decision_engine,
+            )
+
+            if structure and structure.get("exit"):
+                logger.info("EXIT_OVERRIDE | %s | reason=%s", tag, structure["reason"])
+                self._force_exit(pair, secid, tag, raw["ltp"], structure["reason"])
+                return
 
         trail = self.trailing_exit_engine.on_tick(
             secid=secid,
