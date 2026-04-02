@@ -80,10 +80,26 @@ class PaperTradeManager:
             self.opened_today = 0
             self.closed_today = 0
 
+    def has_open_position(self):
+        return len(self.positions) > 0
+
     # --------------------------------------------------
     # ENTRY
     # --------------------------------------------------
     def on_entry(self, secid, tag, side, ltp, lots=1, reason="ENTRY"):
+        # 🚫 BLOCK ANY NEW ENTRY IF ONE EXISTS
+        if self.has_open_position():
+            print(
+                f"⛔ ENTRY_BLOCKED_SINGLE_POSITION | Attempt:{tag} | Reason:Existing position active"
+            )
+            return False
+
+        # if self.has_open_position():
+        #     existing = next(iter(self.positions.values()))
+        #     if existing["tag"] != tag:
+        #         print("🔄 OPPOSITE_SIGNAL_DETECTED → EXIT THEN ENTRY")
+        #         return False
+
         if secid in self.positions:
             return False
 
