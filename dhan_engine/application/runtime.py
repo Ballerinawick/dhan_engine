@@ -85,6 +85,13 @@ class TradingRuntimeCoordinator:
         self.option_index_by_secid: Dict[int, str] = {}
         self.full_quote_secid_tag: Dict[int, str] = {}
 
+        self.premium_flow = {
+            "CE": {"ltp": 0.0, "prev": 0.0, "velocity": 0.0},
+            "PE": {"ltp": 0.0, "prev": 0.0, "velocity": 0.0},
+            "dominant": None,
+            "last_update": 0.0,
+        }
+
     def run(self) -> None:
         logger.info("MODE: FUTURE_WS_STREAM + OPTION_WS_STREAM + OPTION_DEPTH_STREAM")
 
@@ -241,6 +248,27 @@ class TradingRuntimeCoordinator:
             self._process_option_update(index, pair, secid, tag, raw)
 
     def _process_option_update(self, index: str, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
+        side = "CE" if "CE" in tag else "PE" if "PE" in tag else None
+        if side:
+            pf = self.premium_flow[side]
+
+            pf["prev"] = pf["ltp"]
+            pf["ltp"] = raw["ltp"]
+
+            if pf["prev"] > 0:
+                pf["velocity"] = pf["ltp"] - pf["prev"]
+
+            self.premium_flow["last_update"] = time.time()
+
+        ce_vel = self.premium_flow["CE"]["velocity"]
+        pe_vel = self.premium_flow["PE"]["velocity"]
+
+        if ce_vel > 0 and pe_vel < 0:
+            self.premium_flow["dominant"] = "CE"
+
+        elif pe_vel > 0 and ce_vel < 0:
+            self.premium_flow["dominant"] = "PE"
+
         self._track_zero_book(secid, tag, raw)
         self.paper_trader.on_tick(secid, raw["ltp"])
 
@@ -273,6 +301,17 @@ class TradingRuntimeCoordinator:
         route_secid, route_tag, route_ltp = pair.route_for_signal(turn_signal.get("signal"), tag, raw["ltp"])
         if route_secid is None:
             return
+
+        flow = self.premium_flow.get("dominant")
+
+        if flow:
+            if flow == "CE" and "PE" in route_tag:
+                logger.info("🚫 FLOW_BLOCK | PE against CE dominance")
+                return
+
+            if flow == "PE" and "CE" in route_tag:
+                logger.info("🚫 FLOW_BLOCK | CE against PE dominance")
+                return
 
         decision = self.decision_engine.on_signal(
             secid=route_secid,
@@ -315,6 +354,26 @@ class TradingRuntimeCoordinator:
                 logger.info("EXIT_OVERRIDE | %s | reason=%s", tag, structure["reason"])
                 self._force_exit(pair, secid, tag, raw["ltp"], structure["reason"])
                 return
+
+        flow = self.premium_flow.get("dominant")
+
+        active = self.paper_trader.trades.get(secid)
+        if active:
+            entry = active.get("entry_price", 0)
+            if entry > 0:
+
+                pnl_pct = ((raw["ltp"] - entry) / entry) * 100
+
+                if flow:
+                    if "CE" in tag and flow == "PE" and pnl_pct < 0:
+                        logger.info("🧠 FLOW_EXIT | CE losing dominance to PE")
+                        self._force_exit(pair, secid, tag, raw["ltp"], "FLOW_REVERSAL")
+                        return
+
+                    if "PE" in tag and flow == "CE" and pnl_pct < 0:
+                        logger.info("🧠 FLOW_EXIT | PE losing dominance to CE")
+                        self._force_exit(pair, secid, tag, raw["ltp"], "FLOW_REVERSAL")
+                        return
 
         trail = self.trailing_exit_engine.on_tick(
             secid=secid,
@@ -402,6 +461,12 @@ class TradingRuntimeCoordinator:
             if now - last_heartbeat >= self.settings.heartbeat_sec:
                 last_heartbeat = now
                 logger.info("%s ENGINE_RUNNING", datetime.now(self.settings.timezone).strftime("%H:%M:%S"))
+                logger.info(
+                    "📊 FLOW | CE_vel=%.2f | PE_vel=%.2f | DOM=%s",
+                    self.premium_flow["CE"]["velocity"],
+                    self.premium_flow["PE"]["velocity"],
+                    self.premium_flow["dominant"],
+                )
 
             time.sleep(1.0)
 
