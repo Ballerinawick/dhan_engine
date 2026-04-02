@@ -10,9 +10,9 @@ PREMIUM_FILTER = {
 }
 
 DELTA_FILTER = {
-    "NIFTY": (0.12, 0.35),
-    "BANKNIFTY": (0.10, 0.32),
-    "FINNIFTY": (0.10, 0.33),
+    "NIFTY": (0.35, 0.65),
+    "BANKNIFTY": (0.30, 0.60),
+    "FINNIFTY": (0.30, 0.60),
 }
 
 SPREAD_MAX_PCT = {
@@ -246,6 +246,7 @@ class OptionChainSelector:
             g = leg.get("greeks", {}) or {}
             delta = abs(float(g.get("delta", 0)))
             premium_penalty = _calculate_penalty(ltp, min_prem, max_prem)
+            # SOFT penalty only (do NOT reject here)
             delta_penalty = _calculate_penalty(delta, min_delta, max_delta)
 
             bid = float(leg.get("top_bid_price", 0) or 0)
@@ -378,29 +379,73 @@ class OptionChainSelector:
         best_ce = None
         best_pe = None
 
+        # -------- CE SELECTION --------
+
+        ce_scored = []
+
         for strike, ce_leg, ce_meta in ce_candidates:
             base_score, r = self._score_with_reason(ce_leg)
+
             s = base_score - (ce_meta["premium_penalty"] * wp) - (ce_meta["delta_penalty"] * wd)
-            if not best_ce or s > best_ce["score"]:
-                best_ce = dict(
-                    score=s,
-                    strike=strike,
-                    reason=r,
-                    live_security_id=self._extract_live_security_id(ce_leg),
-                    **ce_meta,
-                )
+
+            ce_scored.append({
+                "score": s,
+                "strike": strike,
+                "reason": r,
+                "live_security_id": self._extract_live_security_id(ce_leg),
+                **ce_meta,
+            })
+
+        # STRICT FILTER
+        strict_ce = [
+            x for x in ce_scored
+            if min_delta <= x["delta"] <= max_delta
+        ]
+
+        # FALLBACK FILTER
+        if strict_ce:
+            ce_pool = strict_ce
+        else:
+            ce_pool = [
+                x for x in ce_scored
+                if 0.25 <= x["delta"] <= 0.75
+            ]
+
+        best_ce = max(ce_pool, key=lambda x: x["score"]) if ce_pool else None
+
+        # -------- PE SELECTION --------
+
+        pe_scored = []
 
         for strike, pe_leg, pe_meta in pe_candidates:
             base_score, r = self._score_with_reason(pe_leg)
+
             s = base_score - (pe_meta["premium_penalty"] * wp) - (pe_meta["delta_penalty"] * wd)
-            if not best_pe or s > best_pe["score"]:
-                best_pe = dict(
-                    score=s,
-                    strike=strike,
-                    reason=r,
-                    live_security_id=self._extract_live_security_id(pe_leg),
-                    **pe_meta,
-                )
+
+            pe_scored.append({
+                "score": s,
+                "strike": strike,
+                "reason": r,
+                "live_security_id": self._extract_live_security_id(pe_leg),
+                **pe_meta,
+            })
+
+        # STRICT FILTER
+        strict_pe = [
+            x for x in pe_scored
+            if min_delta <= x["delta"] <= max_delta
+        ]
+
+        # FALLBACK FILTER
+        if strict_pe:
+            pe_pool = strict_pe
+        else:
+            pe_pool = [
+                x for x in pe_scored
+                if 0.25 <= x["delta"] <= 0.75
+            ]
+
+        best_pe = max(pe_pool, key=lambda x: x["score"]) if pe_pool else None
 
         out = {}
 
