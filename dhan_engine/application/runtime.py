@@ -17,7 +17,6 @@ from dhan_engine.domain.strategy.institutional_decision_engine import Institutio
 from dhan_engine.domain.strategy.institutional_trailing_exit_engine import InstitutionalTrailingExitEngine
 from dhan_engine.domain.strategy.options_momentum_engine import OptionsMomentumEngine
 from dhan_engine.domain.strategy.structure_exit_engine import StructureExitEngine
-from dhan_engine.infrastructure.dhan.full_market_quote_sampler import FullMarketQuoteSampler
 from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
 from dhan_engine.infrastructure.dhan.option_chain_selector import OptionChainSelector
 from dhan_engine.simulations.paper_trade_manager import PaperTradeManager
@@ -112,7 +111,9 @@ class TradingRuntimeCoordinator:
 
         self._wait_for_underlyings()
         self._select_and_subscribe_option_pairs()
-        self._start_optional_full_quote_sampler()
+        # 🚫 DISABLED: causing Dhan 429 rate limit
+        # self._start_optional_full_quote_sampler()
+        logger.info("⚠️ FULL QUOTE SAMPLER DISABLED (429 PROTECTION ACTIVE)")
         self._heartbeat_loop()
 
     def market_open(self) -> bool:
@@ -434,19 +435,13 @@ class TradingRuntimeCoordinator:
             self._zero_book_warned.discard(secid)
 
     def _start_optional_full_quote_sampler(self) -> None:
-        if not (self.settings.full_quote_sampler_enabled and self.full_quote_secid_tag):
-            return
-        try:
-            sampler = FullMarketQuoteSampler(
-                client_id=self.settings.credentials.client_id,
-                token=self.settings.credentials.access_token,
-                secid_tag_map=self.full_quote_secid_tag,
-                settings=self.settings,
-            )
-            threading.Thread(target=sampler.run, name="FullQuoteSampler", daemon=True).start()
-            logger.info("Full marketfeed sampler started | instruments=%s", len(self.full_quote_secid_tag))
-        except Exception:
-            logger.exception("Full marketfeed sampler not started")
+        """
+        Disabled to prevent API rate limit (429 Too Many Requests)
+        FullMarketQuoteSampler is redundant because:
+        - OptionDepthStream already provides real-time data
+        - OptionQuoteStream already provides LTP
+        """
+        return
 
     def _heartbeat_loop(self) -> None:
         last_heartbeat = 0.0
