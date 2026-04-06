@@ -77,6 +77,8 @@ class TradingRuntimeCoordinator:
         self._future_ready = threading.Event()
         self._zero_book_counter: Dict[int, int] = {}
         self._zero_book_warned = set()
+        self.ws_blocked_until = 0
+        self.ws_retry_delay = 1
 
         self.pairs = {index: PairRuntimeState(index=index) for index in self.settings.indexes}
         self.future_secids: Dict[str, int] = {}
@@ -97,17 +99,26 @@ class TradingRuntimeCoordinator:
         self._configure_underlying_contracts()
         if self.future_quote_stream is None:
             raise RuntimeError("Future quote stream is not configured")
-        self.future_quote_stream.start()
         subscriptions = [(secid, f"{index}_FUT") for index, secid in self.future_secids.items()]
-        print("🚀 SUBSCRIBING FUTURE:", subscriptions)
-        self.future_quote_stream.subscribe(subscriptions)
+        try:
+            self.future_quote_stream.start()
+            print("🚀 SUBSCRIBING FUTURE:", subscriptions)
+            self.future_quote_stream.subscribe(subscriptions)
+        except Exception as error:
+            self._handle_ws_error(error)
 
         if self.option_quote_stream is None:
             raise RuntimeError("Option quote stream is not configured")
-        self.option_quote_stream.start()
+        try:
+            self.option_quote_stream.start()
+        except Exception as error:
+            self._handle_ws_error(error)
         if self.option_depth_stream is None:
             raise RuntimeError("Option depth stream is not configured")
-        self.option_depth_stream.start()
+        try:
+            self.option_depth_stream.start()
+        except Exception as error:
+            self._handle_ws_error(error)
 
         self._wait_for_underlyings()
         self._select_and_subscribe_option_pairs()
@@ -143,7 +154,46 @@ class TradingRuntimeCoordinator:
             if self._all_underlyings_ready():
                 break
             logger.info("FUTURE_WS_STARTUP_RETRY")
+            self._retry_future_ws_startup()
         logger.info("Future websocket LTP stream ready")
+
+    def _retry_future_ws_startup(self) -> None:
+        now = time.time()
+
+        # 🚫 HARD BLOCK CHECK
+        if now < self.ws_blocked_until:
+            return
+
+        time.sleep(self.ws_retry_delay)
+        try:
+            if self.future_quote_stream is None:
+                return
+            self.future_quote_stream.start()
+            subscriptions = [(secid, f"{index}_FUT") for index, secid in self.future_secids.items()]
+            self.future_quote_stream.subscribe(subscriptions)
+        except Exception as error:
+            self._handle_ws_error(error)
+
+    def _handle_ws_error(self, error: Exception) -> None:
+        if "429" in str(error):
+            # 🚫 block all WS attempts for cooldown
+            self.ws_blocked_until = time.time() + 120  # 2 min block
+
+            # 🔁 exponential backoff
+            self.ws_retry_delay = min(self.ws_retry_delay * 2, 60)
+
+            logger.error(
+                "🚫 WS BLOCKED | cooldown=120s | retry_delay=%ss",
+                self.ws_retry_delay,
+            )
+        else:
+            logger.exception("WS_RUNTIME_ERROR | error=%s", error)
+
+    def _handle_ws_connected(self) -> None:
+        if self.ws_retry_delay != 1 or self.ws_blocked_until != 0:
+            self.ws_retry_delay = 1
+            self.ws_blocked_until = 0
+            logger.info("✅ WS_CONNECTED | retry_reset")
 
     def _all_underlyings_ready(self) -> bool:
         with self._lock:
@@ -182,6 +232,7 @@ class TradingRuntimeCoordinator:
                     self.full_quote_secid_tag[secid] = tag
 
     def on_future_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
+        self._handle_ws_connected()
         with self._lock:
             index = self.future_index_by_secid.get(int(secid))
             if index is None:
@@ -203,6 +254,7 @@ class TradingRuntimeCoordinator:
                 self._future_ready.set()
 
     def _on_option_full_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
+        self._handle_ws_connected()
         with self._lock:
             index = self.option_index_by_secid.get(int(secid))
             if index is None:
