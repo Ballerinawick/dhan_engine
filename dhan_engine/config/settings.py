@@ -3,8 +3,8 @@ from dataclasses import dataclass, field
 from datetime import time as dtime
 from typing import Dict, Tuple
 
-import pytz
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
 
 load_dotenv()
@@ -49,7 +49,7 @@ class RuntimeSettings:
 
     @property
     def timezone(self):
-        return pytz.timezone("Asia/Kolkata")
+        return ZoneInfo(self.timezone_name)
 
 
 def _csv_file() -> str:
