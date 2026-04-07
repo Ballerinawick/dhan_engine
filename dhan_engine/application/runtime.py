@@ -4,6 +4,7 @@ import threading
 import time
 from datetime import datetime
 from typing import Dict, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -78,9 +79,10 @@ class TradingRuntimeCoordinator:
         self._zero_book_counter: Dict[int, int] = {}
         self._zero_book_warned = set()
         self.ws_blocked_until = 0
-        self.ws_retry_delay = 1
+        self.ws_retry_delay = 5
         self._future_ws_started = False
         self._future_ws_subscribed = False
+        self.timezone = ZoneInfo("Asia/Kolkata")
 
         self.pairs = {index: PairRuntimeState(index=index) for index in self.settings.indexes}
         self.future_secids: Dict[str, int] = {}
@@ -135,7 +137,7 @@ class TradingRuntimeCoordinator:
         self._heartbeat_loop()
 
     def market_open(self) -> bool:
-        now = datetime.now(self.settings.timezone)
+        now = datetime.now(self.timezone)
 
         if now.weekday() >= 5:
             return False
@@ -171,17 +173,26 @@ class TradingRuntimeCoordinator:
 
     def _retry_future_ws_startup(self) -> None:
         now = time.time()
+        last_retry_time = getattr(self, "_last_retry_time", 0)
 
-        if now < self.ws_blocked_until:
+        if now - last_retry_time < self.ws_retry_delay:
             return
 
+        if now < self.ws_blocked_until:
+            remaining = int(self.ws_blocked_until - now)
+            logger.info(
+                "⏳ WS_BLOCK_ACTIVE | retry paused | remaining=%ss",
+                remaining,
+            )
+            return
+
+        self._last_retry_time = time.time()
         time.sleep(self.ws_retry_delay)
 
         try:
             if self.future_quote_stream is None:
                 return
 
-            # ONLY re-subscribe if needed
             if not self._future_ws_subscribed:
                 subscriptions = [
                     (secid, f"{index}_FUT")
@@ -199,25 +210,22 @@ class TradingRuntimeCoordinator:
             self._handle_ws_error(error)
 
     def _handle_ws_error(self, error: Exception) -> None:
-        self._future_ws_subscribed = False
+        error_str = str(error)
 
-        if "429" in str(error):
-            # 🚫 block all WS attempts for cooldown
-            self.ws_blocked_until = time.time() + 120  # 2 min block
-
-            # 🔁 exponential backoff
+        if "429" in error_str or "Too many requests" in error_str:
+            self.ws_blocked_until = time.time() + 60
             self.ws_retry_delay = min(self.ws_retry_delay * 2, 60)
-
             logger.error(
-                "🚫 WS BLOCKED | cooldown=120s | retry_delay=%ss",
-                self.ws_retry_delay,
+                "🚫 WS_BLOCKED | 429 detected | blocking retries for 60s"
             )
         else:
             logger.exception("WS_RUNTIME_ERROR | error=%s", error)
 
+        self._future_ws_subscribed = False
+
     def _handle_ws_connected(self) -> None:
-        if self.ws_retry_delay != 1 or self.ws_blocked_until != 0:
-            self.ws_retry_delay = 1
+        if self.ws_retry_delay != 5 or self.ws_blocked_until != 0:
+            self.ws_retry_delay = 5
             self.ws_blocked_until = 0
             logger.info("✅ WS_CONNECTED | retry_reset")
 
@@ -532,14 +540,14 @@ class TradingRuntimeCoordinator:
         logger.info("LIVE: INSTITUTIONAL OPTIONS ENGINE ACTIVE")
         while True:
             if not self.market_open():
-                logger.info("⏸️ MARKET_CLOSED | idle mode active")
+                logger.info("⏸️ MARKET_CLOSED | idle mode")
                 time.sleep(30.0)
                 continue
 
             now = time.time()
             if now - last_heartbeat >= self.settings.heartbeat_sec:
                 last_heartbeat = now
-                logger.info("%s ENGINE_RUNNING", datetime.now(self.settings.timezone).strftime("%H:%M:%S"))
+                logger.info("%s ENGINE_RUNNING", datetime.now(self.timezone).strftime("%H:%M:%S"))
                 logger.info(
                     "📊 FLOW | CE_vel=%.2f | PE_vel=%.2f | DOM=%s",
                     self.premium_flow["CE"]["velocity"],
