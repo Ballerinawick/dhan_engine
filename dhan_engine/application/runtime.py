@@ -79,6 +79,8 @@ class TradingRuntimeCoordinator:
         self._zero_book_warned = set()
         self.ws_blocked_until = 0
         self.ws_retry_delay = 1
+        self._future_ws_started = False
+        self._future_ws_subscribed = False
 
         self.pairs = {index: PairRuntimeState(index=index) for index in self.settings.indexes}
         self.future_secids: Dict[str, int] = {}
@@ -101,9 +103,14 @@ class TradingRuntimeCoordinator:
             raise RuntimeError("Future quote stream is not configured")
         subscriptions = [(secid, f"{index}_FUT") for index, secid in self.future_secids.items()]
         try:
-            self.future_quote_stream.start()
-            print("🚀 SUBSCRIBING FUTURE:", subscriptions)
-            self.future_quote_stream.subscribe(subscriptions)
+            if not self._future_ws_started:
+                self.future_quote_stream.start()
+                self._future_ws_started = True
+
+            if not self._future_ws_subscribed:
+                print("🚀 SUBSCRIBING FUTURE:", subscriptions)
+                self.future_quote_stream.subscribe(subscriptions)
+                self._future_ws_subscribed = True
         except Exception as error:
             self._handle_ws_error(error)
 
@@ -129,9 +136,14 @@ class TradingRuntimeCoordinator:
 
     def market_open(self) -> bool:
         now = datetime.now(self.settings.timezone)
+
         if now.weekday() >= 5:
             return False
-        return self.settings.market_start <= now.time() <= self.settings.market_end
+
+        market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+
+        return market_start <= now <= market_end
 
     def _configure_underlying_contracts(self) -> None:
         for index in self.settings.indexes:
@@ -160,21 +172,35 @@ class TradingRuntimeCoordinator:
     def _retry_future_ws_startup(self) -> None:
         now = time.time()
 
-        # 🚫 HARD BLOCK CHECK
         if now < self.ws_blocked_until:
             return
 
         time.sleep(self.ws_retry_delay)
+
         try:
             if self.future_quote_stream is None:
                 return
-            self.future_quote_stream.start()
-            subscriptions = [(secid, f"{index}_FUT") for index, secid in self.future_secids.items()]
-            self.future_quote_stream.subscribe(subscriptions)
+
+            # ONLY re-subscribe if needed
+            if not self._future_ws_subscribed:
+                subscriptions = [
+                    (secid, f"{index}_FUT")
+                    for index, secid in self.future_secids.items()
+                ]
+                self.future_quote_stream.subscribe(subscriptions)
+                self._future_ws_subscribed = True
+
+            logger.info(
+                "🔁 WS_RETRY | subscribe_only | delay=%ss",
+                self.ws_retry_delay,
+            )
+
         except Exception as error:
             self._handle_ws_error(error)
 
     def _handle_ws_error(self, error: Exception) -> None:
+        self._future_ws_subscribed = False
+
         if "429" in str(error):
             # 🚫 block all WS attempts for cooldown
             self.ws_blocked_until = time.time() + 120  # 2 min block
@@ -301,6 +327,9 @@ class TradingRuntimeCoordinator:
             self._process_option_update(index, pair, secid, tag, raw)
 
     def _process_option_update(self, index: str, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
+        if not self.market_open():
+            return
+
         side = "CE" if "CE" in tag else "PE" if "PE" in tag else None
         if side:
             pf = self.premium_flow[side]
@@ -335,6 +364,9 @@ class TradingRuntimeCoordinator:
         self._process_exit_engines(pair, secid, tag, raw)
 
     def _update_market_snapshot(self, pair: PairRuntimeState, raw: dict, secid: int, tag: str) -> None:
+        if not self.market_open():
+            return
+
         ce_input, pe_input = pair.build_market_inputs()
         if ce_input is None or pe_input is None or pair.underlying_ltp is None:
             return
@@ -500,8 +532,8 @@ class TradingRuntimeCoordinator:
         logger.info("LIVE: INSTITUTIONAL OPTIONS ENGINE ACTIVE")
         while True:
             if not self.market_open():
-                logger.info("Market closed. Sleeping.")
-                time.sleep(60.0)
+                logger.info("⏸️ MARKET_CLOSED | idle mode active")
+                time.sleep(30.0)
                 continue
 
             now = time.time()

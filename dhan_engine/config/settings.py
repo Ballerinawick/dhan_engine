@@ -2,8 +2,8 @@ import os
 from dataclasses import dataclass, field
 from datetime import time as dtime
 from typing import Dict, Tuple
-from zoneinfo import ZoneInfo
 
+import pytz
 from dotenv import load_dotenv
 
 
@@ -48,8 +48,8 @@ class RuntimeSettings:
     master_url: str = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
     @property
-    def timezone(self) -> ZoneInfo:
-        return ZoneInfo(self.timezone_name)
+    def timezone(self):
+        return pytz.timezone("Asia/Kolkata")
 
 
 def _csv_file() -> str:
