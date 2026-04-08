@@ -450,9 +450,9 @@ class TradingRuntimeCoordinator:
 
         flow = self.premium_flow.get("dominant")
 
-        active = self.paper_trader.trades.get(secid)
+        active = self.paper_trader.positions.get(secid)
         if active:
-            entry = active.get("entry_price", 0)
+            entry = active.get("entry", 0)
             if entry > 0:
 
                 pnl_pct = ((raw["ltp"] - entry) / entry) * 100

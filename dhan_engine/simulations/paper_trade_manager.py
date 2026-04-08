@@ -36,6 +36,7 @@ class PaperTradeManager:
         self.cash = float(capital)
 
         self.positions = {}
+        self.trades = self.positions
         self.realized_pnl = 0.0
 
         self.last_log_ts = 0.0
