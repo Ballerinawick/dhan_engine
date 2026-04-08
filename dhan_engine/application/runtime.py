@@ -392,6 +392,8 @@ class TradingRuntimeCoordinator:
 
         pair.last_turn_signal = turn_signal
         route_secid, route_tag, route_ltp = pair.route_for_signal(turn_signal.get("signal"), tag, raw["ltp"])
+        print("TURN_SIGNAL →", turn_signal)
+        print("ROUTED →", route_secid, route_tag, route_ltp)
         if route_secid is None:
             return
 
@@ -399,13 +401,12 @@ class TradingRuntimeCoordinator:
 
         if flow:
             if flow == "CE" and "PE" in route_tag:
-                logger.info("🚫 FLOW_BLOCK | PE against CE dominance")
-                return
+                logger.info("⚠️ FLOW_SOFT_BLOCK | PE against CE dominance")
 
-            if flow == "PE" and "CE" in route_tag:
-                logger.info("🚫 FLOW_BLOCK | CE against PE dominance")
-                return
+            elif flow == "PE" and "CE" in route_tag:
+                logger.info("⚠️ FLOW_SOFT_BLOCK | CE against PE dominance")
 
+        print("CALLING_DECISION_ENGINE →", route_tag, route_ltp)
         decision = self.decision_engine.on_signal(
             secid=route_secid,
             tag=route_tag,
