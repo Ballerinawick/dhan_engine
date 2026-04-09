@@ -96,6 +96,14 @@ class TradingRuntimeCoordinator:
             "dominant": None,
             "last_update": 0.0,
         }
+        self.last_reselection_ts = 0.0
+        self.reselection_cooldown_sec = 30
+        self.last_selected_underlying: Dict[str, float] = {}
+        self.reselection_move_threshold = {
+            "NIFTY": 40,
+            "BANKNIFTY": 100,
+            "FINNIFTY": 40,
+        }
 
     def run(self) -> None:
         logger.info("MODE: FUTURE_WS_STREAM + OPTION_WS_STREAM + OPTION_DEPTH_STREAM")
@@ -286,6 +294,79 @@ class TradingRuntimeCoordinator:
             )
             if self._all_underlyings_ready():
                 self._future_ready.set()
+            self._reselect_option_pair_if_needed(index)
+
+    def _should_reselect_options(self, index: str, underlying_ltp: float) -> bool:
+        last = self.last_selected_underlying.get(index)
+        if last is None:
+            self.last_selected_underlying[index] = float(underlying_ltp)
+            return False
+
+        threshold = self.reselection_move_threshold.get(index, 40)
+        moved = abs(float(underlying_ltp) - float(last))
+
+        now = time.time()
+        if moved >= threshold and (now - self.last_reselection_ts) >= self.reselection_cooldown_sec:
+            return True
+
+        return False
+
+    def _reselect_option_pair_if_needed(self, index: str) -> None:
+        pair = self.pairs.get(index)
+        if pair is None or pair.underlying_ltp is None:
+            return
+
+        if not self._should_reselect_options(index, pair.underlying_ltp):
+            return
+
+        active_ce = pair.ce_id in self.paper_trader.positions if pair.ce_id else False
+        active_pe = pair.pe_id in self.paper_trader.positions if pair.pe_id else False
+        if active_ce or active_pe:
+            logger.info("RESELECT_SKIPPED_ACTIVE_POSITION | index=%s", index)
+            return
+
+        selection = self.selector.select_best(index, underlying_ltp_override=pair.underlying_ltp)
+        if not selection:
+            logger.warning("RESELECT_NO_SELECTION | index=%s", index)
+            return
+
+        old_ce = pair.ce_id
+        old_pe = pair.pe_id
+
+        new_ce = int(selection["CE"]["security_id"]) if "CE" in selection else None
+        new_pe = int(selection["PE"]["security_id"]) if "PE" in selection else None
+
+        if old_ce == new_ce and old_pe == new_pe:
+            self.last_selected_underlying[index] = float(pair.underlying_ltp)
+            self.last_reselection_ts = time.time()
+            logger.info("RESELECT_NO_CHANGE | index=%s", index)
+            return
+
+        subscriptions = []
+        if new_ce:
+            pair.ce_id = new_ce
+            self.option_index_by_secid[new_ce] = index
+            subscriptions.append((new_ce, f"{index}_CE"))
+        if new_pe:
+            pair.pe_id = new_pe
+            self.option_index_by_secid[new_pe] = index
+            subscriptions.append((new_pe, f"{index}_PE"))
+
+        if subscriptions:
+            if self.option_depth_stream is not None:
+                self.option_depth_stream.subscribe(subscriptions)
+            if self.option_quote_stream is not None:
+                self.option_quote_stream.subscribe(subscriptions)
+            for secid, mapped_tag in subscriptions:
+                self.full_quote_secid_tag[secid] = mapped_tag
+
+        self.last_selected_underlying[index] = float(pair.underlying_ltp)
+        self.last_reselection_ts = time.time()
+
+        logger.info(
+            "RESELECT_DONE | index=%s | old_ce=%s | new_ce=%s | old_pe=%s | new_pe=%s | underlying=%.2f",
+            index, old_ce, new_ce, old_pe, new_pe, float(pair.underlying_ltp)
+        )
 
     def _on_option_full_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
         self._handle_ws_connected()
@@ -379,6 +460,14 @@ class TradingRuntimeCoordinator:
         if ce_input is None or pe_input is None or pair.underlying_ltp is None:
             return
 
+        print("SNAPSHOT_GATE →", {
+            "index": pair.index,
+            "underlying": pair.underlying_ltp,
+            "ce_ready": ce_input is not None,
+            "pe_ready": pe_input is not None,
+            "flow_dom": self.premium_flow.get("dominant"),
+        })
+
         snapshot = self.market_engine.update(pair.index, pair.underlying_ltp, ce_input, pe_input)
         if not snapshot:
             return
@@ -388,6 +477,7 @@ class TradingRuntimeCoordinator:
 
         turn_signal = self.turn_engine.update(snapshot)
         if not turn_signal:
+            print("TURN_SIGNAL_NONE →", pair.index)
             return
 
         pair.last_turn_signal = turn_signal
@@ -395,6 +485,7 @@ class TradingRuntimeCoordinator:
         print("TURN_SIGNAL →", turn_signal)
         print("ROUTED →", route_secid, route_tag, route_ltp)
         if route_secid is None:
+            print("ROUTE_FAILED →", turn_signal)
             return
 
         flow = self.premium_flow.get("dominant")
