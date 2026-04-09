@@ -342,6 +342,19 @@ class TradingRuntimeCoordinator:
             logger.info("RESELECT_NO_CHANGE | index=%s", index)
             return
 
+        # 🧹 CLEAR OLD STATE (MANDATORY)
+        pair.ce_depth = None
+        pair.pe_depth = None
+        pair.ce_ltp = None
+        pair.pe_ltp = None
+        pair.ready_logged = False
+
+        if old_ce:
+            self.option_index_by_secid.pop(old_ce, None)
+
+        if old_pe:
+            self.option_index_by_secid.pop(old_pe, None)
+
         subscriptions = []
         if new_ce:
             pair.ce_id = new_ce
@@ -366,6 +379,10 @@ class TradingRuntimeCoordinator:
         logger.info(
             "RESELECT_DONE | index=%s | old_ce=%s | new_ce=%s | old_pe=%s | new_pe=%s | underlying=%.2f",
             index, old_ce, new_ce, old_pe, new_pe, float(pair.underlying_ltp)
+        )
+        logger.info(
+            "🧹 STATE_RESET_DONE | index=%s | new_ce=%s | new_pe=%s",
+            index, new_ce, new_pe
         )
 
     def _on_option_full_quote(self, secid: int, tag: str, ltp: float, depth) -> None:

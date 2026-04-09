@@ -377,23 +377,13 @@ class InstitutionalDecisionEngine:
 
         # ================= POST ENTRY =================
         if secid not in paper_trader.positions:
-            print("DECISION_FELL_THROUGH →", {
-                "secid": secid,
-                "tag": tag,
-                "signal": signal,
-                "reason": "NO_OPEN_POSITION",
-            })
-            return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
+            print("POST_ENTRY_SKIP → NO_OPEN_POSITION")
+            return None
 
         ctx = self.trade_ctx.get(secid)
         if not ctx:
-            print("DECISION_FELL_THROUGH →", {
-                "secid": secid,
-                "tag": tag,
-                "signal": signal,
-                "reason": "NO_TRADE_CONTEXT",
-            })
-            return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
+            print("POST_ENTRY_SKIP → NO_TRADE_CONTEXT")
+            return None
 
         ctx["accept"] += 1
         if ctx["mode"] == "SCALP" and ctx["accept"] >= self.MODE_UPGRADE_CONFIRM_TICKS:
@@ -407,13 +397,8 @@ class InstitutionalDecisionEngine:
             )
 
         if ctx["mode"] == "TREND":
-            print("DECISION_FELL_THROUGH →", {
-                "secid": secid,
-                "tag": tag,
-                "signal": signal,
-                "reason": "TREND_MODE_HOLD",
-            })
-            return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
+            print("POST_ENTRY_HOLD → TREND_MODE")
+            return None
 
         recent = list(self.price_track[secid])[-5:]
         bal = sum(p for _, p in recent) / len(recent) if recent else ltp
@@ -425,13 +410,8 @@ class InstitutionalDecisionEngine:
             ctx["disp_start"] = None
 
         if ctx["disp_start"] and now - ctx["disp_start"] >= self.HOLD_CONFIRM_SEC:
-            print("DECISION_FELL_THROUGH →", {
-                "secid": secid,
-                "tag": tag,
-                "signal": signal,
-                "reason": "DISPLACEMENT_CONFIRM_WAIT",
-            })
-            return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
+            print("POST_ENTRY_HOLD → DISPLACEMENT_CONFIRM_WAIT")
+            return None
 
         if now > ctx["post_validate_until"]:
             paper_trader.on_exit(secid, ltp, reason="ENTRY_INVALIDATED")
@@ -462,9 +442,9 @@ class InstitutionalDecisionEngine:
             })
             return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
 
-        print("DECISION_FELL_THROUGH →", {
+        print("DECISION_NO_ACTION →", {
             "secid": secid,
             "tag": tag,
             "signal": signal
         })
-        return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
+        return None
