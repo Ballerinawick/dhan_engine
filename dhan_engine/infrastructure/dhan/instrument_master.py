@@ -190,18 +190,10 @@ class InstrumentMaster:
         if expiries.empty:
             raise Exception(f"❌ No valid expiries for {idx}")
 
-        # NIFTY -> prefer weekly Tuesday (not last Tuesday)
+        # NIFTY -> always pick nearest available expiry
         if idx == "NIFTY":
-            if prefer_weekly:
-                weekly = [d for d in expiries.tolist() if self._is_tuesday(d) and (not self._is_last_tuesday(d))]
-                if weekly:
-                    chosen = weekly[0]
-                    self._log(f"📅 {idx} weekly expiry selected: {chosen.date()} (Tue, not last Tue)")
-                    return chosen
-
-            # fallback to nearest expiry
             chosen = expiries.iloc[0]
-            self._log(f"📅 {idx} nearest expiry selected (fallback): {chosen.date()}")
+            self._log(f"📅 {idx} nearest expiry selected: {chosen.date()}")
             return chosen
 
         # BANKNIFTY / FINNIFTY -> monthly only (prefer last Tuesday)
