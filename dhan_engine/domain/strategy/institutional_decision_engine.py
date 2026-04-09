@@ -130,6 +130,13 @@ class InstitutionalDecisionEngine:
 
     # --------------------------------------------------
     def on_signal(self, *, secid, tag, ltp, signal, momentum_engine, paper_trader, snapshot=None):
+        print("DECISION_ENGINE_INPUT →", {
+            "secid": secid,
+            "tag": tag,
+            "ltp": ltp,
+            "signal": signal,
+            "has_snapshot": snapshot is not None,
+        })
         now = time.time()
         index = self._index_from_tag(tag)
         side = self._side_from_tag(tag)
@@ -189,6 +196,7 @@ class InstitutionalDecisionEngine:
             elif signal == "BEARISH_CONTINUATION" and last_turn == "REAL_BEARISH_TURN":
                 entry_side = "PE"
             else:
+                print("DECISION_REJECT_REASON → TURN_NOT_MATCHED")
                 return {"entry_allowed": False}
 
 
@@ -204,18 +212,22 @@ class InstitutionalDecisionEngine:
             if snapshot.get("market_regime") == "COMPRESSED":
                 if abs(snapshot.get("dominance_score", 0)) < 0.20:
                     self._log_event(event="ENTRY_BLOCK", reason="WEAK_COMPRESSION", index=index)
+                    print("DECISION_REJECT_REASON → LOW_DOM")
                     return {"entry_allowed": False}
 
             if abs(snapshot.get("flow_diff", 0)) < 1200:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_FLOW", index=index)
+                print("DECISION_REJECT_REASON → LOW_FLOW")
                 return {"entry_allowed": False}
 
             if abs(snapshot.get("dominance_score", 0)) < 0.18:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_DOM", index=index)
+                print("DECISION_REJECT_REASON → LOW_DOM")
                 return {"entry_allowed": False}
 
             if abs(snapshot.get("pressure_diff", 0)) < 0.10:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_PRESSURE", index=index)
+                print("DECISION_REJECT_REASON → LOW_PRESSURE")
                 return {"entry_allowed": False}
 
             if index in self.index_active_secid and self.index_active_secid[index] in paper_trader.positions:
@@ -228,6 +240,7 @@ class InstitutionalDecisionEngine:
                     side=entry_side,
                     reason="INDEX_LOCKED",
                 )
+                print("DECISION_REJECT_REASON → INDEX_LOCKED")
                 return {"entry_allowed": False}
 
             if not self._cooldown_ok(index, now):
@@ -240,6 +253,7 @@ class InstitutionalDecisionEngine:
                     side=entry_side,
                     reason="COOLDOWN",
                 )
+                print("DECISION_REJECT_REASON → COOLDOWN")
                 return {"entry_allowed": False}
 
             last_exit_side = self.index_last_exit_side.get(index)
@@ -255,6 +269,7 @@ class InstitutionalDecisionEngine:
                     side=entry_side,
                     reason="FLIP_NO_SHADOW",
                 )
+                print("DECISION_REJECT_REASON → FLIP_NO_SHADOW")
                 return {"entry_allowed": False}
 
             if not is_flip and self.REENTRY_ALLOW_WITHOUT_STRUCT:
@@ -270,6 +285,7 @@ class InstitutionalDecisionEngine:
                     side=entry_side,
                     reason="STRUCT_NOT_OK",
                 )
+                print("DECISION_REJECT_REASON → STRUCT_NOT_OK")
                 return {"entry_allowed": False}
 
             print("BEFORE_PAPER_ENTRY →", secid, tag, ltp)
@@ -293,6 +309,7 @@ class InstitutionalDecisionEngine:
                     side=entry_side,
                     reason="PAPER_TRADER_REJECT",
                 )
+                print("DECISION_REJECT_REASON → PAPER_TRADER_REJECT")
                 return {"entry_allowed": False}
 
             trade = {
@@ -360,11 +377,23 @@ class InstitutionalDecisionEngine:
 
         # ================= POST ENTRY =================
         if secid not in paper_trader.positions:
-            return
+            print("DECISION_FELL_THROUGH →", {
+                "secid": secid,
+                "tag": tag,
+                "signal": signal,
+                "reason": "NO_OPEN_POSITION",
+            })
+            return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
 
         ctx = self.trade_ctx.get(secid)
         if not ctx:
-            return
+            print("DECISION_FELL_THROUGH →", {
+                "secid": secid,
+                "tag": tag,
+                "signal": signal,
+                "reason": "NO_TRADE_CONTEXT",
+            })
+            return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
 
         ctx["accept"] += 1
         if ctx["mode"] == "SCALP" and ctx["accept"] >= self.MODE_UPGRADE_CONFIRM_TICKS:
@@ -378,7 +407,13 @@ class InstitutionalDecisionEngine:
             )
 
         if ctx["mode"] == "TREND":
-            return
+            print("DECISION_FELL_THROUGH →", {
+                "secid": secid,
+                "tag": tag,
+                "signal": signal,
+                "reason": "TREND_MODE_HOLD",
+            })
+            return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
 
         recent = list(self.price_track[secid])[-5:]
         bal = sum(p for _, p in recent) / len(recent) if recent else ltp
@@ -390,7 +425,13 @@ class InstitutionalDecisionEngine:
             ctx["disp_start"] = None
 
         if ctx["disp_start"] and now - ctx["disp_start"] >= self.HOLD_CONFIRM_SEC:
-            return
+            print("DECISION_FELL_THROUGH →", {
+                "secid": secid,
+                "tag": tag,
+                "signal": signal,
+                "reason": "DISPLACEMENT_CONFIRM_WAIT",
+            })
+            return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
 
         if now > ctx["post_validate_until"]:
             paper_trader.on_exit(secid, ltp, reason="ENTRY_INVALIDATED")
@@ -413,4 +454,17 @@ class InstitutionalDecisionEngine:
                 secid=secid,
                 reason="ENTRY_INVALIDATED",
             )
-            return
+            print("DECISION_FELL_THROUGH →", {
+                "secid": secid,
+                "tag": tag,
+                "signal": signal,
+                "reason": "ENTRY_INVALIDATED",
+            })
+            return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
+
+        print("DECISION_FELL_THROUGH →", {
+            "secid": secid,
+            "tag": tag,
+            "signal": signal
+        })
+        return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}

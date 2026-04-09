@@ -84,6 +84,14 @@ class PaperTradeManager:
     def has_open_position(self):
         return len(self.positions) > 0
 
+    def debug_position_snapshot(self):
+        print("PAPER_TRADER_STATE →", {
+            "open_positions": len(self.positions),
+            "keys": list(self.positions.keys()),
+            "cash": self.cash,
+            "realized_pnl": self.realized_pnl,
+        })
+
     # --------------------------------------------------
     # ENTRY
     # --------------------------------------------------
@@ -93,6 +101,7 @@ class PaperTradeManager:
             print(
                 f"⛔ ENTRY_BLOCKED_SINGLE_POSITION | Attempt:{tag} | Reason:Existing position active"
             )
+            self.debug_position_snapshot()
             return False
 
         # if self.has_open_position():
@@ -102,6 +111,7 @@ class PaperTradeManager:
         #         return False
 
         if secid in self.positions:
+            self.debug_position_snapshot()
             return False
 
         side_norm = str(side).upper()
@@ -109,10 +119,12 @@ class PaperTradeManager:
             print(
                 f"🛑 LONG_ONLY_BLOCKED | attempted={side_norm} | secid={secid} | strategy={reason}"
             )
+            self.debug_position_snapshot()
             return False
 
         index = self._extract_index(tag)
         if not index:
+            self.debug_position_snapshot()
             return False
 
         lot_size = self.LOT_SIZES[index]
@@ -120,6 +132,7 @@ class PaperTradeManager:
         cost = qty * ltp
 
         if cost > self.cash:
+            self.debug_position_snapshot()
             return False
 
         now_ts = time.time()
@@ -155,6 +168,7 @@ class PaperTradeManager:
             f"Entry:{ltp:.2f} | "
             f"RoundTripFee:{self.ROUND_TRIP_FEE}"
         )
+        self.debug_position_snapshot()
         self._log_consolidated()
         return True
 
@@ -235,6 +249,7 @@ class PaperTradeManager:
             f"EntryTime:{self.last_trade_summary['entry_time']} | ExitTime:{self.last_trade_summary['exit_time']} | "
             f"EntryReason:{pos.get('entry_reason')} | ExitReason:{reason}"
         )
+        self.debug_position_snapshot()
         self._log_consolidated()
 
     def _log_open_positions(self):
