@@ -37,6 +37,7 @@ class InstitutionalDecisionEngine:
         self.trade_ctx = {}
         self.price_track = defaultdict(deque)
         self.last_turn_signal = {}
+        self.last_entry_ts = {}
 
         self.index_active_side = {}
         self.index_active_secid = {}
@@ -161,19 +162,9 @@ class InstitutionalDecisionEngine:
             entry_side = None
 
         if entry_side:
-            print("⚠️ FORCE ENTRY ON TURN (DEBUG MODE)")
-            print("BEFORE_PAPER_ENTRY →", secid, tag, ltp)
-            entry_accepted = paper_trader.on_entry(
-                secid=secid,
-                tag=tag,
-                side="LONG",
-                ltp=ltp,
-                lots=1,
-                reason="FORCED_TURN_ENTRY"
-            )
-            print("AFTER_PAPER_ENTRY →", entry_accepted)
-            print("POSITIONS_NOW →", paper_trader.positions)
-            return {"entry_allowed": entry_accepted}
+            # ✅ DO NOT FORCE ENTRY
+            # Only store turn signal — continuation logic will decide entry
+            pass
 
         self._update_price_history(secid, now, ltp)
         struct_ok = self._structure_ok(secid)
@@ -199,6 +190,10 @@ class InstitutionalDecisionEngine:
                 print("DECISION_REJECT_REASON → TURN_NOT_MATCHED")
                 return {"entry_allowed": False}
 
+            last_ts = self.last_entry_ts.get(index)
+            if last_ts and (time.time() - last_ts) < 25:
+                print("DECISION_REJECT_REASON → ENTRY_COOLDOWN")
+                return {"entry_allowed": False}
 
             print(
                 "ENTRY_CHECK →",
@@ -333,6 +328,7 @@ class InstitutionalDecisionEngine:
 
             self.index_active_side[index] = entry_side
             self.index_active_secid[index] = secid
+            self.last_entry_ts[index] = time.time()
 
             self.trade_ctx[secid] = {
                 "mode": self.MODE_DEFAULT,
