@@ -43,6 +43,19 @@ class TradingRuntimeCoordinator:
     FLOW_REVERSAL_CONFIRM_TICKS = 3
     FLOW_REVERSAL_MIN_HOLD_SEC = 20
     FLOW_REVERSAL_MIN_LOSS_PCT = -0.20
+    FLOW_REVERSAL_CONFIRM_WINDOW_SEC = 8
+    FLOW_REVERSAL_CONFIRM_MIN_INTERVAL_SEC = 1.0
+    FLOW_REVERSAL_DECISION_COOLDOWN_SEC = 1.0
+    PREMATURE_EXIT_THRESHOLD_SEC = 20
+
+    EXIT_REASON_PRIORITY = {
+        "OPPOSITE_TURN_CONFIRMED": 10,
+        "STRUCTURE_BREAKDOWN": 20,
+        "TRAIL_HIT": 30,
+        "MOMENTUM_EXIT": 35,
+        "FLOW_REVERSAL_CONFIRMED": 40,
+        "STRATEGY_EXIT": 50,
+    }
 
     def __init__(
         self,
@@ -107,7 +120,14 @@ class TradingRuntimeCoordinator:
             "BANKNIFTY": 100,
             "FINNIFTY": 40,
         }
-        self.flow_reversal_streak: Dict[int, int] = {}
+        self.flow_reversal_state: Dict[int, dict] = {}
+        self._tick_exit_guard: Dict[int, dict] = {}
+        self.metrics = {
+            "exit_reason_counts": defaultdict(int),
+            "hold_time_buckets": defaultdict(int),
+            "premature_exits": 0,
+            "total_exits": 0,
+        }
 
     def run(self) -> None:
         logger.info("MODE: FUTURE_WS_STREAM + OPTION_WS_STREAM + OPTION_DEPTH_STREAM")
@@ -539,6 +559,8 @@ class TradingRuntimeCoordinator:
     def _process_exit_engines(self, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
         action = self.momentum_engine.on_tick(secid, raw)
         decision = {"exit_allowed": True}
+        tick_bucket = int(time.time() * 10)
+        self._tick_exit_guard[secid] = {"bucket": tick_bucket, "reason": None, "priority": None}
 
         if action == "EXIT":
             decision = self.decision_engine.on_signal(
@@ -550,21 +572,38 @@ class TradingRuntimeCoordinator:
                 paper_trader=self.paper_trader,
                 snapshot=pair.last_snapshot,
             )
+            if decision and decision.get("exit_allowed") is not False:
+                reason = decision.get("exit_reason", self.momentum_engine.last_exit_reason.get(secid, "MOMENTUM_EXIT"))
+                if self._attempt_exit_once(pair, secid, tag, raw["ltp"], reason):
+                    return
 
-        # STRUCTURE EXIT ONLY WHEN NO ACTIVE MOMENTUM TRADE
-        if secid not in self.momentum_engine.active_trade:
+        structure = self.structure_exit_engine.on_tick(
+            secid=secid,
+            tag=tag,
+            ltp=raw["ltp"],
+            paper_trader=self.paper_trader,
+            decision_engine=self.decision_engine,
+        )
+        if structure and structure.get("exit"):
+            reason = structure.get("reason", "STRUCTURE_BREAKDOWN")
+            logger.info("EXIT_OVERRIDE | %s | reason=%s", tag, reason)
+            if self._attempt_exit_once(pair, secid, tag, raw["ltp"], reason):
+                return
 
-            structure = self.structure_exit_engine.on_tick(
-                secid=secid,
-                tag=tag,
-                ltp=raw["ltp"],
-                paper_trader=self.paper_trader,
-                decision_engine=self.decision_engine,
-            )
+        active = self.paper_trader.positions.get(secid)
+        if not active:
+            self.flow_reversal_state.pop(secid, None)
 
-            if structure and structure.get("exit"):
-                logger.info("EXIT_OVERRIDE | %s | reason=%s", tag, structure["reason"])
-                self._force_exit(pair, secid, tag, raw["ltp"], structure["reason"])
+        trail = self.trailing_exit_engine.on_tick(
+            secid=secid,
+            tag=tag,
+            ltp=raw["ltp"],
+            paper_trader=self.paper_trader,
+            momentum_engine=self.momentum_engine,
+        )
+        if trail and trail.get("exit"):
+            logger.info("EXIT_OVERRIDE | %s | reason=%s", tag, trail["reason"])
+            if self._attempt_exit_once(pair, secid, tag, raw["ltp"], trail["reason"]):
                 return
 
         active = self.paper_trader.positions.get(secid)
@@ -583,30 +622,12 @@ class TradingRuntimeCoordinator:
                     pnl_pct=pnl_pct,
                     hold_sec=hold_sec,
                 )
-                if secid not in self.paper_trader.positions:
-                    return
-        else:
-            self.flow_reversal_streak.pop(secid, None)
-
-        trail = self.trailing_exit_engine.on_tick(
-            secid=secid,
-            tag=tag,
-            ltp=raw["ltp"],
-            paper_trader=self.paper_trader,
-            momentum_engine=self.momentum_engine,
-        )
-        if trail and trail.get("exit"):
-            logger.info("EXIT_OVERRIDE | %s | reason=%s", tag, trail["reason"])
-            self._force_exit(pair, secid, tag, raw["ltp"], trail["reason"])
-            return
-
-        if action == "EXIT":
-            if decision and decision.get("exit_allowed") is False:
-                return
-            reason = decision.get("exit_reason", self.momentum_engine.last_exit_reason.get(secid, action))
-            self._force_exit(pair, secid, tag, raw["ltp"], reason)
 
     def _force_exit(self, pair: PairRuntimeState, secid: int, tag: str, ltp: float, reason: str) -> bool:
+        active = self.paper_trader.positions.get(secid)
+        entry_ts = float(active.get("entry_ts", time.time())) if active else time.time()
+        hold_sec = max(time.time() - entry_ts, 0.0)
+
         try:
             decision = self.decision_engine.on_signal(
                 secid=secid,
@@ -623,12 +644,39 @@ class TradingRuntimeCoordinator:
             logger.exception("force_exit decision engine failure | secid=%s | reason=%s", secid, reason)
 
         self.paper_trader.on_exit(secid, ltp, reason=reason)
-        self.flow_reversal_streak.pop(secid, None)
+        self.flow_reversal_state.pop(secid, None)
         if hasattr(self.momentum_engine, "clear_trade"):
             self.momentum_engine.clear_trade(secid, reason)
         else:
             self.momentum_engine.active_trade.pop(secid, None)
+        self._record_exit_metrics(reason=reason, hold_sec=hold_sec, secid=secid, tag=tag)
         return True
+
+    def _attempt_exit_once(self, pair: PairRuntimeState, secid: int, tag: str, ltp: float, reason: str) -> bool:
+        tick_bucket = int(time.time() * 10)
+        reason_priority = self.EXIT_REASON_PRIORITY.get(reason, 999)
+        guard = self._tick_exit_guard.get(secid)
+        if not guard or guard.get("bucket") != tick_bucket:
+            guard = {"bucket": tick_bucket, "reason": None, "priority": None}
+        else:
+            used_priority = guard.get("priority")
+            if used_priority is not None and reason_priority >= used_priority:
+                logger.info(
+                    "EXIT_GUARD_SKIP | secid=%s | tag=%s | reason=%s | blocked_by=%s",
+                    secid,
+                    tag,
+                    reason,
+                    guard.get("reason"),
+                )
+                return False
+        if secid not in self.paper_trader.positions:
+            return False
+        success = self._force_exit(pair, secid, tag, ltp, reason)
+        if success:
+            guard["reason"] = reason
+            guard["priority"] = reason_priority
+            self._tick_exit_guard[secid] = guard
+        return success
 
     def _handle_flow_reversal_exit(
         self,
@@ -646,28 +694,70 @@ class TradingRuntimeCoordinator:
             or ("PE" in tag and flow == "CE")
         )
         if not opposite_flow:
-            self.flow_reversal_streak.pop(secid, None)
+            self.flow_reversal_state.pop(secid, None)
             return
 
+        state = self.flow_reversal_state.get(secid, {})
+        now = time.time()
+        last_eval_ts = float(state.get("last_eval_ts", 0.0))
+        if now - last_eval_ts < self.FLOW_REVERSAL_DECISION_COOLDOWN_SEC:
+            return
+        state["last_eval_ts"] = now
+
         if hold_sec < self.FLOW_REVERSAL_MIN_HOLD_SEC:
+            self.flow_reversal_state[secid] = state
             return
 
         if pnl_pct > self.FLOW_REVERSAL_MIN_LOSS_PCT:
+            state["count"] = 0
+            state["first_ts"] = 0.0
+            state["last_seen_ts"] = 0.0
+            self.flow_reversal_state[secid] = state
             return
 
-        streak = self.flow_reversal_streak.get(secid, 0) + 1
-        self.flow_reversal_streak[secid] = streak
-        if streak < self.FLOW_REVERSAL_CONFIRM_TICKS:
+        count = int(state.get("count", 0))
+        first_ts = float(state.get("first_ts", 0.0))
+        last_seen_ts = float(state.get("last_seen_ts", 0.0))
+        if not first_ts or now - first_ts > self.FLOW_REVERSAL_CONFIRM_WINDOW_SEC:
+            count = 0
+            first_ts = now
+
+        if last_seen_ts and now - last_seen_ts < self.FLOW_REVERSAL_CONFIRM_MIN_INTERVAL_SEC:
+            self.flow_reversal_state[secid] = {
+                "count": count,
+                "first_ts": first_ts,
+                "last_seen_ts": last_seen_ts,
+                "last_eval_ts": now,
+            }
+            return
+
+        count += 1
+        last_seen_ts = now
+        self.flow_reversal_state[secid] = {
+            "count": count,
+            "first_ts": first_ts,
+            "last_seen_ts": last_seen_ts,
+            "last_eval_ts": now,
+        }
+        if count < self.FLOW_REVERSAL_CONFIRM_TICKS:
+            logger.info(
+                "FLOW_EXIT_GUARD_WAIT | %s | count=%s/%s | hold=%.1fs | pnl_pct=%.3f",
+                tag,
+                count,
+                self.FLOW_REVERSAL_CONFIRM_TICKS,
+                hold_sec,
+                pnl_pct,
+            )
             return
 
         logger.info(
-            "🧠 FLOW_EXIT_CONFIRMED | %s | hold=%.1fs | pnl_pct=%.3f | streak=%s",
+            "🧠 FLOW_EXIT_CONFIRMED | %s | hold=%.1fs | pnl_pct=%.3f | count=%s",
             tag,
             hold_sec,
             pnl_pct,
-            streak,
+            count,
         )
-        self._force_exit(pair, secid, tag, ltp, "FLOW_REVERSAL_CONFIRMED")
+        self._attempt_exit_once(pair, secid, tag, ltp, "FLOW_REVERSAL_CONFIRMED")
 
     def _maybe_exit_on_opposite_turn(
         self,
@@ -703,12 +793,43 @@ class TradingRuntimeCoordinator:
             signal_name,
             opposite_tag,
         )
-        return self._force_exit(
+        return self._attempt_exit_once(
             pair,
             opposite_secid,
             opposite_tag,
             float(opposite_ltp),
             "OPPOSITE_TURN_CONFIRMED",
+        )
+
+    def _record_exit_metrics(self, *, reason: str, hold_sec: float, secid: int, tag: str) -> None:
+        reason_code = reason or "UNKNOWN"
+        self.metrics["exit_reason_counts"][reason_code] += 1
+        self.metrics["total_exits"] += 1
+        if hold_sec < self.PREMATURE_EXIT_THRESHOLD_SEC:
+            self.metrics["premature_exits"] += 1
+
+        if hold_sec < 20:
+            hold_bucket = "<20s"
+        elif hold_sec < 60:
+            hold_bucket = "20-60s"
+        elif hold_sec < 180:
+            hold_bucket = "1-3m"
+        else:
+            hold_bucket = ">=3m"
+        self.metrics["hold_time_buckets"][hold_bucket] += 1
+
+        premature_rate = (
+            self.metrics["premature_exits"] / max(self.metrics["total_exits"], 1)
+        ) * 100.0
+        logger.info(
+            "EXIT_METRICS | secid=%s | tag=%s | reason=%s | hold_sec=%.2f | premature_rate=%.1f%% | reason_counts=%s | hold_buckets=%s",
+            secid,
+            tag,
+            reason_code,
+            hold_sec,
+            premature_rate,
+            dict(self.metrics["exit_reason_counts"]),
+            dict(self.metrics["hold_time_buckets"]),
         )
 
     def _track_zero_book(self, secid: int, tag: str, raw: dict) -> None:
