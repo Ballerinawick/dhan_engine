@@ -40,6 +40,9 @@ def download_master_csv(csv_url: str, save_path: str) -> None:
 
 class TradingRuntimeCoordinator:
     """Coordinates market-data streams and strategy execution."""
+    FLOW_REVERSAL_CONFIRM_TICKS = 3
+    FLOW_REVERSAL_MIN_HOLD_SEC = 20
+    FLOW_REVERSAL_MIN_LOSS_PCT = -0.20
 
     def __init__(
         self,
@@ -104,6 +107,7 @@ class TradingRuntimeCoordinator:
             "BANKNIFTY": 100,
             "FINNIFTY": 40,
         }
+        self.flow_reversal_streak: Dict[int, int] = {}
 
     def run(self) -> None:
         logger.info("MODE: FUTURE_WS_STREAM + OPTION_WS_STREAM + OPTION_DEPTH_STREAM")
@@ -504,6 +508,12 @@ class TradingRuntimeCoordinator:
         if route_secid is None:
             print("ROUTE_FAILED →", turn_signal)
             return
+        self._maybe_exit_on_opposite_turn(
+            pair=pair,
+            turn_signal=turn_signal,
+            routed_secid=route_secid,
+            routed_ltp=route_ltp,
+        )
 
         flow = self.premium_flow.get("dominant")
 
@@ -557,25 +567,26 @@ class TradingRuntimeCoordinator:
                 self._force_exit(pair, secid, tag, raw["ltp"], structure["reason"])
                 return
 
-        flow = self.premium_flow.get("dominant")
-
         active = self.paper_trader.positions.get(secid)
         if active:
             entry = active.get("entry", 0)
             if entry > 0:
-
+                flow = self.premium_flow.get("dominant")
                 pnl_pct = ((raw["ltp"] - entry) / entry) * 100
-
-                if flow:
-                    if "CE" in tag and flow == "PE" and pnl_pct < 0:
-                        logger.info("🧠 FLOW_EXIT | CE losing dominance to PE")
-                        self._force_exit(pair, secid, tag, raw["ltp"], "FLOW_REVERSAL")
-                        return
-
-                    if "PE" in tag and flow == "CE" and pnl_pct < 0:
-                        logger.info("🧠 FLOW_EXIT | PE losing dominance to CE")
-                        self._force_exit(pair, secid, tag, raw["ltp"], "FLOW_REVERSAL")
-                        return
+                hold_sec = max(time.time() - float(active.get("entry_ts", time.time())), 0.0)
+                self._handle_flow_reversal_exit(
+                    pair=pair,
+                    secid=secid,
+                    tag=tag,
+                    ltp=float(raw["ltp"]),
+                    flow=flow,
+                    pnl_pct=pnl_pct,
+                    hold_sec=hold_sec,
+                )
+                if secid not in self.paper_trader.positions:
+                    return
+        else:
+            self.flow_reversal_streak.pop(secid, None)
 
         trail = self.trailing_exit_engine.on_tick(
             secid=secid,
@@ -612,11 +623,93 @@ class TradingRuntimeCoordinator:
             logger.exception("force_exit decision engine failure | secid=%s | reason=%s", secid, reason)
 
         self.paper_trader.on_exit(secid, ltp, reason=reason)
+        self.flow_reversal_streak.pop(secid, None)
         if hasattr(self.momentum_engine, "clear_trade"):
             self.momentum_engine.clear_trade(secid, reason)
         else:
             self.momentum_engine.active_trade.pop(secid, None)
         return True
+
+    def _handle_flow_reversal_exit(
+        self,
+        *,
+        pair: PairRuntimeState,
+        secid: int,
+        tag: str,
+        ltp: float,
+        flow: Optional[str],
+        pnl_pct: float,
+        hold_sec: float,
+    ) -> None:
+        opposite_flow = (
+            ("CE" in tag and flow == "PE")
+            or ("PE" in tag and flow == "CE")
+        )
+        if not opposite_flow:
+            self.flow_reversal_streak.pop(secid, None)
+            return
+
+        if hold_sec < self.FLOW_REVERSAL_MIN_HOLD_SEC:
+            return
+
+        if pnl_pct > self.FLOW_REVERSAL_MIN_LOSS_PCT:
+            return
+
+        streak = self.flow_reversal_streak.get(secid, 0) + 1
+        self.flow_reversal_streak[secid] = streak
+        if streak < self.FLOW_REVERSAL_CONFIRM_TICKS:
+            return
+
+        logger.info(
+            "🧠 FLOW_EXIT_CONFIRMED | %s | hold=%.1fs | pnl_pct=%.3f | streak=%s",
+            tag,
+            hold_sec,
+            pnl_pct,
+            streak,
+        )
+        self._force_exit(pair, secid, tag, ltp, "FLOW_REVERSAL_CONFIRMED")
+
+    def _maybe_exit_on_opposite_turn(
+        self,
+        pair: PairRuntimeState,
+        turn_signal: dict,
+        routed_secid: int,
+        routed_ltp: float,
+    ) -> bool:
+        active = self.paper_trader.positions.get(routed_secid)
+        if active:
+            return False
+
+        signal_name = str(turn_signal.get("signal", ""))
+        if "BULLISH" in signal_name:
+            opposite_secid = pair.pe_id
+            opposite_tag = f"{pair.index}_PE"
+            opposite_ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, routed_ltp)
+        elif "BEARISH" in signal_name:
+            opposite_secid = pair.ce_id
+            opposite_tag = f"{pair.index}_CE"
+            opposite_ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, routed_ltp)
+        else:
+            return False
+
+        if not opposite_secid:
+            return False
+        if opposite_secid not in self.paper_trader.positions:
+            return False
+
+        logger.info(
+            "🔄 OPPOSITE_TURN_EXIT | index=%s | signal=%s | closing=%s",
+            pair.index,
+            signal_name,
+            opposite_tag,
+        )
+        return self._force_exit(
+            pair,
+            opposite_secid,
+            opposite_tag,
+            float(opposite_ltp),
+            "OPPOSITE_TURN_CONFIRMED",
+        )
 
     def _track_zero_book(self, secid: int, tag: str, raw: dict) -> None:
         bid_price = float(raw.get("bid_price", 0.0) or 0.0)

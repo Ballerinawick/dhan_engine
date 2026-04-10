@@ -20,7 +20,7 @@ class InstitutionalDecisionEngine:
 
     DISPLACEMENT_THRESHOLD_PCT = 0.15
     HOLD_CONFIRM_SEC = 3
-    POST_ENTRY_VALIDATE_MAX_SEC = 6
+    POST_ENTRY_VALIDATE_MAX_SEC = 20
 
     MODE_DEFAULT = "SCALP"
     MODE_UPGRADE_CONFIRM_TICKS = 3
@@ -182,7 +182,14 @@ class InstitutionalDecisionEngine:
             last_turn = self.last_turn_signal.get(index)
 
             entry_side = None
-            if signal == "BULLISH_CONTINUATION" and last_turn == "REAL_BULLISH_TURN":
+            entry_reason = "TURN_CONTINUATION"
+            if signal == "REAL_BULLISH_TURN":
+                entry_side = "CE"
+                entry_reason = "TURN_STRICT"
+            elif signal == "REAL_BEARISH_TURN":
+                entry_side = "PE"
+                entry_reason = "TURN_STRICT"
+            elif signal == "BULLISH_CONTINUATION" and last_turn == "REAL_BULLISH_TURN":
                 entry_side = "CE"
             elif signal == "BEARISH_CONTINUATION" and last_turn == "REAL_BEARISH_TURN":
                 entry_side = "PE"
@@ -290,7 +297,7 @@ class InstitutionalDecisionEngine:
                 side="LONG",
                 ltp=ltp,
                 lots=1,
-                reason="TURN_CONTINUATION"
+                reason=entry_reason
             )
             print("AFTER_PAPER_ENTRY →", entry_accepted)
             print("POSITIONS_NOW →", paper_trader.positions)
@@ -347,7 +354,7 @@ class InstitutionalDecisionEngine:
                 flow=round(snapshot.get("flow_diff", 0), 2),
                 dom=round(snapshot.get("dominance_score", 0), 2),
                 pressure=round(snapshot.get("pressure_diff", 0), 2),
-                reason="TURN_CONTINUATION"
+                reason=entry_reason
             )
             return {"entry_allowed": True}
 
