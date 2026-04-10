@@ -30,6 +30,10 @@ class InstitutionalDecisionEngine:
     SHADOW_WINDOW_SEC = 30
 
     REENTRY_ALLOW_WITHOUT_STRUCT = True
+    CONTINUATION_MAX_AGE_SEC = 12
+    CONTINUATION_MIN_DOM = 0.22
+    CONTINUATION_MIN_FLOW = 1500
+    CONTINUATION_MIN_PRESSURE = 0.12
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -37,6 +41,7 @@ class InstitutionalDecisionEngine:
         self.trade_ctx = {}
         self.price_track = defaultdict(deque)
         self.last_turn_signal = {}
+        self.last_turn_ts = {}
         self.last_entry_ts = {}
 
         self.index_active_side = {}
@@ -144,6 +149,7 @@ class InstitutionalDecisionEngine:
 
         if signal == "REAL_BULLISH_TURN":
             self.last_turn_signal[index] = signal
+            self.last_turn_ts[index] = now
             self._log_event(
                 event="TURN_CAPTURED",
                 index=index,
@@ -152,6 +158,7 @@ class InstitutionalDecisionEngine:
             entry_side = "CE"
         elif signal == "REAL_BEARISH_TURN":
             self.last_turn_signal[index] = signal
+            self.last_turn_ts[index] = now
             self._log_event(
                 event="TURN_CAPTURED",
                 index=index,
@@ -180,6 +187,8 @@ class InstitutionalDecisionEngine:
             last_tick = momentum_engine.tick_buffer[secid][-1] if momentum_engine.tick_buffer[secid] else {}
             snapshot = snapshot or {}
             last_turn = self.last_turn_signal.get(index)
+            last_turn_ts = self.last_turn_ts.get(index, 0.0)
+            turn_age_sec = max(now - float(last_turn_ts or 0.0), 0.0)
 
             entry_side = None
             entry_reason = "TURN_CONTINUATION"
@@ -194,11 +203,31 @@ class InstitutionalDecisionEngine:
             elif signal == "BEARISH_CONTINUATION" and last_turn == "REAL_BEARISH_TURN":
                 entry_side = "PE"
             else:
+                self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="TURN_NOT_MATCHED")
                 print("DECISION_REJECT_REASON → TURN_NOT_MATCHED")
                 return {"entry_allowed": False}
 
+            if signal.endswith("CONTINUATION"):
+                if turn_age_sec > self.CONTINUATION_MAX_AGE_SEC:
+                    self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_STALE")
+                    print("DECISION_REJECT_REASON → CONTINUATION_STALE")
+                    return {"entry_allowed": False}
+                if abs(snapshot.get("flow_diff", 0)) < self.CONTINUATION_MIN_FLOW:
+                    self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_LOW_FLOW")
+                    print("DECISION_REJECT_REASON → CONTINUATION_LOW_FLOW")
+                    return {"entry_allowed": False}
+                if abs(snapshot.get("dominance_score", 0)) < self.CONTINUATION_MIN_DOM:
+                    self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_LOW_DOM")
+                    print("DECISION_REJECT_REASON → CONTINUATION_LOW_DOM")
+                    return {"entry_allowed": False}
+                if abs(snapshot.get("pressure_diff", 0)) < self.CONTINUATION_MIN_PRESSURE:
+                    self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_LOW_PRESSURE")
+                    print("DECISION_REJECT_REASON → CONTINUATION_LOW_PRESSURE")
+                    return {"entry_allowed": False}
+
             last_ts = self.last_entry_ts.get(index)
             if last_ts and (time.time() - last_ts) < 25:
+                self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="ENTRY_COOLDOWN")
                 print("DECISION_REJECT_REASON → ENTRY_COOLDOWN")
                 return {"entry_allowed": False}
 
@@ -370,6 +399,7 @@ class InstitutionalDecisionEngine:
 
             self._log_event(
                 event="EXIT",
+                decision="ACCEPT",
                 index=index,
                 tag=tag,
                 secid=secid,
