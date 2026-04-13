@@ -31,9 +31,9 @@ class InstitutionalDecisionEngine:
 
     REENTRY_ALLOW_WITHOUT_STRUCT = True
     CONTINUATION_MAX_AGE_SEC = 12
-    CONTINUATION_MIN_DOM = 0.22
-    CONTINUATION_MIN_FLOW = 1500
-    CONTINUATION_MIN_PRESSURE = 0.12
+    CONTINUATION_MIN_DOM = 0.30
+    CONTINUATION_MIN_FLOW = 2000
+    CONTINUATION_MIN_PRESSURE = 0.18
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -186,6 +186,17 @@ class InstitutionalDecisionEngine:
         ):
             last_tick = momentum_engine.tick_buffer[secid][-1] if momentum_engine.tick_buffer[secid] else {}
             snapshot = snapshot or {}
+            signal_confidence = snapshot.get("confidence", 0.0)
+            print("ENTRY_CONFIDENCE →", signal_confidence)
+            if signal_confidence < 0.65:
+                self._log_event(
+                    event="ENTRY",
+                    decision="REJECT",
+                    reason="LOW_CONFIDENCE",
+                    confidence=round(signal_confidence, 2)
+                )
+                print("DECISION_REJECT_REASON → LOW_CONFIDENCE")
+                return {"entry_allowed": False}
             last_turn = self.last_turn_signal.get(index)
             last_turn_ts = self.last_turn_ts.get(index, 0.0)
             turn_age_sec = max(now - float(last_turn_ts or 0.0), 0.0)
@@ -226,7 +237,7 @@ class InstitutionalDecisionEngine:
                     return {"entry_allowed": False}
 
             last_ts = self.last_entry_ts.get(index)
-            if last_ts and (time.time() - last_ts) < 25:
+            if last_ts and (time.time() - last_ts) < 45:
                 self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="ENTRY_COOLDOWN")
                 print("DECISION_REJECT_REASON → ENTRY_COOLDOWN")
                 return {"entry_allowed": False}
@@ -383,6 +394,7 @@ class InstitutionalDecisionEngine:
                 flow=round(snapshot.get("flow_diff", 0), 2),
                 dom=round(snapshot.get("dominance_score", 0), 2),
                 pressure=round(snapshot.get("pressure_diff", 0), 2),
+                confidence=round(signal_confidence, 2),
                 reason=entry_reason
             )
             return {"entry_allowed": True}
