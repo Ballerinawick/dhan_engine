@@ -798,6 +798,35 @@ class TradingRuntimeCoordinator:
             )
             return False
 
+        entry = float(active.get("entry", 0))
+        pnl_pct = ((float(opposite_ltp) - entry) / entry) * 100 if entry > 0 else 0
+
+        # Rule 1: If trade is in small profit, DO NOT exit (let it run)
+        if pnl_pct > 0 and pnl_pct < 0.30:
+            logger.info(
+                "PROFIT_PROTECTION_BLOCK | tag=%s | pnl_pct=%.3f | hold=%.2fs",
+                opposite_tag,
+                pnl_pct,
+                hold_sec,
+            )
+            return False
+
+        # Rule 2: If profit is strong, allow exit
+        if pnl_pct >= 0.30:
+            logger.info(
+                "PROFIT_TARGET_EXIT_ALLOWED | tag=%s | pnl_pct=%.3f",
+                opposite_tag,
+                pnl_pct,
+            )
+
+        # Rule 3: If loss, allow exit (cut quickly)
+        if pnl_pct < 0:
+            logger.info(
+                "LOSS_EXIT_ALLOWED | tag=%s | pnl_pct=%.3f",
+                opposite_tag,
+                pnl_pct,
+            )
+
         logger.info(
             "OPPOSITE_TURN_EXIT | index=%s | signal=%s | closing=%s | hold=%.2fs",
             pair.index,
