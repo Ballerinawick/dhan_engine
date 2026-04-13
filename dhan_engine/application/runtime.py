@@ -518,6 +518,8 @@ class TradingRuntimeCoordinator:
         pair.last_snapshot = snapshot
 
         turn_signal = self.turn_engine.update(snapshot)
+        if turn_signal:
+            snapshot["confidence"] = turn_signal.get("confidence", 0.0)
         if not turn_signal:
             print("TURN_SIGNAL_NONE →", pair.index)
             return
@@ -787,15 +789,28 @@ class TradingRuntimeCoordinator:
         if not active:
             return False
 
-        # Minimum hold time protection (critical fix)
-        hold_sec = time.time() - float(active.get("entry_ts", time.time()))
-        if hold_sec < 20:
-            logger.info(
-                "OPPOSITE_TURN_BLOCKED_MIN_HOLD | tag=%s | hold=%.2fs | signal=%s",
-                opposite_tag,
-                hold_sec,
-                signal_name,
-            )
+        active = self.paper_trader.positions.get(opposite_secid)
+        if active:
+            entry_ts = float(active.get("entry_ts", time.time()))
+            hold_sec = time.time() - entry_ts
+
+            logger.info("HOLD_TIME_CHECK | %.2f sec", hold_sec)
+
+            if hold_sec < 35:
+                logger.info(
+                    "EXIT_BLOCKED_REASON | HOLD_PROTECTION_ACTIVE | hold_sec=%.2f",
+                    hold_sec
+                )
+                return False
+
+        flow = self.premium_flow.get("dominant")
+
+        if "CE" in opposite_tag and flow != "PE":
+            logger.info("EXIT_BLOCKED_REASON | NO_FLOW_CONFIRMATION_CE")
+            return False
+
+        if "PE" in opposite_tag and flow != "CE":
+            logger.info("EXIT_BLOCKED_REASON | NO_FLOW_CONFIRMATION_PE")
             return False
 
         entry = float(active.get("entry", 0))
