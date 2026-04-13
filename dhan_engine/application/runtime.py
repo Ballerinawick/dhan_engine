@@ -628,6 +628,25 @@ class TradingRuntimeCoordinator:
 
     def _force_exit(self, pair: PairRuntimeState, secid: int, tag: str, ltp: float, reason: str) -> bool:
         active = self.paper_trader.positions.get(secid)
+        if active:
+            entry = float(active.get("entry", 0))
+            entry_ts = float(active.get("entry_ts", time.time()))
+            hold_sec = time.time() - entry_ts
+            pnl_pct = ((ltp - entry) / entry) * 100 if entry > 0 else 0
+
+            logger.info("GLOBAL_HOLD_CHECK | %.2f sec | pnl=%.2f%%", hold_sec, pnl_pct)
+
+            if hold_sec < 40:
+                if pnl_pct < -8:
+                    logger.info("EMERGENCY_EXIT_ALLOWED | pnl_pct=%.2f", pnl_pct)
+                else:
+                    logger.info(
+                        "EXIT_BLOCKED_REASON | GLOBAL_HOLD_PROTECTION | hold_sec=%.2f",
+                        hold_sec
+                    )
+                    return False
+
+        active = self.paper_trader.positions.get(secid)
         entry_ts = float(active.get("entry_ts", time.time())) if active else time.time()
         hold_sec = max(time.time() - entry_ts, 0.0)
 
@@ -760,6 +779,12 @@ class TradingRuntimeCoordinator:
             pnl_pct,
             count,
         )
+        if hold_sec < 40:
+            logger.info(
+                "EXIT_BLOCKED_REASON | FLOW_HOLD_PROTECTION | hold_sec=%.2f",
+                hold_sec
+            )
+            return
         self._attempt_exit_once(pair, secid, tag, ltp, "FLOW_REVERSAL_CONFIRMED")
 
     def _maybe_exit_on_opposite_turn(
@@ -796,7 +821,7 @@ class TradingRuntimeCoordinator:
 
             logger.info("HOLD_TIME_CHECK | %.2f sec", hold_sec)
 
-            if hold_sec < 35:
+            if hold_sec < 40:
                 logger.info(
                     "EXIT_BLOCKED_REASON | HOLD_PROTECTION_ACTIVE | hold_sec=%.2f",
                     hold_sec
