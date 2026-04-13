@@ -801,47 +801,64 @@ class TradingRuntimeCoordinator:
         entry = float(active.get("entry", 0))
         pnl_pct = ((float(opposite_ltp) - entry) / entry) * 100 if entry > 0 else 0
 
-        # Rule 1: If trade is in small profit, DO NOT exit (let it run)
-        if pnl_pct > 0 and pnl_pct < 0.30:
+        peak = active.get("peak_pnl_pct", pnl_pct)
+        if pnl_pct > peak:
+            active["peak_pnl_pct"] = pnl_pct
+            peak = pnl_pct
+        elif "peak_pnl_pct" not in active:
+            active["peak_pnl_pct"] = peak
+
+        drawdown = peak - pnl_pct
+
+        # RULE 1: If profit is increasing → HOLD (DO NOT EXIT)
+        if pnl_pct > 0 and pnl_pct >= peak:
             logger.info(
-                "PROFIT_PROTECTION_BLOCK | tag=%s | pnl_pct=%.3f | hold=%.2fs",
+                "HOLD_PROFIT_GROWING | tag=%s | pnl_pct=%.3f | peak=%.3f",
                 opposite_tag,
                 pnl_pct,
-                hold_sec,
+                peak,
             )
             return False
 
-        # Rule 2: If profit is strong, allow exit
-        if pnl_pct >= 0.30:
+        # RULE 2: If profit dropped from peak → EXIT
+        if peak > 0.30 and drawdown > 0.20:
             logger.info(
-                "PROFIT_TARGET_EXIT_ALLOWED | tag=%s | pnl_pct=%.3f",
+                "TRAILING_EXIT | tag=%s | pnl_pct=%.3f | peak=%.3f | drawdown=%.3f",
+                opposite_tag,
+                pnl_pct,
+                peak,
+                drawdown,
+            )
+            return self._attempt_exit_once(
+                pair,
+                opposite_secid,
+                opposite_tag,
+                float(opposite_ltp),
+                "TRAIL_PROFIT_EXIT",
+            )
+
+        # RULE 3: If loss → EXIT immediately
+        if pnl_pct < -0.30:
+            logger.info(
+                "LOSS_EXIT | tag=%s | pnl_pct=%.3f",
                 opposite_tag,
                 pnl_pct,
             )
-
-        # Rule 3: If loss, allow exit (cut quickly)
-        if pnl_pct < 0:
-            logger.info(
-                "LOSS_EXIT_ALLOWED | tag=%s | pnl_pct=%.3f",
+            return self._attempt_exit_once(
+                pair,
+                opposite_secid,
                 opposite_tag,
-                pnl_pct,
+                float(opposite_ltp),
+                "LOSS_EXIT",
             )
 
+        # RULE 4: Otherwise HOLD (ignore weak opposite signals)
         logger.info(
-            "OPPOSITE_TURN_EXIT | index=%s | signal=%s | closing=%s | hold=%.2fs",
-            pair.index,
-            signal_name,
+            "HOLD_WEAK_SIGNAL | tag=%s | pnl_pct=%.3f",
             opposite_tag,
-            hold_sec,
+            pnl_pct,
         )
-
-        return self._attempt_exit_once(
-            pair,
-            opposite_secid,
-            opposite_tag,
-            float(opposite_ltp),
-            "OPPOSITE_TURN_CONFIRMED",
-        )
+        return False
 
     def _record_exit_metrics(self, *, reason: str, hold_sec: float, secid: int, tag: str) -> None:
         reason_code = reason or "UNKNOWN"
