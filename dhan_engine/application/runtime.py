@@ -767,33 +767,45 @@ class TradingRuntimeCoordinator:
         routed_secid: int,
         routed_ltp: float,
     ) -> bool:
-        active = self.paper_trader.positions.get(routed_secid)
-        if active:
-            return False
-
         signal_name = str(turn_signal.get("signal", ""))
+
         if "BULLISH" in signal_name:
             opposite_secid = pair.pe_id
             opposite_tag = f"{pair.index}_PE"
             opposite_ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, routed_ltp)
+
         elif "BEARISH" in signal_name:
             opposite_secid = pair.ce_id
             opposite_tag = f"{pair.index}_CE"
             opposite_ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, routed_ltp)
+
         else:
             return False
 
-        if not opposite_secid:
+        # Check if opposite position exists
+        active = self.paper_trader.positions.get(opposite_secid)
+        if not active:
             return False
-        if opposite_secid not in self.paper_trader.positions:
+
+        # Minimum hold time protection (critical fix)
+        hold_sec = time.time() - float(active.get("entry_ts", time.time()))
+        if hold_sec < 20:
+            logger.info(
+                "OPPOSITE_TURN_BLOCKED_MIN_HOLD | tag=%s | hold=%.2fs | signal=%s",
+                opposite_tag,
+                hold_sec,
+                signal_name,
+            )
             return False
 
         logger.info(
-            "🔄 OPPOSITE_TURN_EXIT | index=%s | signal=%s | closing=%s",
+            "OPPOSITE_TURN_EXIT | index=%s | signal=%s | closing=%s | hold=%.2fs",
             pair.index,
             signal_name,
             opposite_tag,
+            hold_sec,
         )
+
         return self._attempt_exit_once(
             pair,
             opposite_secid,
