@@ -5,6 +5,7 @@ import time
 from datetime import datetime
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo
+from collections import defaultdict
 
 import requests
 
