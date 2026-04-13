@@ -20,7 +20,7 @@ class InstitutionalDecisionEngine:
 
     DISPLACEMENT_THRESHOLD_PCT = 0.15
     HOLD_CONFIRM_SEC = 3
-    POST_ENTRY_VALIDATE_MAX_SEC = 20
+    POST_ENTRY_VALIDATE_MAX_SEC = 45
 
     MODE_DEFAULT = "SCALP"
     MODE_UPGRADE_CONFIRM_TICKS = 3
@@ -459,6 +459,9 @@ class InstitutionalDecisionEngine:
             return None
 
         if now > ctx["post_validate_until"]:
+            if (now - ctx["ts"]) < 45:
+                print("POST_ENTRY_SKIP → HOLD_PROTECTED")
+                return None
             paper_trader.on_exit(secid, ltp, reason="ENTRY_INVALIDATED")
             if hasattr(momentum_engine, "clear_trade"):
                 momentum_engine.clear_trade(secid, "ENTRY_INVALIDATED")
