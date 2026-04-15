@@ -145,6 +145,22 @@ class TurnDetectionEngine:
     def _turn_reason(self, reasons):
         return "+".join(r for r in reasons if r)
 
+    def _is_discontinuation(self, latest):
+        displacement = float(latest.get("price_displacement_pct", 0.0) or 0.0)
+        velocity = float(latest.get("velocity", 0.0) or 0.0)
+        vol_expand = float(latest.get("volatility_expand", 1.0) or 1.0)
+
+        if displacement < 0.08:
+            return False
+
+        if abs(velocity) < 0.5:
+            return False
+
+        if vol_expand < 1.15:
+            return False
+
+        return True
+
     def _is_real_bullish_turn(self, rows):
         if len(rows) < self.MIN_HISTORY_FOR_TURN:
             return False, 0.0, []
@@ -185,6 +201,8 @@ class TurnDetectionEngine:
             confidence += 0.08
         if pre_exhaustion:
             confidence += 0.05
+        if not self._is_discontinuation(latest):
+            return False, 0.0, ["NO_DISCONTINUATION"]
         return True, min(confidence, 0.95), reasons
 
     def _is_real_bearish_turn(self, rows):
@@ -227,6 +245,8 @@ class TurnDetectionEngine:
             confidence += 0.08
         if pre_exhaustion:
             confidence += 0.05
+        if not self._is_discontinuation(latest):
+            return False, 0.0, ["NO_DISCONTINUATION"]
         return True, min(confidence, 0.95), reasons
 
     def _is_fake_bullish_turn(self, rows):

@@ -194,6 +194,39 @@ class MarketStateEngine:
         flow_diff = ce_flow - pe_flow
         ofi_diff = ce_ofi - pe_ofi
         absorb_skew = ce_absorb - pe_absorb
+        premium_imbalance = pe_ltp - ce_ltp
+
+        imbalance_hist = s.setdefault("premium_imbalance_hist", [])
+        imbalance_move_hist = s.setdefault("premium_imbalance_move_hist", [])
+        prev_imbalance = s.get("prev_premium_imbalance")
+
+        if imbalance_hist:
+            baseline = sum(imbalance_hist) / len(imbalance_hist)
+            price_displacement_pct = abs(premium_imbalance - baseline) / max(abs(baseline), 1.0)
+        else:
+            price_displacement_pct = 0.0
+
+        if prev_imbalance is None:
+            velocity = 0.0
+            volatility_expand = 1.0
+            current_move = 0.0
+        else:
+            velocity = premium_imbalance - prev_imbalance
+            current_move = abs(premium_imbalance - prev_imbalance)
+            if imbalance_move_hist:
+                baseline_move = sum(imbalance_move_hist) / len(imbalance_move_hist)
+                volatility_expand = current_move / max(baseline_move, 0.01)
+            else:
+                volatility_expand = 1.0
+
+        imbalance_hist.append(premium_imbalance)
+        if len(imbalance_hist) > 5:
+            imbalance_hist.pop(0)
+        if prev_imbalance is not None:
+            imbalance_move_hist.append(current_move)
+            if len(imbalance_move_hist) > 5:
+                imbalance_move_hist.pop(0)
+        s["prev_premium_imbalance"] = premium_imbalance
 
         if pressure_diff > self.PRESSURE_BIAS_THRESHOLD:
             bias = "BULLISH"
@@ -264,7 +297,10 @@ class MarketStateEngine:
             "pe_vacuum": pe_vacuum,
             "synthetic_spread": ce_ltp + pe_ltp,
             "call_put_ratio": ce_ltp / max(pe_ltp, 1e-6),
-            "premium_imbalance": pe_ltp - ce_ltp,
+            "premium_imbalance": premium_imbalance,
+            "price_displacement_pct": price_displacement_pct,
+            "velocity": velocity,
+            "volatility_expand": volatility_expand,
             "dominance_score": dominance_score,
             "dominance_side": dominance_side,
             "market_regime": market_regime,

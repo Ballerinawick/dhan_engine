@@ -31,9 +31,9 @@ class InstitutionalDecisionEngine:
 
     REENTRY_ALLOW_WITHOUT_STRUCT = True
     CONTINUATION_MAX_AGE_SEC = 12
-    CONTINUATION_MIN_DOM = 0.30
-    CONTINUATION_MIN_FLOW = 2000
-    CONTINUATION_MIN_PRESSURE = 0.18
+    CONTINUATION_MIN_DOM = 0.15
+    CONTINUATION_MIN_FLOW = 1000
+    CONTINUATION_MIN_PRESSURE = 0.08
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -43,6 +43,7 @@ class InstitutionalDecisionEngine:
         self.last_turn_signal = {}
         self.last_turn_ts = {}
         self.last_entry_ts = {}
+        self.pending_turn_entry = {}
 
         self.index_active_side = {}
         self.index_active_secid = {}
@@ -146,32 +147,55 @@ class InstitutionalDecisionEngine:
         now = time.time()
         index = self._index_from_tag(tag)
         side = self._side_from_tag(tag)
+        snapshot = snapshot or {}
+        signal_confidence = snapshot.get("confidence", 0.0)
+
+        pending = self.pending_turn_entry.get(index)
+        if pending and (now - float(pending.get("timestamp", 0.0))) > 3.0:
+            self.pending_turn_entry.pop(index, None)
+            self._log_event(
+                event="TURN_CONFIRMATION_REJECT",
+                index=index,
+                secid=pending.get("secid"),
+                reason="PENDING_EXPIRED",
+            )
 
         if signal == "REAL_BULLISH_TURN":
             self.last_turn_signal[index] = signal
             self.last_turn_ts[index] = now
+            self.pending_turn_entry[index] = {
+                "index": index,
+                "secid": secid,
+                "tag": tag,
+                "entry_side": "CE",
+                "timestamp": now,
+                "ltp": float(ltp),
+                "confidence": float(signal_confidence or 0.0),
+            }
             self._log_event(
-                event="TURN_CAPTURED",
+                event="TURN_PENDING_CONFIRMATION",
                 index=index,
                 signal=signal,
             )
-            entry_side = "CE"
+            return {"entry_allowed": False, "reason": "TURN_PENDING_CONFIRMATION"}
         elif signal == "REAL_BEARISH_TURN":
             self.last_turn_signal[index] = signal
             self.last_turn_ts[index] = now
+            self.pending_turn_entry[index] = {
+                "index": index,
+                "secid": secid,
+                "tag": tag,
+                "entry_side": "PE",
+                "timestamp": now,
+                "ltp": float(ltp),
+                "confidence": float(signal_confidence or 0.0),
+            }
             self._log_event(
-                event="TURN_CAPTURED",
+                event="TURN_PENDING_CONFIRMATION",
                 index=index,
                 signal=signal,
             )
-            entry_side = "PE"
-        else:
-            entry_side = None
-
-        if entry_side:
-            # ✅ DO NOT FORCE ENTRY
-            # Only store turn signal — continuation logic will decide entry
-            pass
+            return {"entry_allowed": False, "reason": "TURN_PENDING_CONFIRMATION"}
 
         self._update_price_history(secid, now, ltp)
         struct_ok = self._structure_ok(secid)
@@ -185,8 +209,6 @@ class InstitutionalDecisionEngine:
             "BEARISH_CONTINUATION",
         ):
             last_tick = momentum_engine.tick_buffer[secid][-1] if momentum_engine.tick_buffer[secid] else {}
-            snapshot = snapshot or {}
-            signal_confidence = snapshot.get("confidence", 0.0)
             print("ENTRY_CONFIDENCE →", signal_confidence)
             if signal_confidence < 0.65:
                 self._log_event(
@@ -203,13 +225,7 @@ class InstitutionalDecisionEngine:
 
             entry_side = None
             entry_reason = "TURN_CONTINUATION"
-            if signal == "REAL_BULLISH_TURN":
-                entry_side = "CE"
-                entry_reason = "TURN_STRICT"
-            elif signal == "REAL_BEARISH_TURN":
-                entry_side = "PE"
-                entry_reason = "TURN_STRICT"
-            elif signal == "BULLISH_CONTINUATION" and last_turn == "REAL_BULLISH_TURN":
+            if signal == "BULLISH_CONTINUATION" and last_turn == "REAL_BULLISH_TURN":
                 entry_side = "CE"
             elif signal == "BEARISH_CONTINUATION" and last_turn == "REAL_BEARISH_TURN":
                 entry_side = "PE"
@@ -219,22 +235,51 @@ class InstitutionalDecisionEngine:
                 return {"entry_allowed": False}
 
             if signal.endswith("CONTINUATION"):
+                pending_turn = self.pending_turn_entry.get(index)
+                if not pending_turn:
+                    self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="NO_PENDING_TURN")
+                    self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_WITHOUT_PENDING")
+                    print("DECISION_REJECT_REASON → CONTINUATION_WITHOUT_PENDING")
+                    return {"entry_allowed": False}
+                if pending_turn.get("entry_side") != entry_side:
+                    self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="DIRECTION_MISMATCH")
+                    self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_DIRECTION_MISMATCH")
+                    print("DECISION_REJECT_REASON → CONTINUATION_DIRECTION_MISMATCH")
+                    return {"entry_allowed": False}
+                pending_age = max(now - float(pending_turn.get("timestamp", 0.0)), 0.0)
+                if pending_age > 3.0:
+                    self.pending_turn_entry.pop(index, None)
+                    self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="PENDING_TURN_STALE")
+                    self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_STALE")
+                    print("DECISION_REJECT_REASON → CONTINUATION_STALE")
+                    return {"entry_allowed": False}
                 if turn_age_sec > self.CONTINUATION_MAX_AGE_SEC:
+                    self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="TURN_CONTEXT_STALE")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_STALE")
                     print("DECISION_REJECT_REASON → CONTINUATION_STALE")
                     return {"entry_allowed": False}
                 if abs(snapshot.get("flow_diff", 0)) < self.CONTINUATION_MIN_FLOW:
+                    self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="CONTINUATION_LOW_FLOW")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_LOW_FLOW")
                     print("DECISION_REJECT_REASON → CONTINUATION_LOW_FLOW")
                     return {"entry_allowed": False}
                 if abs(snapshot.get("dominance_score", 0)) < self.CONTINUATION_MIN_DOM:
+                    self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="CONTINUATION_LOW_DOM")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_LOW_DOM")
                     print("DECISION_REJECT_REASON → CONTINUATION_LOW_DOM")
                     return {"entry_allowed": False}
                 if abs(snapshot.get("pressure_diff", 0)) < self.CONTINUATION_MIN_PRESSURE:
+                    self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="CONTINUATION_LOW_PRESSURE")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_LOW_PRESSURE")
                     print("DECISION_REJECT_REASON → CONTINUATION_LOW_PRESSURE")
                     return {"entry_allowed": False}
+                self._log_event(
+                    event="TURN_CONFIRMATION_ACCEPT",
+                    index=index,
+                    secid=secid,
+                    direction=entry_side,
+                    age=round(pending_age, 2),
+                )
 
             last_ts = self.last_entry_ts.get(index)
             if last_ts and (time.time() - last_ts) < 45:
@@ -257,17 +302,17 @@ class InstitutionalDecisionEngine:
                     print("DECISION_REJECT_REASON → LOW_DOM")
                     return {"entry_allowed": False}
 
-            if abs(snapshot.get("flow_diff", 0)) < 1200:
+            if abs(snapshot.get("flow_diff", 0)) < 1000:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_FLOW", index=index)
                 print("DECISION_REJECT_REASON → LOW_FLOW")
                 return {"entry_allowed": False}
 
-            if abs(snapshot.get("dominance_score", 0)) < 0.18:
+            if abs(snapshot.get("dominance_score", 0)) < 0.15:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_DOM", index=index)
                 print("DECISION_REJECT_REASON → LOW_DOM")
                 return {"entry_allowed": False}
 
-            if abs(snapshot.get("pressure_diff", 0)) < 0.10:
+            if abs(snapshot.get("pressure_diff", 0)) < 0.08:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_PRESSURE", index=index)
                 print("DECISION_REJECT_REASON → LOW_PRESSURE")
                 return {"entry_allowed": False}
@@ -397,6 +442,7 @@ class InstitutionalDecisionEngine:
                 confidence=round(signal_confidence, 2),
                 reason=entry_reason
             )
+            self.pending_turn_entry.pop(index, None)
             return {"entry_allowed": True}
 
         # ================= EXIT =================
