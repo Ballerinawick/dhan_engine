@@ -151,7 +151,7 @@ class InstitutionalDecisionEngine:
         signal_confidence = snapshot.get("confidence", 0.0)
 
         pending = self.pending_turn_entry.get(index)
-        if pending and (now - float(pending.get("timestamp", 0.0))) > 8.0:
+        if pending and (now - float(pending.get("timestamp", 0.0))) > 20.0:
             self.pending_turn_entry.pop(index, None)
             self._log_event(
                 event="TURN_CONFIRMATION_REJECT",
@@ -225,29 +225,65 @@ class InstitutionalDecisionEngine:
 
             entry_side = None
             entry_reason = "TURN_CONTINUATION"
-            if signal == "BULLISH_CONTINUATION" and last_turn == "REAL_BULLISH_TURN":
+            if signal == "BULLISH_CONTINUATION":
                 entry_side = "CE"
-            elif signal == "BEARISH_CONTINUATION" and last_turn == "REAL_BEARISH_TURN":
+            elif signal == "BEARISH_CONTINUATION":
+                entry_side = "PE"
+            elif signal == "REAL_BULLISH_TURN":
+                entry_side = "CE"
+            elif signal == "REAL_BEARISH_TURN":
                 entry_side = "PE"
             else:
                 self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="TURN_NOT_MATCHED")
-                print("DECISION_REJECT_REASON → TURN_NOT_MATCHED")
                 return {"entry_allowed": False}
 
             if signal.endswith("CONTINUATION"):
                 pending_turn = self.pending_turn_entry.get(index)
+
                 if not pending_turn:
-                    self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="NO_PENDING_TURN")
-                    self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_WITHOUT_PENDING")
-                    print("DECISION_REJECT_REASON → CONTINUATION_WITHOUT_PENDING")
-                    return {"entry_allowed": False}
-                if pending_turn.get("entry_side") != entry_side:
+                    dom = float(snapshot.get("dominance_score", 0) or 0)
+                    flow = float(snapshot.get("flow_diff", 0) or 0)
+                    pressure = float(snapshot.get("pressure_diff", 0) or 0)
+                    regime = snapshot.get("market_regime", "BALANCED")
+
+                    pure_ok = False
+
+                    if entry_side == "CE":
+                        pure_ok = (
+                            dom >= 0.22 and
+                            flow >= 1200 and
+                            pressure >= 0.08 and
+                            regime != "COMPRESSED"
+                        )
+                    else:
+                        pure_ok = (
+                            dom <= -0.22 and
+                            flow <= -1200 and
+                            pressure <= -0.08 and
+                            regime != "COMPRESSED"
+                        )
+
+                    if pure_ok:
+                        entry_reason = "PURE_CONTINUATION_ENTRY"
+                        self._log_event(
+                            event="TURN_CONFIRMATION_BYPASS",
+                            index=index,
+                            secid=secid,
+                            side=entry_side,
+                            reason="PURE_CONTINUATION"
+                        )
+                    else:
+                        self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="NO_PENDING_TURN")
+                        self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_WITHOUT_PENDING")
+                        print("DECISION_REJECT_REASON → CONTINUATION_WITHOUT_PENDING")
+                        return {"entry_allowed": False}
+                if pending_turn and pending_turn.get("entry_side") != entry_side:
                     self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="DIRECTION_MISMATCH")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_DIRECTION_MISMATCH")
                     print("DECISION_REJECT_REASON → CONTINUATION_DIRECTION_MISMATCH")
                     return {"entry_allowed": False}
-                pending_age = max(now - float(pending_turn.get("timestamp", 0.0)), 0.0)
-                if pending_age > 8.0:
+                pending_age = max(now - float(pending_turn.get("timestamp", 0.0)), 0.0) if pending_turn else 0.0
+                if pending_turn and pending_age > 20.0:
                     self.pending_turn_entry.pop(index, None)
                     self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="PENDING_TURN_STALE")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_STALE")
