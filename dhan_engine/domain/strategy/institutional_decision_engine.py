@@ -151,7 +151,7 @@ class InstitutionalDecisionEngine:
         signal_confidence = snapshot.get("confidence", 0.0)
 
         pending = self.pending_turn_entry.get(index)
-        if pending and (now - float(pending.get("timestamp", 0.0))) > 3.0:
+        if pending and (now - float(pending.get("timestamp", 0.0))) > 8.0:
             self.pending_turn_entry.pop(index, None)
             self._log_event(
                 event="TURN_CONFIRMATION_REJECT",
@@ -247,7 +247,7 @@ class InstitutionalDecisionEngine:
                     print("DECISION_REJECT_REASON → CONTINUATION_DIRECTION_MISMATCH")
                     return {"entry_allowed": False}
                 pending_age = max(now - float(pending_turn.get("timestamp", 0.0)), 0.0)
-                if pending_age > 3.0:
+                if pending_age > 8.0:
                     self.pending_turn_entry.pop(index, None)
                     self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="PENDING_TURN_STALE")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_STALE")
@@ -411,14 +411,12 @@ class InstitutionalDecisionEngine:
                 if entry_side == "CE":
                     candle_confirmed = (
                         (last_close > prev_close) and
-                        ((last_close >= prev_high) or (last_close >= prev_body_70)) and
-                        (last_low >= prev_low)
+                        ((last_close >= prev_high) or (last_close >= prev_body_70))
                     )
                 else:
                     candle_confirmed = (
                         (last_close < prev_close) and
-                        ((last_close <= prev_low) or (last_close <= prev_body_30)) and
-                        (last_high <= prev_high)
+                        ((last_close <= prev_low) or (last_close <= prev_body_30))
                     )
 
                 if not candle_confirmed:
