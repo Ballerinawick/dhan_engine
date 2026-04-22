@@ -407,11 +407,25 @@ class TurnDetectionEngine:
         last_signal = self.last_signal.get(index)
         last_ts = self.last_signal_ts.get(index, 0)
         last_conf = self.last_signal_confidence.get(index, 0.0)
+
+        # New signal type always allowed
         if last_signal != signal:
             return True
+
+        # Continuation signals need faster refresh
+        if signal in ("BULLISH_CONTINUATION", "BEARISH_CONTINUATION"):
+            # allow resend every 2 sec
+            if ts - last_ts >= 2:
+                return True
+
+            # allow smaller confidence improvement
+            return confidence >= (last_conf + 0.02)
+
+        # Keep strict rules for turn signals / others
         if ts - last_ts >= self.SIGNAL_COOLDOWN_SEC:
             return True
-        return confidence >= last_conf + 0.08
+
+        return confidence >= (last_conf + 0.08)
 
     def update(self, snapshot):
         if not snapshot or not isinstance(snapshot, dict):
