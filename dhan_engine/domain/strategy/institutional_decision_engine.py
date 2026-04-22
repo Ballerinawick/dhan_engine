@@ -375,6 +375,81 @@ class InstitutionalDecisionEngine:
                 print("DECISION_REJECT_REASON → STRUCT_NOT_OK")
                 return {"entry_allowed": False}
 
+            if signal.endswith("CONTINUATION"):
+                candles = list(momentum_engine.candles.get(secid, []))
+                if len(candles) < 3:
+                    self._log_event(
+                        event="ENTRY",
+                        decision="REJECT",
+                        index=index,
+                        tag=tag,
+                        secid=secid,
+                        side=entry_side,
+                        reason="NO_CANDLE_CONFIRM",
+                        detail="INSUFFICIENT_CANDLES",
+                        candle_count=len(candles),
+                    )
+                    print("DECISION_REJECT_REASON → NO_CANDLE_CONFIRM")
+                    return {"entry_allowed": False}
+
+                prev_candle = candles[-3]
+                last_candle = candles[-2]
+
+                prev_open = float(prev_candle.get("open", 0) or 0)
+                prev_close = float(prev_candle.get("close", 0) or 0)
+                prev_high = float(prev_candle.get("high", 0) or 0)
+                prev_low = float(prev_candle.get("low", 0) or 0)
+                last_close = float(last_candle.get("close", 0) or 0)
+                last_high = float(last_candle.get("high", 0) or 0)
+                last_low = float(last_candle.get("low", 0) or 0)
+
+                prev_body_top = max(prev_open, prev_close)
+                prev_body_bottom = min(prev_open, prev_close)
+                prev_body_70 = prev_body_bottom + ((prev_body_top - prev_body_bottom) * 0.70)
+                prev_body_30 = prev_body_bottom + ((prev_body_top - prev_body_bottom) * 0.30)
+
+                if entry_side == "CE":
+                    candle_confirmed = (
+                        (last_close > prev_close) and
+                        ((last_close >= prev_high) or (last_close >= prev_body_70)) and
+                        (last_low >= prev_low)
+                    )
+                else:
+                    candle_confirmed = (
+                        (last_close < prev_close) and
+                        ((last_close <= prev_low) or (last_close <= prev_body_30)) and
+                        (last_high <= prev_high)
+                    )
+
+                if not candle_confirmed:
+                    self._log_event(
+                        event="ENTRY",
+                        decision="REJECT",
+                        index=index,
+                        tag=tag,
+                        secid=secid,
+                        side=entry_side,
+                        reason="NO_CANDLE_CONFIRM",
+                        prev_close=round(prev_close, 4),
+                        prev_high=round(prev_high, 4),
+                        prev_low=round(prev_low, 4),
+                        last_close=round(last_close, 4),
+                        last_high=round(last_high, 4),
+                        last_low=round(last_low, 4),
+                    )
+                    print(
+                        "DECISION_REJECT_REASON → NO_CANDLE_CONFIRM",
+                        {
+                            "prev_close": round(prev_close, 4),
+                            "prev_high": round(prev_high, 4),
+                            "prev_low": round(prev_low, 4),
+                            "last_close": round(last_close, 4),
+                            "last_high": round(last_high, 4),
+                            "last_low": round(last_low, 4),
+                        }
+                    )
+                    return {"entry_allowed": False}
+
             print("BEFORE_PAPER_ENTRY →", secid, tag, ltp)
             entry_accepted = paper_trader.on_entry(
                 secid=secid,
