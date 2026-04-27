@@ -2,5 +2,5 @@ pandas
 websocket-client
 requests
 python-dotenv
-dhanhq
+dhanhq==2.0.2
 websockets
