@@ -8,32 +8,49 @@ from dhan_engine.infrastructure.dhan.async_depth_adapter import DepthSide
 
 class DepthMicroFeatureBuilder:
     """
-    Builds:
-      - bid_qty, ask_qty (top1)
-      - imbalance_5
-      - flow (top5 delta)
-      - vacuum_flag (liquidity pull)
-      - absorption_flag + absorption_strength
-      - ltp proxy from mid/last known
+    PRO v2
+    Existing fields preserved + adds:
+
+    velocity
+    accel
+    deceleration
+    real_flow
+    spoof_risk
+    bid_refill_score
+    ask_refill_score
+    bull_turn_score
+    bear_turn_score
+    micro_signal
+    trend_fatigue
     """
 
     def __init__(self):
-        # per security state
-        self._prev_top5: Dict[int, Tuple[int, int]] = {}  # (sumBid5, sumAsk5)
-        self._prev_best: Dict[int, Tuple[float, float, int, int]] = {}  # (bidPx, askPx, bidQty, askQty)
+        self._prev_top5: Dict[int, Tuple[int, int]] = {}
+        self._prev_best: Dict[int, Tuple[float, float, int, int]] = {}
         self._prev_bid1: Dict[int, int] = {}
         self._prev_ask1: Dict[int, int] = {}
 
-        # stability buffer for absorption detection
-        self._mid_buf: Dict[int, deque] = {}   # mid prices
-        self._best_qty_buf: Dict[int, deque] = {}  # (bidQty, askQty)
+        self._mid_buf: Dict[int, deque] = {}
+        self._best_qty_buf: Dict[int, deque] = {}
+
+        # PRO buffers
+        self._mid_hist: Dict[int, deque] = {}
+        self._vel_hist: Dict[int, deque] = {}
+        self._flow_hist: Dict[int, deque] = {}
+        self._ofi_hist: Dict[int, deque] = {}
 
     @staticmethod
     def _sum_top(side: DepthSide, k: int) -> int:
         return int(sum(side.qty[:k])) if side.qty else 0
 
+    @staticmethod
+    def _clamp(v, lo=0.0, hi=1.0):
+        return max(lo, min(hi, v))
+
     def build(self, secid: int, bid: DepthSide, ask: DepthSide) -> dict:
-        # best levels
+        # ---------------------------
+        # BEST LEVELS
+        # ---------------------------
         best_bid_px = float(bid.prices[0]) if bid.prices else 0.0
         best_ask_px = float(ask.prices[0]) if ask.prices else 0.0
         best_bid_qty = int(bid.qty[0]) if bid.qty else 0
@@ -47,80 +64,147 @@ class DepthMicroFeatureBuilder:
         self._prev_bid1[secid] = best_bid_qty
         self._prev_ask1[secid] = best_ask_qty
 
-        # mid + spread
-        mid = (best_bid_px + best_ask_px) / 2.0 if best_bid_px and best_ask_px else 0.0
+        # ---------------------------
+        # PRICE
+        # ---------------------------
+        mid = (best_bid_px + best_ask_px) / 2 if best_bid_px and best_ask_px else 0.0
+
         microprice = 0.0
         if best_bid_qty + best_ask_qty > 0:
             microprice = (
-                (best_bid_px * best_ask_qty) +
-                (best_ask_px * best_bid_qty)
+                (best_bid_px * best_ask_qty)
+                + (best_ask_px * best_bid_qty)
             ) / (best_bid_qty + best_ask_qty)
+
         spread = (best_ask_px - best_bid_px) if best_bid_px and best_ask_px else 0.0
 
-        # top5
+        # ---------------------------
+        # TOP5
+        # ---------------------------
         sum_bid5 = self._sum_top(bid, 5)
         sum_ask5 = self._sum_top(ask, 5)
 
-        # imbalance
-        denom = (sum_bid5 + sum_ask5)
+        denom = sum_bid5 + sum_ask5
         imbalance_5 = ((sum_bid5 - sum_ask5) / denom) if denom > 0 else 0.0
 
-        # flow (delta of top5 liquidity)
         prev = self._prev_top5.get(secid)
         if prev:
             prev_bid5, prev_ask5 = prev
             flow = (sum_bid5 - prev_bid5) - (sum_ask5 - prev_ask5)
         else:
             flow = 0.0
+
         self._prev_top5[secid] = (sum_bid5, sum_ask5)
 
-        # vacuum: sudden pull on one side OR spread expansion + thinning
-        prev_best = self._prev_best.get(secid)
+        # ---------------------------
+        # HISTORY
+        # ---------------------------
+        mh = self._mid_hist.setdefault(secid, deque(maxlen=8))
+        vh = self._vel_hist.setdefault(secid, deque(maxlen=8))
+        fh = self._flow_hist.setdefault(secid, deque(maxlen=8))
+        oh = self._ofi_hist.setdefault(secid, deque(maxlen=8))
+
+        prev_mid = mh[-1] if mh else mid
+        velocity = mid - prev_mid
+        mh.append(mid)
+
+        prev_vel = vh[-1] if vh else velocity
+        accel = velocity - prev_vel
+        vh.append(velocity)
+
+        fh.append(flow)
+        oh.append(ofi)
+
+        # sellers slowing / buyers slowing
+        deceleration = -accel
+
+        # ---------------------------
+        # REAL FLOW (smooth)
+        # ---------------------------
+        real_flow = sum(fh) / len(fh) if fh else 0.0
+
+        # spoof risk
+        spoof_risk = 0.0
+        if len(fh) >= 3:
+            if abs(fh[-1]) > 2000 and abs(fh[-2]) > 2000 and (fh[-1] * fh[-2] < 0):
+                spoof_risk = 0.8
+
+        # ---------------------------
+        # VACUUM
+        # ---------------------------
         vacuum_flag = False
         vacuum_strength = 0.0
+
+        prev_best = self._prev_best.get(secid)
         if prev_best:
             pbid_px, pask_px, pbid_qty, pask_qty = prev_best
-            # pull definition (simple + robust)
-            pull_bid = (best_bid_qty < pbid_qty * 0.45) and (best_bid_px <= pbid_px)
-            pull_ask = (best_ask_qty < pask_qty * 0.45) and (best_ask_px >= pask_px)
-            spread_jump = spread > (pask_px - pbid_px) * 1.8 if (pbid_px and pask_px) else False
+
+            pull_bid = best_bid_qty < pbid_qty * 0.45
+            pull_ask = best_ask_qty < pask_qty * 0.45
+
+            spread_jump = spread > max((pask_px - pbid_px) * 1.8, 0.05)
+
             vacuum_flag = pull_bid or pull_ask or spread_jump
 
             if pull_bid:
-                vacuum_strength = min(1.0, (pbid_qty - best_bid_qty) / max(pbid_qty, 1))
+                vacuum_strength = self._clamp((pbid_qty - best_bid_qty) / max(pbid_qty, 1))
 
             elif pull_ask:
-                vacuum_strength = min(1.0, (pask_qty - best_ask_qty) / max(pask_qty, 1))
-        self._prev_best[secid] = (best_bid_px, best_ask_px, best_bid_qty, best_ask_qty)
+                vacuum_strength = self._clamp((pask_qty - best_ask_qty) / max(pask_qty, 1))
 
-        # absorption: mid stable but best qty increases (trapping)
+        self._prev_best[secid] = (
+            best_bid_px,
+            best_ask_px,
+            best_bid_qty,
+            best_ask_qty,
+        )
+
+        # ---------------------------
+        # ABSORPTION
+        # ---------------------------
         mb = self._mid_buf.setdefault(secid, deque(maxlen=6))
         qb = self._best_qty_buf.setdefault(secid, deque(maxlen=6))
+
         mb.append(mid)
         qb.append((best_bid_qty, best_ask_qty))
 
         absorption_flag = False
         absorption_strength = 0.0
+
         if len(mb) >= 6:
-            # mid stability
             mid_range = max(mb) - min(mb)
-            # qty build-up
             bid_build = qb[-1][0] - qb[0][0]
             ask_build = qb[-1][1] - qb[0][1]
 
-            # If price not moving but liquidity stacking -> absorption
             if mid_range <= 0.10 and (bid_build > 0 or ask_build > 0):
                 absorption_flag = True
-                # normalize (keep bounded)
-                absorption_strength = min(1.0, (abs(bid_build) + abs(ask_build)) / 50000.0)
+                absorption_strength = self._clamp(
+                    (abs(bid_build) + abs(ask_build)) / 30000.0
+                )
 
+        # ---------------------------
+        # REFILL DETECTION
+        # ---------------------------
+        bid_refill_score = 0.0
+        ask_refill_score = 0.0
+
+        if best_bid_qty > prev_bid and velocity >= 0:
+            bid_refill_score = self._clamp((best_bid_qty - prev_bid) / 3000.0)
+
+        if best_ask_qty > prev_ask and velocity <= 0:
+            ask_refill_score = self._clamp((best_ask_qty - prev_ask) / 3000.0)
+
+        # ---------------------------
+        # PRESSURE
+        # ---------------------------
         pressure_score = (
-            0.35 * imbalance_5 +
-            0.25 * (ofi / 1000.0) +
-            0.20 * (flow / 1000.0) +
-            0.10 * vacuum_strength +
-            0.10 * absorption_strength
+            0.30 * imbalance_5 +
+            0.22 * (ofi / 1000.0) +
+            0.18 * (real_flow / 1000.0) +
+            0.15 * vacuum_strength +
+            0.15 * absorption_strength
         )
+
         pressure_score = max(min(pressure_score, 1.0), -1.0)
 
         pressure_side = "NEUTRAL"
@@ -129,42 +213,94 @@ class DepthMicroFeatureBuilder:
         elif pressure_score < -0.15:
             pressure_side = "SELL"
 
-        # LTP proxy:
-        # In depth feed you don't get last trade here, so we use mid as "ltp-like" for engine inputs.
-        # (Later: if you also run a separate LTP feed, replace this with true LTP.)
-        ltp_proxy = mid if mid > 0 else best_bid_px or best_ask_px or 0.0
+        # ---------------------------
+        # TURN SCORES
+        # ---------------------------
+        bull_turn_score = (
+            0.25 * self._clamp(imbalance_5, 0, 1)
+            + 0.20 * self._clamp(ofi / 2000.0, 0, 1)
+            + 0.20 * self._clamp(real_flow / 3000.0, 0, 1)
+            + 0.20 * bid_refill_score
+            + 0.15 * self._clamp(deceleration, 0, 1)
+        )
+
+        bear_turn_score = (
+            0.25 * self._clamp(-imbalance_5, 0, 1)
+            + 0.20 * self._clamp(-ofi / 2000.0, 0, 1)
+            + 0.20 * self._clamp(-real_flow / 3000.0, 0, 1)
+            + 0.20 * ask_refill_score
+            + 0.15 * self._clamp(-deceleration, 0, 1)
+        )
+
+        if spoof_risk > 0.5:
+            bull_turn_score *= 0.7
+            bear_turn_score *= 0.7
+
+        bull_turn_score = self._clamp(bull_turn_score)
+        bear_turn_score = self._clamp(bear_turn_score)
+
+        micro_signal = "NEUTRAL"
+
+        if bull_turn_score >= 0.62 and bull_turn_score > bear_turn_score:
+            micro_signal = "PRE_BULLISH_TURN"
+
+        elif bear_turn_score >= 0.62 and bear_turn_score > bull_turn_score:
+            micro_signal = "PRE_BEARISH_TURN"
+
+        trend_fatigue = self._clamp(abs(deceleration))
+
+        # ---------------------------
+        # LTP PROXY
+        # ---------------------------
+        ltp_proxy = microprice if microprice > 0 else mid
 
         return {
-            # core price
             "ltp": ltp_proxy,
-            "ltp_source": "DEPTH_MID",
-            "bid_price": float(best_bid_px),
-            "ask_price": float(best_ask_px),
-            "best_bid": float(best_bid_px),
-            "best_ask": float(best_ask_px),
+            "ltp_source": "DEPTH_MICROPRICE",
 
-            # microstructure
+            "bid_price": best_bid_px,
+            "ask_price": best_ask_px,
+            "best_bid": best_bid_px,
+            "best_ask": best_ask_px,
+
             "bid_qty": best_bid_qty,
             "ask_qty": best_ask_qty,
-            "imbalance_5": float(imbalance_5),
-            "flow": float(flow),
-            "ofi": float(ofi),
 
-            "vacuum_flag": bool(vacuum_flag),
-            "vacuum_strength": float(vacuum_strength),
-            "vacuum_score": float(vacuum_strength),
-            "vacuum": float(vacuum_strength),
+            "imbalance_5": imbalance_5,
+            "flow": flow,
+            "real_flow": real_flow,
+            "ofi": ofi,
 
-            "absorption_flag": bool(absorption_flag),
-            "absorption_strength": float(absorption_strength),
-            "absorption_score": float(absorption_strength),
-            "absorb": float(absorption_strength),
+            "velocity": velocity,
+            "accel": accel,
+            "deceleration": deceleration,
 
-            "microprice": float(microprice),
-            "spread": float(spread),
+            "vacuum_flag": vacuum_flag,
+            "vacuum_strength": vacuum_strength,
+            "vacuum_score": vacuum_strength,
+            "vacuum": vacuum_strength,
 
-            "pressure_score": float(pressure_score),
-            "pressure": float(pressure_score),
+            "absorption_flag": absorption_flag,
+            "absorption_strength": absorption_strength,
+            "absorption_score": absorption_strength,
+            "absorb": absorption_strength,
+
+            "bid_refill_score": bid_refill_score,
+            "ask_refill_score": ask_refill_score,
+
+            "bull_turn_score": bull_turn_score,
+            "bear_turn_score": bear_turn_score,
+            "micro_signal": micro_signal,
+            "trend_fatigue": trend_fatigue,
+
+            "spoof_risk": spoof_risk,
+
+            "microprice": microprice,
+            "spread": spread,
+
+            "pressure_score": pressure_score,
+            "pressure": pressure_score,
             "pressure_side": pressure_side,
+
             "ts": time.time(),
         }
