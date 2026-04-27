@@ -15,6 +15,10 @@ class TurnDetectionEngine:
     EXHAUSTION_THRESHOLD = 0.65
     SUMMARY_INTERVAL_SEC = 30
     REGIME_SHIFT_COOLDOWN_SEC = 3
+    MICRO_TURN_SCORE_THRESHOLD = 0.58
+    SPOOF_RISK_BLOCK = 0.62
+    TREND_FATIGUE_BLOCK = 0.72
+    DECELERATION_CONFIRM = 0.18
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -161,6 +165,30 @@ class TurnDetectionEngine:
 
         return True
 
+    def _micro_turn_ready(self, latest, side):
+        if side == "BULLISH":
+            score = self._safe_float(latest.get("bull_turn_score"))
+        else:
+            score = self._safe_float(latest.get("bear_turn_score"))
+
+        spoof = self._safe_float(latest.get("spoof_risk"))
+        fatigue = self._safe_float(latest.get("trend_fatigue"))
+        decel = self._safe_float(latest.get("deceleration"))
+
+        if score < self.MICRO_TURN_SCORE_THRESHOLD:
+            return False
+
+        if spoof > self.SPOOF_RISK_BLOCK:
+            return False
+
+        if fatigue > self.TREND_FATIGUE_BLOCK:
+            return False
+
+        if decel < self.DECELERATION_CONFIRM:
+            return False
+
+        return True
+
     def _is_real_bullish_turn(self, rows):
         if len(rows) < self.MIN_HISTORY_FOR_TURN:
             return False, 0.0, []
@@ -180,7 +208,8 @@ class TurnDetectionEngine:
         pre_exhaustion = self._safe_float(prev_rows[-1].get("exhaustion_score")) >= 0.50
         compression_release = self._is_compression(prev_rows[-3:]) and not self._is_compression(rows[-2:])
         weak_fake = self._safe_float(latest.get("dominance_score")) < self.DOM_FLIP_THRESHOLD or self._safe_float(latest.get("flow_diff")) < 0
-        if not (prev_state_bearish and (bias_flip or dom_flip) and flow_support and pressure_support) or weak_fake:
+        micro_ok = self._micro_turn_ready(latest, "BULLISH")
+        if not (prev_state_bearish and (bias_flip or dom_flip) and flow_support and pressure_support and micro_ok) or weak_fake:
             return False, 0.0, []
         reasons = []
         if bias_flip:
@@ -224,7 +253,8 @@ class TurnDetectionEngine:
         pre_exhaustion = self._safe_float(prev_rows[-1].get("exhaustion_score")) >= 0.50
         compression_release = self._is_compression(prev_rows[-3:]) and not self._is_compression(rows[-2:])
         weak_fake = self._safe_float(latest.get("dominance_score")) > -self.DOM_FLIP_THRESHOLD or self._safe_float(latest.get("flow_diff")) > 0
-        if not (prev_state_bullish and (bias_flip or dom_flip) and flow_support and pressure_support) or weak_fake:
+        micro_ok = self._micro_turn_ready(latest, "BEARISH")
+        if not (prev_state_bullish and (bias_flip or dom_flip) and flow_support and pressure_support and micro_ok) or weak_fake:
             return False, 0.0, []
         reasons = []
         if bias_flip:
