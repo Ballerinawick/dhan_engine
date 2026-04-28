@@ -8,14 +8,14 @@ class TurnDetectionEngine:
     MIN_HISTORY_FOR_TURN = 6
     MIN_HISTORY_FOR_CONTINUATION = 4
     SIGNAL_COOLDOWN_SEC = 5
-    DOM_FLIP_THRESHOLD = 0.18
-    FLOW_FLIP_THRESHOLD = 1200.0
-    PRESSURE_FLIP_THRESHOLD = 0.12
+    DOM_FLIP_THRESHOLD = 0.10
+    FLOW_FLIP_THRESHOLD = 350.0
+    PRESSURE_FLIP_THRESHOLD = 0.04
     COMPRESSION_THRESHOLD = 0.70
     EXHAUSTION_THRESHOLD = 0.65
     SUMMARY_INTERVAL_SEC = 30
     REGIME_SHIFT_COOLDOWN_SEC = 3
-    MICRO_TURN_SCORE_THRESHOLD = 0.58
+    MICRO_TURN_SCORE_THRESHOLD = 0.35
     SPOOF_RISK_BLOCK = 0.62
     TREND_FATIGUE_BLOCK = 0.72
     DECELERATION_CONFIRM = 0.18
@@ -30,6 +30,8 @@ class TurnDetectionEngine:
         self.last_regime = {}
         self.last_regime_log_ts = {}
         self.active_trade = {}
+        self.reject_stats = defaultdict(int)
+        self.last_reject_stats_print_ts = 0.0
 
     def _log_event(self, **kwargs):
         if not getattr(self, "debug", True):
@@ -153,38 +155,53 @@ class TurnDetectionEngine:
         displacement = float(latest.get("price_displacement_pct", 0.0) or 0.0)
         velocity = float(latest.get("velocity", 0.0) or 0.0)
         vol_expand = float(latest.get("volatility_expand", 1.0) or 1.0)
+        flow_diff = self._safe_float(latest.get("flow_diff"))
+        pressure_diff = self._safe_float(latest.get("pressure_diff"))
+        dominance_score = self._safe_float(latest.get("dominance_score"))
 
-        if displacement < 0.08:
+        if abs(flow_diff) >= 350 or abs(pressure_diff) >= 0.04 or abs(dominance_score) >= 0.10:
+            return True
+
+        if displacement < 0.025:
             return False
 
-        if abs(velocity) < 0.5:
+        if abs(velocity) < 0.15:
             return False
 
-        if vol_expand < 1.15:
+        if vol_expand < 1.03:
             return False
 
         return True
 
     def _micro_turn_ready(self, latest, side):
+        score_key = "bull_turn_score" if side == "BULLISH" else "bear_turn_score"
+        score = self._safe_float(latest.get(score_key)) if score_key in latest else None
+
         if side == "BULLISH":
-            score = self._safe_float(latest.get("bull_turn_score"))
+            fallback_confirm = (
+                self._safe_float(latest.get("dominance_score")) >= 0.10
+                or self._safe_float(latest.get("pressure_diff")) >= 0.05
+                or self._safe_float(latest.get("flow_diff")) >= 250
+            )
         else:
-            score = self._safe_float(latest.get("bear_turn_score"))
+            fallback_confirm = (
+                self._safe_float(latest.get("dominance_score")) <= -0.10
+                or self._safe_float(latest.get("pressure_diff")) <= -0.05
+                or self._safe_float(latest.get("flow_diff")) <= -250
+            )
 
-        spoof = self._safe_float(latest.get("spoof_risk"))
-        fatigue = self._safe_float(latest.get("trend_fatigue"))
-        decel = self._safe_float(latest.get("deceleration"))
-
-        if score < self.MICRO_TURN_SCORE_THRESHOLD:
+        if score is not None and score < self.MICRO_TURN_SCORE_THRESHOLD:
+            return False
+        if score is None and not fallback_confirm:
             return False
 
-        if spoof > self.SPOOF_RISK_BLOCK:
+        if "spoof_risk" in latest and self._safe_float(latest.get("spoof_risk")) > self.SPOOF_RISK_BLOCK:
             return False
 
-        if fatigue > self.TREND_FATIGUE_BLOCK:
+        if "trend_fatigue" in latest and self._safe_float(latest.get("trend_fatigue")) > self.TREND_FATIGUE_BLOCK:
             return False
 
-        if decel < self.DECELERATION_CONFIRM:
+        if "deceleration" in latest and self._safe_float(latest.get("deceleration")) < self.DECELERATION_CONFIRM:
             return False
 
         return True
@@ -209,7 +226,23 @@ class TurnDetectionEngine:
         compression_release = self._is_compression(prev_rows[-3:]) and not self._is_compression(rows[-2:])
         weak_fake = self._safe_float(latest.get("dominance_score")) < self.DOM_FLIP_THRESHOLD or self._safe_float(latest.get("flow_diff")) < 0
         micro_ok = self._micro_turn_ready(latest, "BULLISH")
-        if not (prev_state_bearish and (bias_flip or dom_flip) and flow_support and pressure_support and micro_ok) or weak_fake:
+        if not prev_state_bearish:
+            self.reject_stats["REAL_BULL_NO_PREV_STATE"] += 1
+            return False, 0.0, []
+        if not (bias_flip or dom_flip):
+            self.reject_stats["REAL_BULL_NO_FLIP"] += 1
+            return False, 0.0, []
+        if not flow_support:
+            self.reject_stats["REAL_BULL_NO_FLOW"] += 1
+            return False, 0.0, []
+        if not pressure_support:
+            self.reject_stats["REAL_BULL_NO_PRESSURE"] += 1
+            return False, 0.0, []
+        if not micro_ok:
+            self.reject_stats["REAL_BULL_MICRO_BLOCK"] += 1
+            return False, 0.0, []
+        if weak_fake:
+            self.reject_stats["REAL_BULL_WEAK_FAKE"] += 1
             return False, 0.0, []
         reasons = []
         if bias_flip:
@@ -231,6 +264,7 @@ class TurnDetectionEngine:
         if pre_exhaustion:
             confidence += 0.05
         if not self._is_discontinuation(latest):
+            self.reject_stats["REAL_BULL_NO_DISCONTINUATION"] += 1
             return False, 0.0, ["NO_DISCONTINUATION"]
         return True, min(confidence, 0.95), reasons
 
@@ -254,7 +288,23 @@ class TurnDetectionEngine:
         compression_release = self._is_compression(prev_rows[-3:]) and not self._is_compression(rows[-2:])
         weak_fake = self._safe_float(latest.get("dominance_score")) > -self.DOM_FLIP_THRESHOLD or self._safe_float(latest.get("flow_diff")) > 0
         micro_ok = self._micro_turn_ready(latest, "BEARISH")
-        if not (prev_state_bullish and (bias_flip or dom_flip) and flow_support and pressure_support and micro_ok) or weak_fake:
+        if not prev_state_bullish:
+            self.reject_stats["REAL_BEAR_NO_PREV_STATE"] += 1
+            return False, 0.0, []
+        if not (bias_flip or dom_flip):
+            self.reject_stats["REAL_BEAR_NO_FLIP"] += 1
+            return False, 0.0, []
+        if not flow_support:
+            self.reject_stats["REAL_BEAR_NO_FLOW"] += 1
+            return False, 0.0, []
+        if not pressure_support:
+            self.reject_stats["REAL_BEAR_NO_PRESSURE"] += 1
+            return False, 0.0, []
+        if not micro_ok:
+            self.reject_stats["REAL_BEAR_MICRO_BLOCK"] += 1
+            return False, 0.0, []
+        if weak_fake:
+            self.reject_stats["REAL_BEAR_WEAK_FAKE"] += 1
             return False, 0.0, []
         reasons = []
         if bias_flip:
@@ -276,6 +326,7 @@ class TurnDetectionEngine:
         if pre_exhaustion:
             confidence += 0.05
         if not self._is_discontinuation(latest):
+            self.reject_stats["REAL_BEAR_NO_DISCONTINUATION"] += 1
             return False, 0.0, ["NO_DISCONTINUATION"]
         return True, min(confidence, 0.95), reasons
 
@@ -337,12 +388,12 @@ class TurnDetectionEngine:
         latest = rows[-1]
         strong_bias = latest.get("bias") == "BULLISH" or latest.get("dominance_side") == "BULLISH"
         flow_ok = self._avg("flow_diff", rows[-3:]) > 0
-        dom_ok = self._avg("dominance_score", rows[-3:]) > self.DOM_FLIP_THRESHOLD
+        dom_ok = self._avg("dominance_score", rows[-3:]) > 0.05
         not_tired = self._safe_float(latest.get("exhaustion_score")) < self.EXHAUSTION_THRESHOLD
         is_compressed = self._is_compression(rows[-2:])
         strong_trend_inside_compression = (
             latest.get("bias") == "BULLISH"
-            and self._avg("dominance_score", rows[-3:]) > 0.18
+            and self._avg("dominance_score", rows[-3:]) > 0.08
             and self._avg("flow_diff", rows[-3:]) > 0
         )
         not_compressed = (not is_compressed) or strong_trend_inside_compression
@@ -351,6 +402,7 @@ class TurnDetectionEngine:
             if self._slope("flow_diff", rows[-4:]) > 0:
                 confidence += 0.05
             return True, min(confidence, 0.88), ["bullish_structure_holding"]
+        self.reject_stats["CONT_BULL_BLOCK"] += 1
         return False, 0.0, []
 
     def _is_bearish_continuation(self, rows):
@@ -359,12 +411,12 @@ class TurnDetectionEngine:
         latest = rows[-1]
         strong_bias = latest.get("bias") == "BEARISH" or latest.get("dominance_side") == "BEARISH"
         flow_ok = self._avg("flow_diff", rows[-3:]) < 0
-        dom_ok = self._avg("dominance_score", rows[-3:]) < -self.DOM_FLIP_THRESHOLD
+        dom_ok = self._avg("dominance_score", rows[-3:]) < -0.05
         not_tired = self._safe_float(latest.get("exhaustion_score")) < self.EXHAUSTION_THRESHOLD
         is_compressed = self._is_compression(rows[-2:])
         strong_trend_inside_compression = (
             latest.get("bias") == "BEARISH"
-            and self._avg("dominance_score", rows[-3:]) < -0.18
+            and self._avg("dominance_score", rows[-3:]) < -0.08
             and self._avg("flow_diff", rows[-3:]) < 0
         )
         not_compressed = (not is_compressed) or strong_trend_inside_compression
@@ -373,6 +425,7 @@ class TurnDetectionEngine:
             if self._slope("flow_diff", rows[-4:]) < 0:
                 confidence += 0.05
             return True, min(confidence, 0.88), ["bearish_structure_holding"]
+        self.reject_stats["CONT_BEAR_BLOCK"] += 1
         return False, 0.0, []
 
     def _emit(self, snapshot, signal, confidence, reason, state):
@@ -460,6 +513,10 @@ class TurnDetectionEngine:
     def update(self, snapshot):
         if not snapshot or not isinstance(snapshot, dict):
             return None
+        now_ts = time.time()
+        if now_ts - self.last_reject_stats_print_ts >= self.SUMMARY_INTERVAL_SEC:
+            print(f"TURN_REJECT_STATS => {dict(self.reject_stats)}")
+            self.last_reject_stats_print_ts = now_ts
 
         index = snapshot.get("index")
         if not index:
