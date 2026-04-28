@@ -41,6 +41,16 @@ class OptionsMomentumEngine:
     MICRO_MIN_FLOW = 250
 
     TURN_SPEED_RATIO_THRESHOLD = 1.2
+    FEE_BUFFER_POINTS = 1.40
+    MIN_NET_PROFIT_POINTS = 1.80
+    MIN_PROFIT_EXIT_POINTS = 2.80
+    HARD_STOP_PCT = 0.055
+    MAX_LOSS_POINTS = 2.20
+    TRAIL_ACTIVATE_POINTS = 3.00
+    TRAIL_GIVEBACK_PCT = 0.38
+    PROFIT_PROTECTION_MIN_MFE_POINTS = 4.00
+    PROFIT_PROTECTION_MIN_PRICE_ABOVE_ENTRY = 1.20
+    RECOVERY_WINDOW_SEC = 60
 
     def __init__(self):
         self.IST = timezone(timedelta(hours=5, minutes=30))
@@ -70,6 +80,7 @@ class OptionsMomentumEngine:
 
         self.last_candle_sec = {}
         self.vol_exit_counter = defaultdict(int)
+        self.last_exit_guard_log_sec = {}
 
         self.micro_stats_window = defaultdict(int)
         self.last_micro_stats_sec = None
@@ -513,6 +524,8 @@ class OptionsMomentumEngine:
             t = self.active_trade[secid]
             entry = float(t["entry"])
             price = float(last["close"])
+            pnl_points = price - entry
+            pnl_pct = (pnl_points / entry) * 100 if entry > 0 else 0
             t["last_ts"] = float(last["ts"])
 
             state = self.trade_state.get(secid)
@@ -539,64 +552,38 @@ class OptionsMomentumEngine:
             t["worst_price"] = min(float(t["worst_price"]), price)
             t["mfe"] = max(float(t["best_price"]) - entry, 0.0)
             t["mae"] = max(entry - float(t["worst_price"]), 0.0)
+            mfe_points = float(t["mfe"])
+            mae_points = float(t["mae"])
+            hard_stop_points = min(self.MAX_LOSS_POINTS, max(entry * self.HARD_STOP_PCT, 1.20))
 
             spread = max(float(t["entry_spread"]), 0.05)
 
             if cur_sec % 10 == 0:
-                pnl = price - entry
                 hold = state.seconds_in_trade if state else 0
 
                 print(
                     f"📊 OPEN_POSITION | secid={secid} | "
                     f"Entry:{entry:.2f} | LTP:{price:.2f} | "
-                    f"PnL:{pnl:+.2f} | Hold:{hold:.1f}s"
+                    f"PnL:{pnl_points:+.2f} ({pnl_pct:+.2f}%) | Hold:{hold:.1f}s"
                 )
 
             # --- SMART HOLD SYSTEM ---
             if state:
-
-                # --- RECOVERY WINDOW (CONTROLLED HOLD) ---
-                if state.seconds_in_trade < 90:
-                    extreme_fail = state.mae > max(spread * 20, 5.0)
-
-                    if extreme_fail:
-                        print(f"🚨 EXTREME_FAIL_EXIT | secid={secid}")
-                        return self._close_trade(secid, price, cur_sec, "EXTREME_FAIL")
-
-                    return "HOLD"
-
-                # 🟡 PROBE PHASE (0–15 sec)
-                if state.seconds_in_trade < 15:
-
-                    # Only exit if BOTH strong adverse move + no recovery attempt
-                    strong_adverse = state.mae > max(spread * 10, 2.0)
-
-                    no_bounce = (
-                        price < entry - (spread * 2)
-                        and state.mfe < spread * 0.3
+                last_guard_sec = self.last_exit_guard_log_sec.get(secid, -1)
+                if cur_sec - last_guard_sec >= 10:
+                    self.last_exit_guard_log_sec[secid] = cur_sec
+                    print(
+                        f"🛡 PRINT_EXIT_GUARD | secid={secid} | entry={entry:.2f} | price={price:.2f} | "
+                        f"pnl_points={pnl_points:+.2f} | mfe_points={mfe_points:.2f} | "
+                        f"mae_points={mae_points:.2f} | hard_stop_points={hard_stop_points:.2f} | "
+                        f"seconds_in_trade={state.seconds_in_trade:.2f}"
                     )
 
-                    if strong_adverse and no_bounce:
-                        print(f"🚪 EARLY_STRUCTURE_FAIL | secid={secid}")
-                        return self._close_trade(secid, price, cur_sec, "EARLY_STRUCTURE_FAIL")
-
-                    return "HOLD"
-
-                # 🛡️ Minimum hold guarantee before any later exit
-                if state.seconds_in_trade < 20:
-                    return "HOLD"
-
-                # 🟠 BUILD PHASE (20–60 sec)
-                if state.seconds_in_trade < 60:
-
-                    # Allow recovery zone
-                    if state.mae > max(spread * 12, 2.5):
-
-                        # Only exit if structure is clearly broken
-                        if price < entry - (spread * 2):
-                            print(f"🚪 STRUCTURE_FAIL_EXIT | secid={secid}")
-                            return self._close_trade(secid, price, cur_sec, "STRUCTURE_FAIL")
-
+                # --- RECOVERY WINDOW (CONTROLLED HOLD) ---
+                if state.seconds_in_trade < self.RECOVERY_WINDOW_SEC:
+                    if pnl_points <= -hard_stop_points:
+                        print(f"🚨 HARD_STOP_EXIT_RECOVERY | secid={secid}")
+                        return self._close_trade(secid, price, cur_sec, "HARD_STOP")
                     return "HOLD"
 
             if state:
@@ -620,50 +607,57 @@ class OptionsMomentumEngine:
             if (
                 state
                 and state.seconds_in_trade > 60
-                and state.mfe > spread * 6.0
-                and state.mae > state.mfe * 0.5
+                and pnl_points > self.PROFIT_PROTECTION_MIN_PRICE_ABOVE_ENTRY
+                and mfe_points >= self.PROFIT_PROTECTION_MIN_MFE_POINTS
             ):
-                print(f"🚨 PROFIT_PROTECTION_EXIT | secid={secid}")
-                return self._close_trade(secid, price, cur_sec, "PROFIT_PROTECTION")
+                drawdown_points = float(t["best_price"]) - price
+                if drawdown_points >= max(1.5, mfe_points * 0.45):
+                    print(f"🚨 PROFIT_PROTECTION_EXIT | secid={secid}")
+                    return self._close_trade(secid, price, cur_sec, "PROFIT_PROTECTION")
+
+            if state and state.seconds_in_trade >= 45:
+                if mfe_points >= self.TRAIL_ACTIVATE_POINTS and pnl_points <= self.FEE_BUFFER_POINTS:
+                    print(f"🛡 BREAKEVEN_PROTECT_EXIT | secid={secid}")
+                    return self._close_trade(secid, price, cur_sec, "BREAKEVEN_PROTECT")
+
+            if state and state.seconds_in_trade >= self.RECOVERY_WINDOW_SEC:
+                if pnl_points <= -hard_stop_points:
+                    print(f"🚨 HARD_STOP_EXIT | secid={secid}")
+                    return self._close_trade(secid, price, cur_sec, "HARD_STOP")
 
             if state and t["profit_lock_armed"] and self.phase_manager.allow_trailing_exit(state):
-                if t["mfe"] < max(spread * 2, 1.2):
-                    pass
-
-                trail_distance = max(spread * 2, 1.5)
-                locked_price = float(t["best_price"]) - trail_distance
-
-                if t.get("locked_price") is None:
-                    t["locked_price"] = locked_price
+                if mfe_points < self.TRAIL_ACTIVATE_POINTS:
+                    return "HOLD"
+                elif pnl_points < self.MIN_PROFIT_EXIT_POINTS:
+                    return "HOLD"
                 else:
-                    t["locked_price"] = max(t["locked_price"], locked_price)
+                    trail_distance = max(spread * 2, 1.5)
+                    locked_price = float(t["best_price"]) - trail_distance
 
-                t["locked_price"] = max(t["locked_price"], entry + spread)
+                    if t.get("locked_price") is None:
+                        t["locked_price"] = locked_price
+                    else:
+                        t["locked_price"] = max(t["locked_price"], locked_price)
 
-                if t.get("locked_price") is not None and price <= t["locked_price"]:
-                    print(
-                        f"🔐 LOCKED_PROFIT_EXIT | secid={secid} | "
-                        f"price={price:.2f} | locked_price={t['locked_price']:.2f}"
-                    )
-                    return self._close_trade(secid, price, cur_sec, "PROFIT_TRAIL")
+                    t["locked_price"] = max(t["locked_price"], entry + spread)
 
-                giveback = float(t["best_price"]) - price
-                mfe = float(t["mfe"])
+                    if t.get("locked_price") is not None and price <= t["locked_price"]:
+                        print(
+                            f"🔐 LOCKED_PROFIT_EXIT | secid={secid} | "
+                            f"price={price:.2f} | locked_price={t['locked_price']:.2f}"
+                        )
+                        return self._close_trade(secid, price, cur_sec, "PROFIT_TRAIL")
 
-                if mfe < spread * 4:
-                    threshold = mfe * 0.60
-                elif mfe < spread * 8:
-                    threshold = mfe * 0.45
-                else:
-                    threshold = mfe * 0.35
+                    giveback = float(t["best_price"]) - price
+                    threshold = max(1.2, mfe_points * self.TRAIL_GIVEBACK_PCT)
 
-                if giveback >= threshold:
-                    print(
-                        f"📉 TRAILING_EXIT | secid={secid} | "
-                        f"price={price:.2f} | best={t['best_price']:.2f} | "
-                        f"mfe={t['mfe']:.3f} | giveback={giveback:.3f} | threshold={threshold:.3f}"
-                    )
-                    return self._close_trade(secid, price, cur_sec, "PROFIT_TRAIL")
+                    if giveback >= threshold:
+                        print(
+                            f"📉 TRAILING_EXIT | secid={secid} | "
+                            f"price={price:.2f} | best={t['best_price']:.2f} | "
+                            f"mfe={t['mfe']:.3f} | giveback={giveback:.3f} | threshold={threshold:.3f}"
+                        )
+                        return self._close_trade(secid, price, cur_sec, "PROFIT_TRAIL")
 
             opposite_turn_exit = (
                 prev_speed > 0
@@ -701,4 +695,3 @@ class OptionsMomentumEngine:
             return "NO_TRADE"
 
         return "NO_TRADE"
-
