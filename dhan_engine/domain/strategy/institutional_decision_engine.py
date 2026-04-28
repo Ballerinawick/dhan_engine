@@ -30,10 +30,11 @@ class InstitutionalDecisionEngine:
     SHADOW_WINDOW_SEC = 30
 
     REENTRY_ALLOW_WITHOUT_STRUCT = True
-    CONTINUATION_MAX_AGE_SEC = 12
-    CONTINUATION_MIN_DOM = 0.15
-    CONTINUATION_MIN_FLOW = 1000
-    CONTINUATION_MIN_PRESSURE = 0.08
+    CONTINUATION_MAX_AGE_SEC = 18
+    CONTINUATION_MIN_DOM = 0.10
+    CONTINUATION_MIN_FLOW = 600
+    CONTINUATION_MIN_PRESSURE = 0.05
+    ENABLE_CANDLE_CONFIRM = False
 
     def __init__(self, debug=True):
         self.debug = debug
@@ -210,7 +211,8 @@ class InstitutionalDecisionEngine:
         ):
             last_tick = momentum_engine.tick_buffer[secid][-1] if momentum_engine.tick_buffer[secid] else {}
             print("ENTRY_CONFIDENCE →", signal_confidence)
-            if signal_confidence < 0.65:
+            min_conf = 0.58 if "CONTINUATION" in signal else 0.62
+            if signal_confidence < min_conf:
                 self._log_event(
                     event="ENTRY",
                     decision="REJECT",
@@ -318,7 +320,7 @@ class InstitutionalDecisionEngine:
                 )
 
             last_ts = self.last_entry_ts.get(index)
-            if last_ts and (time.time() - last_ts) < 45:
+            if last_ts and (time.time() - last_ts) < 20:
                 self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="ENTRY_COOLDOWN")
                 print("DECISION_REJECT_REASON → ENTRY_COOLDOWN")
                 return {"entry_allowed": False}
@@ -338,17 +340,17 @@ class InstitutionalDecisionEngine:
                     print("DECISION_REJECT_REASON → LOW_DOM")
                     return {"entry_allowed": False}
 
-            if abs(snapshot.get("flow_diff", 0)) < 1000:
+            if abs(snapshot.get("flow_diff", 0)) < 600:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_FLOW", index=index)
                 print("DECISION_REJECT_REASON → LOW_FLOW")
                 return {"entry_allowed": False}
 
-            if abs(snapshot.get("dominance_score", 0)) < 0.15:
+            if abs(snapshot.get("dominance_score", 0)) < 0.10:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_DOM", index=index)
                 print("DECISION_REJECT_REASON → LOW_DOM")
                 return {"entry_allowed": False}
 
-            if abs(snapshot.get("pressure_diff", 0)) < 0.08:
+            if abs(snapshot.get("pressure_diff", 0)) < 0.05:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_PRESSURE", index=index)
                 print("DECISION_REJECT_REASON → LOW_PRESSURE")
                 return {"entry_allowed": False}
@@ -411,7 +413,7 @@ class InstitutionalDecisionEngine:
                 print("DECISION_REJECT_REASON → STRUCT_NOT_OK")
                 return {"entry_allowed": False}
 
-            if signal.endswith("CONTINUATION"):
+            if self.ENABLE_CANDLE_CONFIRM and signal.endswith("CONTINUATION"):
                 candles = list(momentum_engine.candles.get(secid, []))
                 if len(candles) < 3:
                     self._log_event(
