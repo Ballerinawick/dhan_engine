@@ -30,10 +30,10 @@ class InstitutionalDecisionEngine:
     SHADOW_WINDOW_SEC = 30
 
     REENTRY_ALLOW_WITHOUT_STRUCT = True
-    CONTINUATION_MAX_AGE_SEC = 18
-    CONTINUATION_MIN_DOM = 0.10
-    CONTINUATION_MIN_FLOW = 600
-    CONTINUATION_MIN_PRESSURE = 0.05
+    CONTINUATION_MAX_AGE_SEC = 30
+    CONTINUATION_MIN_DOM = 0.05
+    CONTINUATION_MIN_FLOW = 250
+    CONTINUATION_MIN_PRESSURE = 0.01
     ENABLE_CANDLE_CONFIRM = False
 
     def __init__(self, debug=True):
@@ -50,6 +50,8 @@ class InstitutionalDecisionEngine:
         self.index_active_secid = {}
         self.index_last_exit_ts = {}
         self.index_last_exit_side = {}
+        self.reject_stats = defaultdict(int)
+        self.last_reject_stats_print_ts = 0.0
 
         self.shadow = defaultdict(lambda: {
             "CE": {"ticks": 0, "last_ts": 0.0, "structure_ok": False},
@@ -146,6 +148,9 @@ class InstitutionalDecisionEngine:
             "has_snapshot": snapshot is not None,
         })
         now = time.time()
+        if (now - self.last_reject_stats_print_ts) >= 60:
+            print(f"ENTRY_REJECT_STATS => {dict(self.reject_stats)}")
+            self.last_reject_stats_print_ts = now
         index = self._index_from_tag(tag)
         side = self._side_from_tag(tag)
         snapshot = snapshot or {}
@@ -178,6 +183,7 @@ class InstitutionalDecisionEngine:
                 index=index,
                 signal=signal,
             )
+            self.reject_stats["TURN_PENDING_CONFIRMATION"] += 1
             return {"entry_allowed": False, "reason": "TURN_PENDING_CONFIRMATION"}
         elif signal == "REAL_BEARISH_TURN":
             self.last_turn_signal[index] = signal
@@ -196,6 +202,7 @@ class InstitutionalDecisionEngine:
                 index=index,
                 signal=signal,
             )
+            self.reject_stats["TURN_PENDING_CONFIRMATION"] += 1
             return {"entry_allowed": False, "reason": "TURN_PENDING_CONFIRMATION"}
 
         self._update_price_history(secid, now, ltp)
@@ -211,7 +218,7 @@ class InstitutionalDecisionEngine:
         ):
             last_tick = momentum_engine.tick_buffer[secid][-1] if momentum_engine.tick_buffer[secid] else {}
             print("ENTRY_CONFIDENCE →", signal_confidence)
-            min_conf = 0.58 if "CONTINUATION" in signal else 0.62
+            min_conf = 0.48 if "CONTINUATION" in signal else 0.52
             if signal_confidence < min_conf:
                 self._log_event(
                     event="ENTRY",
@@ -220,6 +227,7 @@ class InstitutionalDecisionEngine:
                     confidence=round(signal_confidence, 2)
                 )
                 print("DECISION_REJECT_REASON → LOW_CONFIDENCE")
+                self.reject_stats["LOW_CONFIDENCE"] += 1
                 return {"entry_allowed": False}
             last_turn = self.last_turn_signal.get(index)
             last_turn_ts = self.last_turn_ts.get(index, 0.0)
@@ -237,6 +245,7 @@ class InstitutionalDecisionEngine:
                 entry_side = "PE"
             else:
                 self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="TURN_NOT_MATCHED")
+                self.reject_stats["TURN_NOT_MATCHED"] += 1
                 return {"entry_allowed": False}
 
             if signal.endswith("CONTINUATION"):
@@ -278,11 +287,13 @@ class InstitutionalDecisionEngine:
                         self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="NO_PENDING_TURN")
                         self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_WITHOUT_PENDING")
                         print("DECISION_REJECT_REASON → CONTINUATION_WITHOUT_PENDING")
+                        self.reject_stats["CONTINUATION_WITHOUT_PENDING"] += 1
                         return {"entry_allowed": False}
                 if pending_turn and pending_turn.get("entry_side") != entry_side:
                     self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="DIRECTION_MISMATCH")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_DIRECTION_MISMATCH")
                     print("DECISION_REJECT_REASON → CONTINUATION_DIRECTION_MISMATCH")
+                    self.reject_stats["CONTINUATION_DIRECTION_MISMATCH"] += 1
                     return {"entry_allowed": False}
                 pending_age = max(now - float(pending_turn.get("timestamp", 0.0)), 0.0) if pending_turn else 0.0
                 if pending_turn and pending_age > 20.0:
@@ -290,26 +301,31 @@ class InstitutionalDecisionEngine:
                     self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="PENDING_TURN_STALE")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_STALE")
                     print("DECISION_REJECT_REASON → CONTINUATION_STALE")
+                    self.reject_stats["CONTINUATION_STALE"] += 1
                     return {"entry_allowed": False}
                 if turn_age_sec > self.CONTINUATION_MAX_AGE_SEC:
                     self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="TURN_CONTEXT_STALE")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_STALE")
                     print("DECISION_REJECT_REASON → CONTINUATION_STALE")
+                    self.reject_stats["CONTINUATION_STALE"] += 1
                     return {"entry_allowed": False}
                 if abs(snapshot.get("flow_diff", 0)) < self.CONTINUATION_MIN_FLOW:
                     self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="CONTINUATION_LOW_FLOW")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_LOW_FLOW")
                     print("DECISION_REJECT_REASON → CONTINUATION_LOW_FLOW")
+                    self.reject_stats["CONTINUATION_LOW_FLOW"] += 1
                     return {"entry_allowed": False}
                 if abs(snapshot.get("dominance_score", 0)) < self.CONTINUATION_MIN_DOM:
                     self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="CONTINUATION_LOW_DOM")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_LOW_DOM")
                     print("DECISION_REJECT_REASON → CONTINUATION_LOW_DOM")
+                    self.reject_stats["CONTINUATION_LOW_DOM"] += 1
                     return {"entry_allowed": False}
                 if abs(snapshot.get("pressure_diff", 0)) < self.CONTINUATION_MIN_PRESSURE:
                     self._log_event(event="TURN_CONFIRMATION_REJECT", index=index, secid=secid, reason="CONTINUATION_LOW_PRESSURE")
                     self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="CONTINUATION_LOW_PRESSURE")
                     print("DECISION_REJECT_REASON → CONTINUATION_LOW_PRESSURE")
+                    self.reject_stats["CONTINUATION_LOW_PRESSURE"] += 1
                     return {"entry_allowed": False}
                 self._log_event(
                     event="TURN_CONFIRMATION_ACCEPT",
@@ -320,9 +336,10 @@ class InstitutionalDecisionEngine:
                 )
 
             last_ts = self.last_entry_ts.get(index)
-            if last_ts and (time.time() - last_ts) < 20:
+            if last_ts and (time.time() - last_ts) < 8:
                 self._log_event(event="ENTRY", decision="REJECT", index=index, secid=secid, side=side, reason="ENTRY_COOLDOWN")
                 print("DECISION_REJECT_REASON → ENTRY_COOLDOWN")
+                self.reject_stats["ENTRY_COOLDOWN"] += 1
                 return {"entry_allowed": False}
 
             print(
@@ -338,21 +355,25 @@ class InstitutionalDecisionEngine:
                 if abs(snapshot.get("dominance_score", 0)) < 0.20:
                     self._log_event(event="ENTRY_BLOCK", reason="WEAK_COMPRESSION", index=index)
                     print("DECISION_REJECT_REASON → LOW_DOM")
+                    self.reject_stats["LOW_DOM"] += 1
                     return {"entry_allowed": False}
 
-            if abs(snapshot.get("flow_diff", 0)) < 600:
+            if abs(snapshot.get("flow_diff", 0)) < 250:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_FLOW", index=index)
                 print("DECISION_REJECT_REASON → LOW_FLOW")
+                self.reject_stats["LOW_FLOW"] += 1
                 return {"entry_allowed": False}
 
-            if abs(snapshot.get("dominance_score", 0)) < 0.10:
+            if abs(snapshot.get("dominance_score", 0)) < 0.05:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_DOM", index=index)
                 print("DECISION_REJECT_REASON → LOW_DOM")
+                self.reject_stats["LOW_DOM"] += 1
                 return {"entry_allowed": False}
 
-            if abs(snapshot.get("pressure_diff", 0)) < 0.05:
+            if abs(snapshot.get("pressure_diff", 0)) < 0.01:
                 self._log_event(event="ENTRY_BLOCK", reason="LOW_PRESSURE", index=index)
                 print("DECISION_REJECT_REASON → LOW_PRESSURE")
+                self.reject_stats["LOW_PRESSURE"] += 1
                 return {"entry_allowed": False}
 
             if index in self.index_active_secid and self.index_active_secid[index] in paper_trader.positions:
@@ -366,6 +387,7 @@ class InstitutionalDecisionEngine:
                     reason="INDEX_LOCKED",
                 )
                 print("DECISION_REJECT_REASON → INDEX_LOCKED")
+                self.reject_stats["INDEX_LOCKED"] += 1
                 return {"entry_allowed": False}
 
             if not self._cooldown_ok(index, now):
@@ -379,6 +401,7 @@ class InstitutionalDecisionEngine:
                     reason="COOLDOWN",
                 )
                 print("DECISION_REJECT_REASON → COOLDOWN")
+                self.reject_stats["COOLDOWN"] += 1
                 return {"entry_allowed": False}
 
             last_exit_side = self.index_last_exit_side.get(index)
@@ -395,6 +418,7 @@ class InstitutionalDecisionEngine:
                     reason="FLIP_NO_SHADOW",
                 )
                 print("DECISION_REJECT_REASON → FLIP_NO_SHADOW")
+                self.reject_stats["FLIP_NO_SHADOW"] += 1
                 return {"entry_allowed": False}
 
             if not is_flip and self.REENTRY_ALLOW_WITHOUT_STRUCT:
@@ -411,6 +435,7 @@ class InstitutionalDecisionEngine:
                     reason="STRUCT_NOT_OK",
                 )
                 print("DECISION_REJECT_REASON → STRUCT_NOT_OK")
+                self.reject_stats["STRUCT_NOT_OK"] += 1
                 return {"entry_allowed": False}
 
             if self.ENABLE_CANDLE_CONFIRM and signal.endswith("CONTINUATION"):
@@ -428,6 +453,7 @@ class InstitutionalDecisionEngine:
                         candle_count=len(candles),
                     )
                     print("DECISION_REJECT_REASON → NO_CANDLE_CONFIRM")
+                    self.reject_stats["NO_CANDLE_CONFIRM"] += 1
                     return {"entry_allowed": False}
 
                 prev_candle = candles[-3]
@@ -484,6 +510,7 @@ class InstitutionalDecisionEngine:
                             "last_low": round(last_low, 4),
                         }
                     )
+                    self.reject_stats["NO_CANDLE_CONFIRM"] += 1
                     return {"entry_allowed": False}
 
             print("BEFORE_PAPER_ENTRY →", secid, tag, ltp)
@@ -508,6 +535,7 @@ class InstitutionalDecisionEngine:
                     reason="PAPER_TRADER_REJECT",
                 )
                 print("DECISION_REJECT_REASON → PAPER_TRADER_REJECT")
+                self.reject_stats["PAPER_TRADER_REJECT"] += 1
                 return {"entry_allowed": False}
 
             trade = {
@@ -645,6 +673,7 @@ class InstitutionalDecisionEngine:
                 "signal": signal,
                 "reason": "ENTRY_INVALIDATED",
             })
+            self.reject_stats["DECISION_FELL_THROUGH"] += 1
             return {"entry_allowed": False, "reason": "DECISION_FELL_THROUGH"}
 
         print("DECISION_NO_ACTION →", {
