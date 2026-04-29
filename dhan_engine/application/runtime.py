@@ -574,15 +574,13 @@ class TradingRuntimeCoordinator:
 
         if action == "EXIT_CE":
             secid = pair.ce_id
-            tag = f"{pair.index}_CE"
             ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
-            return bool(secid and self._attempt_exit_once(pair, secid, tag, float(ltp), f"TRI_WAVE_EXIT:{signal.reason}"))
+            return bool(secid and self._tri_wave_direct_exit(pair, secid, float(ltp), signal.reason))
 
         if action == "EXIT_PE":
             secid = pair.pe_id
-            tag = f"{pair.index}_PE"
             ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
-            return bool(secid and self._attempt_exit_once(pair, secid, tag, float(ltp), f"TRI_WAVE_EXIT:{signal.reason}"))
+            return bool(secid and self._tri_wave_direct_exit(pair, secid, float(ltp), signal.reason))
 
         if action == "FLIP_TO_CE":
             old_secid = pair.pe_id
@@ -613,6 +611,22 @@ class TradingRuntimeCoordinator:
             return bool(accepted)
 
         return False
+
+    def _tri_wave_direct_exit(self, pair: PairRuntimeState, secid: int, ltp: float, reason: str) -> bool:
+        active = self.paper_trader.positions.get(secid)
+        if not active:
+            return False
+        tag = active.get("tag", f"{pair.index}_{'CE' if secid == pair.ce_id else 'PE'}")
+        final_reason = f"TRI_WAVE_EXIT:{reason}"
+        hold_sec = max(time.time() - float(active.get("entry_ts", time.time())), 0.0)
+        self.paper_trader.on_exit(secid, float(ltp), reason=final_reason)
+        self.flow_reversal_state.pop(secid, None)
+        if hasattr(self.momentum_engine, "clear_trade"):
+            self.momentum_engine.clear_trade(secid, final_reason)
+        else:
+            self.momentum_engine.active_trade.pop(secid, None)
+        self._record_exit_metrics(reason=final_reason, hold_sec=hold_sec, secid=secid, tag=str(tag))
+        return True
 
     def _process_option_update(self, index: str, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
         if not self.market_open():
