@@ -95,7 +95,7 @@ class PaperTradeManager:
     # --------------------------------------------------
     # ENTRY
     # --------------------------------------------------
-    def on_entry(self, secid, tag, side, ltp, lots=1, reason="ENTRY"):
+    def on_entry(self, secid, tag, side, ltp, lots=1, reason="ENTRY", metadata: dict | None = None):
         # 🚫 BLOCK ANY NEW ENTRY IF ONE EXISTS
         if self.has_open_position():
             print(
@@ -143,7 +143,7 @@ class PaperTradeManager:
         self.entries_by_index[index] += 1
         self.opened_today += 1
 
-        self.positions[secid] = {
+        entry_record = {
             "tag": tag,
             "side": side,
             "lots": lots,
@@ -154,6 +154,18 @@ class PaperTradeManager:
             "entry_ts": now_ts,
             "entry_reason": reason,
         }
+        metadata = dict(metadata or {})
+        strategy_owner = metadata.get("strategy_owner")
+        if strategy_owner:
+            entry_record["strategy_owner"] = strategy_owner
+        entry_reason_source = metadata.get("entry_reason_source")
+        if entry_reason_source:
+            entry_record["entry_reason_source"] = entry_reason_source
+        for key, value in metadata.items():
+            if key not in entry_record:
+                entry_record[key] = value
+
+        self.positions[secid] = entry_record
         print(f"🔥 TRADE STORED CONFIRMED | {tag} | {ltp}")
 
         self.max_concurrent_open = max(self.max_concurrent_open, len(self.positions))
