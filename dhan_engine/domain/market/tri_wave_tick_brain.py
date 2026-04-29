@@ -55,6 +55,13 @@ class TriWaveTickBrain:
     OPTION_WEAKEN_MIN_STRENGTH = -0.12
     OPPOSITE_EXPAND_MIN_STRENGTH = 0.28
     CURRENT_WEAKEN_MIN_STRENGTH = -0.22
+    ENTRY_PULLBACK_LOOKBACK_TICKS = 30
+    ENTRY_MAX_POSITION_IN_RANGE = 0.72
+    ENTRY_TURN_ZONE_MAX_POSITION = 0.45
+    ENTRY_REQUIRE_RECENT_TURN = True
+    ENTRY_MIN_RECOVERY_STRENGTH = 0.12
+    ENTRY_MAX_CHASE_STRENGTH = 0.82
+    ENTRY_MIN_OPPOSITE_WEAKEN = -0.10
 
     SPREAD_MAX_PCT = 0.025
     SPOOF_RISK_BLOCK = 0.72
@@ -111,7 +118,20 @@ class TriWaveTickBrain:
         n = len(prices)
         first, last = prices[0], prices[-1]
         delta = last - first
-        rng = max(max(prices) - min(prices), 0.05)
+        min_price = min(prices)
+        max_price = max(prices)
+        rng = max(max_price - min_price, 0.05)
+        position_in_range = (last - min_price) / rng
+        recent = prices[-10:]
+        recent_low = min(recent)
+        recent_high = max(recent)
+        from_recent_low_pct = ((last - recent_low) / max(recent_low, 1e-9)) * 100
+        from_recent_high_pct = ((last - recent_high) / max(recent_high, 1e-9)) * 100
+        last_5_delta = prices[-1] - prices[-5] if n >= 5 else 0.0
+        previous_5_delta = prices[-5] - prices[-10] if n >= 10 else 0.0
+        turn_up = previous_5_delta < 0 and last_5_delta > 0
+        turn_down = previous_5_delta > 0 and last_5_delta < 0
+        pullback_then_recover = turn_up and position_in_range <= self.ENTRY_TURN_ZONE_MAX_POSITION
         velocity = prices[-1] - prices[-2] if n >= 2 else 0.0
         prev_velocity = prices[-2] - prices[-3] if n >= 3 else 0.0
         accel = velocity - prev_velocity
@@ -135,6 +155,18 @@ class TriWaveTickBrain:
             "accel": accel,
             "direction": direction,
             "range": rng,
+            "min_price": min_price,
+            "max_price": max_price,
+            "position_in_range": position_in_range,
+            "recent_low": recent_low,
+            "recent_high": recent_high,
+            "from_recent_low_pct": from_recent_low_pct,
+            "from_recent_high_pct": from_recent_high_pct,
+            "last_5_delta": last_5_delta,
+            "previous_5_delta": previous_5_delta,
+            "turn_up": turn_up,
+            "turn_down": turn_down,
+            "pullback_then_recover": pullback_then_recover,
             "strength": delta / rng,
             "abs_strength": abs(delta / rng),
             "imbalance_5": latest.get("imbalance_5"),
@@ -151,6 +183,38 @@ class TriWaveTickBrain:
             "bid_price": latest.get("bid_price"),
             "ask_price": latest.get("ask_price"),
         }
+
+    def _entry_quality_ok(self, side: str, fs: dict, cs: dict, ps: dict) -> tuple[bool, str]:
+        if side == "CE":
+            target = cs
+            opposite = ps
+            if target["position_in_range"] > self.ENTRY_MAX_POSITION_IN_RANGE:
+                return False, "CHASE_ENTRY_BLOCKED_CE_TOP_ZONE"
+            if target["strength"] > self.ENTRY_MAX_CHASE_STRENGTH:
+                return False, "CHASE_ENTRY_BLOCKED_CE_OVEREXTENDED"
+            if self.ENTRY_REQUIRE_RECENT_TURN and not target["turn_up"]:
+                return False, "NO_CE_BOTTOM_TURN"
+            if target["last_5_delta"] < self.ENTRY_MIN_RECOVERY_STRENGTH:
+                return False, "CE_RECOVERY_TOO_WEAK"
+            if opposite["strength"] > self.ENTRY_MIN_OPPOSITE_WEAKEN:
+                return False, "PE_NOT_WEAKENING_ENOUGH"
+            return True, "CE_BOTTOM_TURN_CONFIRMED"
+
+        if side == "PE":
+            target = ps
+            opposite = cs
+            if target["position_in_range"] > self.ENTRY_MAX_POSITION_IN_RANGE:
+                return False, "CHASE_ENTRY_BLOCKED_PE_TOP_ZONE"
+            if target["strength"] > self.ENTRY_MAX_CHASE_STRENGTH:
+                return False, "CHASE_ENTRY_BLOCKED_PE_OVEREXTENDED"
+            if self.ENTRY_REQUIRE_RECENT_TURN and not target["turn_up"]:
+                return False, "NO_PE_BOTTOM_TURN"
+            if target["last_5_delta"] < self.ENTRY_MIN_RECOVERY_STRENGTH:
+                return False, "PE_RECOVERY_TOO_WEAK"
+            if opposite["strength"] > self.ENTRY_MIN_OPPOSITE_WEAKEN:
+                return False, "CE_NOT_WEAKENING_ENOUGH"
+            return True, "PE_BOTTOM_TURN_CONFIRMED"
+        return False, "UNKNOWN_SIDE"
 
     def _signal(self, index: str, action: str, side: Optional[str], confidence: float, reason: str, state: dict) -> TriWaveSignal:
         sig = TriWaveSignal(index=index, action=action, side=side, confidence=float(confidence), reason=reason, ts=time.time(), state=state)
@@ -206,7 +270,24 @@ class TriWaveTickBrain:
         last_log = self._last_state_log_ts.get(index, 0.0)
         if now_ts - last_log >= 3:
             self._last_state_log_ts[index] = now_ts
-            logger.info("TRI_WAVE_STATE | index=%s | sync_ready=True | fut_dir=%s | fut_strength=%.2f | ce_strength=%.2f | pe_strength=%.2f | bias=%s | active=%s", index, fs["direction"], fs["strength"], cs["strength"], ps["strength"], bias, (active_position or {}).get("side"))
+            logger.info(
+                "TRI_WAVE_STATE | index=%s | sync_ready=True | fut_dir=%s | fut_strength=%.2f | ce_strength=%.2f | pe_strength=%.2f | ce_pos=%.2f | pe_pos=%.2f | ce_turn_up=%s | pe_turn_up=%s | ce_last5=%.2f | pe_last5=%.2f | ce_prev5=%.2f | pe_prev5=%.2f | bias=%s | active=%s",
+                index,
+                fs["direction"],
+                fs["strength"],
+                cs["strength"],
+                ps["strength"],
+                cs["position_in_range"],
+                ps["position_in_range"],
+                cs["turn_up"],
+                ps["turn_up"],
+                cs["last_5_delta"],
+                ps["last_5_delta"],
+                cs["previous_5_delta"],
+                ps["previous_5_delta"],
+                bias,
+                (active_position or {}).get("side"),
+            )
 
         # entries
         if not active_position:
@@ -214,12 +295,22 @@ class TriWaveTickBrain:
                 conf = 0.70 + conf_adj + (0.03 if cs.get("bull_turn_score", 0) and cs.get("bull_turn_score", 0) > 0 else 0)
                 reasons = ["FUT_TURN_UP" if fut_turn_up else "FUT_TREND_UP", "CE_EXPAND", "PE_WEAKEN"]
                 if conf >= self.ENTRY_CONFIDENCE:
+                    quality_ok, quality_reason = self._entry_quality_ok("CE", fs, cs, ps)
+                    if not quality_ok:
+                        logger.info(
+                            "TRI_WAVE_ENTRY_REJECT | index=%s | side=CE | reason=%s | fut_strength=%.2f | ce_strength=%.2f | pe_strength=%.2f | ce_pos=%.2f | pe_pos=%.2f | ce_turn_up=%s | pe_turn_up=%s | ce_last5=%.2f | pe_last5=%.2f",
+                            index, quality_reason, fs["strength"], cs["strength"], ps["strength"],
+                            cs["position_in_range"], ps["position_in_range"],
+                            cs["turn_up"], ps["turn_up"], cs["last_5_delta"], ps["last_5_delta"]
+                        )
+                        return self._signal(index, "NO_TRADE", None, 0.0, quality_reason, state)
                     if (now_ts - self.last_signal_ts.get(index, 0.0)) < self.ENTRY_COOLDOWN_SEC:
                         logger.info("TRI_WAVE_ENTRY_COOLDOWN | index=%s | side=CE | remaining=%.2f", index, self.ENTRY_COOLDOWN_SEC - (now_ts - self.last_signal_ts.get(index, 0.0)))
                         return self._signal(index, "NO_TRADE", None, 0.0, "ENTRY_COOLDOWN", state)
                     if self.last_entry_side.get(index) == "CE" and (now_ts - self.last_entry_ts.get(index, 0.0)) < self.REENTRY_SAME_SIDE_COOLDOWN_SEC:
                         logger.info("TRI_WAVE_REENTRY_BLOCK | index=%s | side=CE | remaining=%.2f", index, self.REENTRY_SAME_SIDE_COOLDOWN_SEC - (now_ts - self.last_entry_ts.get(index, 0.0)))
                         return self._signal(index, "NO_TRADE", None, 0.0, "REENTRY_SAME_SIDE_COOLDOWN", state)
+                    reasons.append(quality_reason)
                     self.last_entry_side[index] = "CE"
                     self.last_entry_ts[index] = now_ts
                     return self._signal(index, "BUY_CE", "CE", conf, "+".join(reasons + reason_parts), state)
@@ -227,12 +318,22 @@ class TriWaveTickBrain:
                 conf = 0.70 + conf_adj + (0.03 if ps.get("bull_turn_score", 0) and ps.get("bull_turn_score", 0) > 0 else 0)
                 reasons = ["FUT_TURN_DOWN" if fut_turn_down else "FUT_TREND_DOWN", "PE_EXPAND", "CE_WEAKEN"]
                 if conf >= self.ENTRY_CONFIDENCE:
+                    quality_ok, quality_reason = self._entry_quality_ok("PE", fs, cs, ps)
+                    if not quality_ok:
+                        logger.info(
+                            "TRI_WAVE_ENTRY_REJECT | index=%s | side=PE | reason=%s | fut_strength=%.2f | ce_strength=%.2f | pe_strength=%.2f | ce_pos=%.2f | pe_pos=%.2f | ce_turn_up=%s | pe_turn_up=%s | ce_last5=%.2f | pe_last5=%.2f",
+                            index, quality_reason, fs["strength"], cs["strength"], ps["strength"],
+                            cs["position_in_range"], ps["position_in_range"],
+                            cs["turn_up"], ps["turn_up"], cs["last_5_delta"], ps["last_5_delta"]
+                        )
+                        return self._signal(index, "NO_TRADE", None, 0.0, quality_reason, state)
                     if (now_ts - self.last_signal_ts.get(index, 0.0)) < self.ENTRY_COOLDOWN_SEC:
                         logger.info("TRI_WAVE_ENTRY_COOLDOWN | index=%s | side=PE | remaining=%.2f", index, self.ENTRY_COOLDOWN_SEC - (now_ts - self.last_signal_ts.get(index, 0.0)))
                         return self._signal(index, "NO_TRADE", None, 0.0, "ENTRY_COOLDOWN", state)
                     if self.last_entry_side.get(index) == "PE" and (now_ts - self.last_entry_ts.get(index, 0.0)) < self.REENTRY_SAME_SIDE_COOLDOWN_SEC:
                         logger.info("TRI_WAVE_REENTRY_BLOCK | index=%s | side=PE | remaining=%.2f", index, self.REENTRY_SAME_SIDE_COOLDOWN_SEC - (now_ts - self.last_entry_ts.get(index, 0.0)))
                         return self._signal(index, "NO_TRADE", None, 0.0, "REENTRY_SAME_SIDE_COOLDOWN", state)
+                    reasons.append(quality_reason)
                     self.last_entry_side[index] = "PE"
                     self.last_entry_ts[index] = now_ts
                     return self._signal(index, "BUY_PE", "PE", conf, "+".join(reasons + reason_parts), state)
