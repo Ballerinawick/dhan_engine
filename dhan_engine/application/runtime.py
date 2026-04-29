@@ -51,6 +51,9 @@ class TradingRuntimeCoordinator:
     PREMATURE_EXIT_THRESHOLD_SEC = 20
 
     EXIT_REASON_PRIORITY = {
+        "TRI_WAVE_EMERGENCY_EXIT": 1,
+        "TRI_WAVE_FLIP_EXIT": 5,
+        "TRI_WAVE_EXIT": 6,
         "OPPOSITE_TURN_CONFIRMED": 10,
         "STRUCTURE_BREAKDOWN": 20,
         "TRAIL_HIT": 30,
@@ -135,6 +138,7 @@ class TradingRuntimeCoordinator:
 
     def run(self) -> None:
         logger.info("MODE: FUTURE_WS_STREAM + OPTION_WS_STREAM + OPTION_DEPTH_STREAM")
+        logger.info("TRI_WAVE_BRAIN_VERSION | production_dynamic_exit_v3 | owner_locked=True | legacy_exit_skip=True | weak_exit_removed=True | static_40s_disabled_for_triwave=True")
 
         self._configure_underlying_contracts()
         if self.future_quote_stream is None:
@@ -491,7 +495,20 @@ class TradingRuntimeCoordinator:
             }
         return None
 
-    def _register_momentum_trade_from_entry(self, secid: int, ltp: float, raw: Optional[dict] = None) -> None:
+    def _is_tri_wave_position(self, secid: int) -> bool:
+        position = self.paper_trader.positions.get(secid, {})
+        if position.get("strategy_owner") == "TRI_WAVE":
+            return True
+
+        active_trade = self.momentum_engine.active_trade.get(secid, {}) if hasattr(self.momentum_engine, "active_trade") else {}
+        if active_trade.get("strategy_owner") == "TRI_WAVE":
+            return True
+
+        reason = str(position.get("entry_reason") or position.get("reason") or "")
+        source = str(position.get("entry_reason_source") or "")
+        return reason.startswith("TRI_WAVE_") or source.startswith("TRI_WAVE")
+
+    def _register_momentum_trade_from_entry(self, secid: int, ltp: float, raw: Optional[dict] = None, tri_wave_metadata: Optional[dict] = None) -> None:
         raw = raw or {}
         trade = {
             "type": "TRI_WAVE",
@@ -507,6 +524,7 @@ class TradingRuntimeCoordinator:
             "profit_lock_armed": False,
             "entry_spread": float(raw.get("spread", 0) or 0),
         }
+        trade.update(dict(tri_wave_metadata or {}))
         if hasattr(self.momentum_engine, "register_trade"):
             self.momentum_engine.register_trade(secid, trade)
         else:
@@ -522,15 +540,23 @@ class TradingRuntimeCoordinator:
             pair.index, action, signal.side, signal.confidence, signal.reason
         )
 
+        tri_meta = {
+            "strategy_owner": "TRI_WAVE",
+            "entry_reason_source": "TRI_WAVE",
+            "tri_wave_action": action,
+            "tri_wave_confidence": signal.confidence,
+            "tri_wave_reason": signal.reason,
+        }
+
         if action == "BUY_CE":
             secid = pair.ce_id
             tag = f"{pair.index}_CE"
             ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
             if not secid:
                 return False
-            accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=f"TRI_WAVE_ENTRY:{signal.reason}")
+            accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=f"TRI_WAVE_ENTRY:{signal.reason}", metadata=tri_meta)
             if accepted:
-                self._register_momentum_trade_from_entry(secid, float(ltp), pair.ce_depth or raw)
+                self._register_momentum_trade_from_entry(secid, float(ltp), pair.ce_depth or raw, tri_wave_metadata=tri_meta)
                 logger.info("TRI_WAVE_ENTRY_COMMITTED | %s | ltp=%.2f | reason=%s", tag, float(ltp), signal.reason)
             return bool(accepted)
 
@@ -540,9 +566,9 @@ class TradingRuntimeCoordinator:
             ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
             if not secid:
                 return False
-            accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=f"TRI_WAVE_ENTRY:{signal.reason}")
+            accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=f"TRI_WAVE_ENTRY:{signal.reason}", metadata=tri_meta)
             if accepted:
-                self._register_momentum_trade_from_entry(secid, float(ltp), pair.pe_depth or raw)
+                self._register_momentum_trade_from_entry(secid, float(ltp), pair.pe_depth or raw, tri_wave_metadata=tri_meta)
                 logger.info("TRI_WAVE_ENTRY_COMMITTED | %s | ltp=%.2f | reason=%s", tag, float(ltp), signal.reason)
             return bool(accepted)
 
@@ -567,9 +593,9 @@ class TradingRuntimeCoordinator:
             if self.paper_trader.has_open_position() or not pair.ce_id:
                 return False
             new_ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
-            accepted = self.paper_trader.on_entry(pair.ce_id, f"{pair.index}_CE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}")
+            accepted = self.paper_trader.on_entry(pair.ce_id, f"{pair.index}_CE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}", metadata=tri_meta)
             if accepted:
-                self._register_momentum_trade_from_entry(pair.ce_id, float(new_ltp), pair.ce_depth or raw)
+                self._register_momentum_trade_from_entry(pair.ce_id, float(new_ltp), pair.ce_depth or raw, tri_wave_metadata=tri_meta)
             return bool(accepted)
 
         if action == "FLIP_TO_PE":
@@ -581,9 +607,9 @@ class TradingRuntimeCoordinator:
             if self.paper_trader.has_open_position() or not pair.pe_id:
                 return False
             new_ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
-            accepted = self.paper_trader.on_entry(pair.pe_id, f"{pair.index}_PE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}")
+            accepted = self.paper_trader.on_entry(pair.pe_id, f"{pair.index}_PE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}", metadata=tri_meta)
             if accepted:
-                self._register_momentum_trade_from_entry(pair.pe_id, float(new_ltp), pair.pe_depth or raw)
+                self._register_momentum_trade_from_entry(pair.pe_id, float(new_ltp), pair.pe_depth or raw, tri_wave_metadata=tri_meta)
             return bool(accepted)
 
         return False
@@ -733,6 +759,14 @@ class TradingRuntimeCoordinator:
         tick_bucket = int(time.time() * 10)
         self._tick_exit_guard[secid] = {"bucket": tick_bucket, "reason": None, "priority": None}
 
+        if self._is_tri_wave_position(secid):
+            logger.info(
+                "TRI_WAVE_OWNED_POSITION | secid=%s | tag=%s | legacy_exit_engines=SKIPPED",
+                secid,
+                tag,
+            )
+            return
+
         if action == "EXIT":
             decision = self.decision_engine.on_signal(
                 secid=secid,
@@ -805,7 +839,14 @@ class TradingRuntimeCoordinator:
             logger.info("GLOBAL_HOLD_CHECK | %.2f sec | pnl=%.2f%%", hold_sec, pnl_pct)
             logger.info("EXIT_GATE | tag=%s | reason=%s | hold=%.2f | pnl_pct=%.2f", tag, reason, hold_sec, pnl_pct)
 
-            if hold_sec < 40:
+            if self._is_tri_wave_position(opposite_secid):
+                logger.info(
+                    "TRI_WAVE_FORCE_EXIT_BYPASS_STATIC_HOLD | secid=%s | reason=%s | hold_sec=%.2f",
+                    opposite_secid,
+                    "OPPOSITE_TURN_CONFIRMED",
+                    hold_sec,
+                )
+            elif hold_sec < 40:
                 if pnl_pct < -8:
                     logger.info("EMERGENCY_EXIT_ALLOWED | pnl_pct=%.2f", pnl_pct)
                 else:
@@ -845,7 +886,14 @@ class TradingRuntimeCoordinator:
 
     def _attempt_exit_once(self, pair: PairRuntimeState, secid: int, tag: str, ltp: float, reason: str) -> bool:
         tick_bucket = int(time.time() * 10)
-        reason_priority = self.EXIT_REASON_PRIORITY.get(reason, 999)
+        if reason.startswith("TRI_WAVE_FLIP_EXIT"):
+            reason_priority = self.EXIT_REASON_PRIORITY.get("TRI_WAVE_FLIP_EXIT", 5)
+        elif reason.startswith("TRI_WAVE_EXIT"):
+            reason_priority = self.EXIT_REASON_PRIORITY.get("TRI_WAVE_EXIT", 6)
+        elif reason.startswith("TRI_WAVE_EMERGENCY_EXIT") or reason.startswith("TRI_WAVE_EXIT:EMERGENCY_LOSS"):
+            reason_priority = self.EXIT_REASON_PRIORITY.get("TRI_WAVE_EMERGENCY_EXIT", 1)
+        else:
+            reason_priority = self.EXIT_REASON_PRIORITY.get(reason, 999)
         guard = self._tick_exit_guard.get(secid)
         if not guard or guard.get("bucket") != tick_bucket:
             guard = {"bucket": tick_bucket, "reason": None, "priority": None}
@@ -948,7 +996,7 @@ class TradingRuntimeCoordinator:
             pnl_pct,
             count,
         )
-        if hold_sec < 40:
+        if hold_sec < 40 and not self._is_tri_wave_position(secid):
             logger.info(
                 "EXIT_BLOCKED_REASON | FLOW_HOLD_PROTECTION | hold_sec=%.2f",
                 hold_sec
@@ -990,7 +1038,14 @@ class TradingRuntimeCoordinator:
 
             logger.info("HOLD_TIME_CHECK | %.2f sec", hold_sec)
 
-            if hold_sec < 40:
+            if self._is_tri_wave_position(opposite_secid):
+                logger.info(
+                    "TRI_WAVE_FORCE_EXIT_BYPASS_STATIC_HOLD | secid=%s | reason=%s | hold_sec=%.2f",
+                    opposite_secid,
+                    "OPPOSITE_TURN_CONFIRMED",
+                    hold_sec,
+                )
+            elif hold_sec < 40:
                 logger.info(
                     "EXIT_BLOCKED_REASON | HOLD_PROTECTION_ACTIVE | hold_sec=%.2f",
                     hold_sec

@@ -41,9 +41,11 @@ class TriWaveTickBrain:
     EXIT_CONFIDENCE = 0.62
     FLIP_CONFIDENCE = 0.72
 
-    MIN_HOLD_BEFORE_NORMAL_EXIT_SEC = 25
-    MIN_HOLD_BEFORE_FLIP_SEC = 35
+    MIN_HOLD_BEFORE_NORMAL_EXIT_SEC = 60
+    MIN_HOLD_BEFORE_FLIP_SEC = 45
     EXIT_CONFIRM_TICKS = 3
+    FLIP_CONFIRM_TICKS = 2
+    EMERGENCY_CONFIRM_TICKS = 2
     ENTRY_COOLDOWN_SEC = 45
     REENTRY_SAME_SIDE_COOLDOWN_SEC = 60
     EMERGENCY_LOSS_PCT = -8.0
@@ -74,7 +76,7 @@ class TriWaveTickBrain:
         self.last_entry_side: Dict[str, str] = {}
         self.last_entry_ts: Dict[str, float] = {}
 
-    def _confirm_exit(self, index: str, side: str, condition: bool, reason: str, now_ts: float) -> bool:
+    def _confirm_exit(self, index: str, side: str, condition: bool, reason: str, now_ts: float, required_ticks: int) -> bool:
         slot = self.exit_confirm[index]
         if not condition:
             self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
@@ -86,8 +88,7 @@ class TriWaveTickBrain:
             slot["first_ts"] = now_ts
         else:
             slot["count"] += 1
-        if slot["count"] >= self.EXIT_CONFIRM_TICKS:
-            logger.info("TRI_WAVE_EXIT_CONFIRMED | index=%s | side=%s | reason=%s | count=%s", index, side, reason, slot["count"])
+        if slot["count"] >= required_ticks:
             return True
         return False
 
@@ -240,43 +241,85 @@ class TriWaveTickBrain:
 
         hold_sec = now_ts - float(active_position.get("entry_ts", now_ts))
         pnl_pct = float(active_position.get("pnl_pct", 0.0))
-        emergency = pnl_pct <= self.EMERGENCY_LOSS_PCT
         side = active_position.get("side")
         if side == "CE":
             ce_real_reversal = (fut_down or fut_turn_down) and ps["strength"] >= self.OPPOSITE_EXPAND_MIN_STRENGTH and cs["strength"] <= self.CURRENT_WEAKEN_MIN_STRENGTH
             ce_profit_protect = pnl_pct > 0.35 and cs["strength"] <= -0.10 and ps["strength"] >= 0.18
+            ce_flip_candidate = ce_real_reversal
             ce_emergency = pnl_pct <= self.EMERGENCY_LOSS_PCT
-            logger.info("TRI_WAVE_EXIT_WATCH | index=%s | side=CE | hold=%.2f | pnl_pct=%.2f | current_strength=%.2f | opposite_strength=%.2f | fut_strength=%.2f | confirm_count=%s", index, hold_sec, pnl_pct, cs["strength"], ps["strength"], fs["strength"], self.exit_confirm[index]["count"])
-            ce_exit_reason = "REAL_REVERSAL" if ce_real_reversal else "PROFIT_PROTECT" if ce_profit_protect else "NONE"
-            ce_confirmed = self._confirm_exit(index, "CE", ce_real_reversal or ce_profit_protect, ce_exit_reason, now_ts)
+            reason_candidate = "CE_REAL_REVERSAL_CONFIRMED" if ce_real_reversal else "CE_PROFIT_PROTECT_CONFIRMED" if ce_profit_protect else "EMERGENCY_LOSS" if ce_emergency else "NONE"
+            logger.info("TRI_WAVE_EXIT_WATCH | index=%s | active_side=CE | hold_sec=%.2f | pnl_pct=%.2f | ce_strength=%.2f | pe_strength=%.2f | fut_strength=%.2f | reason_candidate=%s | confirm_count=%s", index, hold_sec, pnl_pct, cs["strength"], ps["strength"], fs["strength"], reason_candidate, self.exit_confirm[index]["count"])
+
             if ce_emergency:
+                em_confirmed = self._confirm_exit(index, "CE", True, "EMERGENCY_LOSS", now_ts, self.EMERGENCY_CONFIRM_TICKS)
+                if not em_confirmed:
+                    logger.info("TRI_WAVE_EXIT_BLOCKED | reason=CONFIRMATION_NOT_MET | count=%s | required=%s", self.exit_confirm[index]["count"], self.EMERGENCY_CONFIRM_TICKS)
+                    return self._signal(index, "NO_TRADE", None, 0.0, "EMERGENCY_CONFIRM_PENDING", state)
+                logger.info("TRI_WAVE_EXIT_CONFIRMED | action=EXIT_CE | reason=TRI_WAVE_EXIT:EMERGENCY_LOSS | hold_sec=%.2f | pnl_pct=%.2f | confirm_count=%s", hold_sec, pnl_pct, self.exit_confirm[index]["count"])
                 return self._signal(index, "EXIT_CE", "CE", 0.65 + conf_adj, "EMERGENCY_LOSS", state)
-            if hold_sec >= self.MIN_HOLD_BEFORE_FLIP_SEC and ce_real_reversal and ce_confirmed:
-                conf = 0.74 + conf_adj
-                if conf >= self.FLIP_CONFIDENCE:
-                    return self._signal(index, "FLIP_TO_PE", "PE", conf, "FUT_TURN_DOWN+PE_EXPAND+CE_WEAKEN", state)
-            if hold_sec >= self.MIN_HOLD_BEFORE_NORMAL_EXIT_SEC and ce_confirmed:
+
+            ce_exit_reason = "REAL_REVERSAL" if ce_real_reversal else "PROFIT_PROTECT" if ce_profit_protect else "NONE"
+            ce_confirmed = self._confirm_exit(index, "CE", ce_real_reversal or ce_profit_protect, ce_exit_reason, now_ts, self.EXIT_CONFIRM_TICKS)
+            if not ce_confirmed and (ce_real_reversal or ce_profit_protect):
+                logger.info("TRI_WAVE_EXIT_BLOCKED | reason=CONFIRMATION_NOT_MET | count=%s | required=%s", self.exit_confirm[index]["count"], self.EXIT_CONFIRM_TICKS)
+            if hold_sec < self.MIN_HOLD_BEFORE_FLIP_SEC and ce_flip_candidate:
+                logger.info("TRI_WAVE_EXIT_BLOCKED | reason=MIN_HOLD_NOT_MET | hold_sec=%.2f | required=%.2f", hold_sec, self.MIN_HOLD_BEFORE_FLIP_SEC)
+            elif ce_flip_candidate:
+                flip_confirmed = self._confirm_exit(index, "CE", ce_flip_candidate, "FLIP_TO_PE", now_ts, self.FLIP_CONFIRM_TICKS)
+                if flip_confirmed:
+                    conf = 0.74 + conf_adj
+                    if conf >= self.FLIP_CONFIDENCE:
+                        logger.info("TRI_WAVE_EXIT_CONFIRMED | action=FLIP_TO_PE | reason=TRI_WAVE_FLIP_EXIT:FUT_TURN_DOWN+PE_EXPAND+CE_WEAKEN | hold_sec=%.2f | pnl_pct=%.2f | confirm_count=%s", hold_sec, pnl_pct, self.exit_confirm[index]["count"])
+                        return self._signal(index, "FLIP_TO_PE", "PE", conf, "FUT_TURN_DOWN+PE_EXPAND+CE_WEAKEN", state)
+                else:
+                    logger.info("TRI_WAVE_EXIT_BLOCKED | reason=CONFIRMATION_NOT_MET | count=%s | required=%s", self.exit_confirm[index]["count"], self.FLIP_CONFIRM_TICKS)
+
+            if hold_sec < self.MIN_HOLD_BEFORE_NORMAL_EXIT_SEC and (ce_real_reversal or ce_profit_protect):
+                logger.info("TRI_WAVE_EXIT_BLOCKED | reason=MIN_HOLD_NOT_MET | hold_sec=%.2f | required=%.2f", hold_sec, self.MIN_HOLD_BEFORE_NORMAL_EXIT_SEC)
+            elif ce_confirmed:
                 conf = 0.65 + conf_adj
                 if conf >= self.EXIT_CONFIDENCE:
                     reason = "CE_REAL_REVERSAL_CONFIRMED" if ce_exit_reason == "REAL_REVERSAL" else "CE_PROFIT_PROTECT_CONFIRMED"
+                    logger.info("TRI_WAVE_EXIT_CONFIRMED | action=EXIT_CE | reason=TRI_WAVE_EXIT:%s | hold_sec=%.2f | pnl_pct=%.2f | confirm_count=%s", reason, hold_sec, pnl_pct, self.exit_confirm[index]["count"])
                     return self._signal(index, "EXIT_CE", "CE", conf, reason, state)
         if side == "PE":
             pe_real_reversal = (fut_up or fut_turn_up) and cs["strength"] >= self.OPPOSITE_EXPAND_MIN_STRENGTH and ps["strength"] <= self.CURRENT_WEAKEN_MIN_STRENGTH
             pe_profit_protect = pnl_pct > 0.35 and ps["strength"] <= -0.10 and cs["strength"] >= 0.18
+            pe_flip_candidate = pe_real_reversal
             pe_emergency = pnl_pct <= self.EMERGENCY_LOSS_PCT
-            logger.info("TRI_WAVE_EXIT_WATCH | index=%s | side=PE | hold=%.2f | pnl_pct=%.2f | current_strength=%.2f | opposite_strength=%.2f | fut_strength=%.2f | confirm_count=%s", index, hold_sec, pnl_pct, ps["strength"], cs["strength"], fs["strength"], self.exit_confirm[index]["count"])
-            pe_exit_reason = "REAL_REVERSAL" if pe_real_reversal else "PROFIT_PROTECT" if pe_profit_protect else "NONE"
-            pe_confirmed = self._confirm_exit(index, "PE", pe_real_reversal or pe_profit_protect, pe_exit_reason, now_ts)
+            reason_candidate = "PE_REAL_REVERSAL_CONFIRMED" if pe_real_reversal else "PE_PROFIT_PROTECT_CONFIRMED" if pe_profit_protect else "EMERGENCY_LOSS" if pe_emergency else "NONE"
+            logger.info("TRI_WAVE_EXIT_WATCH | index=%s | active_side=PE | hold_sec=%.2f | pnl_pct=%.2f | ce_strength=%.2f | pe_strength=%.2f | fut_strength=%.2f | reason_candidate=%s | confirm_count=%s", index, hold_sec, pnl_pct, cs["strength"], ps["strength"], fs["strength"], reason_candidate, self.exit_confirm[index]["count"])
             if pe_emergency:
+                em_confirmed = self._confirm_exit(index, "PE", True, "EMERGENCY_LOSS", now_ts, self.EMERGENCY_CONFIRM_TICKS)
+                if not em_confirmed:
+                    logger.info("TRI_WAVE_EXIT_BLOCKED | reason=CONFIRMATION_NOT_MET | count=%s | required=%s", self.exit_confirm[index]["count"], self.EMERGENCY_CONFIRM_TICKS)
+                    return self._signal(index, "NO_TRADE", None, 0.0, "EMERGENCY_CONFIRM_PENDING", state)
+                logger.info("TRI_WAVE_EXIT_CONFIRMED | action=EXIT_PE | reason=TRI_WAVE_EXIT:EMERGENCY_LOSS | hold_sec=%.2f | pnl_pct=%.2f | confirm_count=%s", hold_sec, pnl_pct, self.exit_confirm[index]["count"])
                 return self._signal(index, "EXIT_PE", "PE", 0.65 + conf_adj, "EMERGENCY_LOSS", state)
-            if hold_sec >= self.MIN_HOLD_BEFORE_FLIP_SEC and pe_real_reversal and pe_confirmed:
-                conf = 0.74 + conf_adj
-                if conf >= self.FLIP_CONFIDENCE:
-                    return self._signal(index, "FLIP_TO_CE", "CE", conf, "FUT_TURN_UP+CE_EXPAND+PE_WEAKEN", state)
-            if hold_sec >= self.MIN_HOLD_BEFORE_NORMAL_EXIT_SEC and pe_confirmed:
+
+            pe_exit_reason = "REAL_REVERSAL" if pe_real_reversal else "PROFIT_PROTECT" if pe_profit_protect else "NONE"
+            pe_confirmed = self._confirm_exit(index, "PE", pe_real_reversal or pe_profit_protect, pe_exit_reason, now_ts, self.EXIT_CONFIRM_TICKS)
+            if not pe_confirmed and (pe_real_reversal or pe_profit_protect):
+                logger.info("TRI_WAVE_EXIT_BLOCKED | reason=CONFIRMATION_NOT_MET | count=%s | required=%s", self.exit_confirm[index]["count"], self.EXIT_CONFIRM_TICKS)
+            if hold_sec < self.MIN_HOLD_BEFORE_FLIP_SEC and pe_flip_candidate:
+                logger.info("TRI_WAVE_EXIT_BLOCKED | reason=MIN_HOLD_NOT_MET | hold_sec=%.2f | required=%.2f", hold_sec, self.MIN_HOLD_BEFORE_FLIP_SEC)
+            elif pe_flip_candidate:
+                flip_confirmed = self._confirm_exit(index, "PE", pe_flip_candidate, "FLIP_TO_CE", now_ts, self.FLIP_CONFIRM_TICKS)
+                if flip_confirmed:
+                    conf = 0.74 + conf_adj
+                    if conf >= self.FLIP_CONFIDENCE:
+                        logger.info("TRI_WAVE_EXIT_CONFIRMED | action=FLIP_TO_CE | reason=TRI_WAVE_FLIP_EXIT:FUT_TURN_UP+CE_EXPAND+PE_WEAKEN | hold_sec=%.2f | pnl_pct=%.2f | confirm_count=%s", hold_sec, pnl_pct, self.exit_confirm[index]["count"])
+                        return self._signal(index, "FLIP_TO_CE", "CE", conf, "FUT_TURN_UP+CE_EXPAND+PE_WEAKEN", state)
+                else:
+                    logger.info("TRI_WAVE_EXIT_BLOCKED | reason=CONFIRMATION_NOT_MET | count=%s | required=%s", self.exit_confirm[index]["count"], self.FLIP_CONFIRM_TICKS)
+
+            if hold_sec < self.MIN_HOLD_BEFORE_NORMAL_EXIT_SEC and (pe_real_reversal or pe_profit_protect):
+                logger.info("TRI_WAVE_EXIT_BLOCKED | reason=MIN_HOLD_NOT_MET | hold_sec=%.2f | required=%.2f", hold_sec, self.MIN_HOLD_BEFORE_NORMAL_EXIT_SEC)
+            elif pe_confirmed:
                 conf = 0.65 + conf_adj
                 if conf >= self.EXIT_CONFIDENCE:
                     reason = "PE_REAL_REVERSAL_CONFIRMED" if pe_exit_reason == "REAL_REVERSAL" else "PE_PROFIT_PROTECT_CONFIRMED"
+                    logger.info("TRI_WAVE_EXIT_CONFIRMED | action=EXIT_PE | reason=TRI_WAVE_EXIT:%s | hold_sec=%.2f | pnl_pct=%.2f | confirm_count=%s", reason, hold_sec, pnl_pct, self.exit_confirm[index]["count"])
                     return self._signal(index, "EXIT_PE", "PE", conf, reason, state)
 
         if self.last_signal.get(index) in {"BUY_CE", "BUY_PE"} and active_position:
