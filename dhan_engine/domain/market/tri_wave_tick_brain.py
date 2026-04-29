@@ -41,13 +41,18 @@ class TriWaveTickBrain:
     EXIT_CONFIDENCE = 0.62
     FLIP_CONFIDENCE = 0.72
 
-    MIN_HOLD_BEFORE_NORMAL_EXIT_SEC = 40
+    MIN_HOLD_BEFORE_NORMAL_EXIT_SEC = 25
+    MIN_HOLD_BEFORE_FLIP_SEC = 35
+    EXIT_CONFIRM_TICKS = 3
+    ENTRY_COOLDOWN_SEC = 45
+    REENTRY_SAME_SIDE_COOLDOWN_SEC = 60
     EMERGENCY_LOSS_PCT = -8.0
 
     FUT_MIN_STRENGTH = 0.18
     OPTION_EXPAND_MIN_STRENGTH = 0.20
     OPTION_WEAKEN_MIN_STRENGTH = -0.12
-    OPPOSITE_EXPAND_MIN_STRENGTH = 0.16
+    OPPOSITE_EXPAND_MIN_STRENGTH = 0.28
+    CURRENT_WEAKEN_MIN_STRENGTH = -0.22
 
     SPREAD_MAX_PCT = 0.025
     SPOOF_RISK_BLOCK = 0.72
@@ -65,6 +70,26 @@ class TriWaveTickBrain:
         self.last_signal: Dict[str, str] = {}
         self.latest_state: Dict[str, dict] = {}
         self._last_state_log_ts: Dict[str, float] = {}
+        self.exit_confirm = defaultdict(lambda: {"side": None, "count": 0, "first_ts": 0.0, "reason": None})
+        self.last_entry_side: Dict[str, str] = {}
+        self.last_entry_ts: Dict[str, float] = {}
+
+    def _confirm_exit(self, index: str, side: str, condition: bool, reason: str, now_ts: float) -> bool:
+        slot = self.exit_confirm[index]
+        if not condition:
+            self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
+            return False
+        if slot["side"] != side or slot["reason"] != reason:
+            slot["side"] = side
+            slot["reason"] = reason
+            slot["count"] = 1
+            slot["first_ts"] = now_ts
+        else:
+            slot["count"] += 1
+        if slot["count"] >= self.EXIT_CONFIRM_TICKS:
+            logger.info("TRI_WAVE_EXIT_CONFIRMED | index=%s | side=%s | reason=%s | count=%s", index, side, reason, slot["count"])
+            return True
+        return False
 
     def on_future_tick(self, index: str, secid: int, ltp: float, quote: Optional[dict] = None) -> None:
         if not ltp or ltp <= 0:
@@ -188,11 +213,27 @@ class TriWaveTickBrain:
                 conf = 0.70 + conf_adj + (0.03 if cs.get("bull_turn_score", 0) and cs.get("bull_turn_score", 0) > 0 else 0)
                 reasons = ["FUT_TURN_UP" if fut_turn_up else "FUT_TREND_UP", "CE_EXPAND", "PE_WEAKEN"]
                 if conf >= self.ENTRY_CONFIDENCE:
+                    if (now_ts - self.last_signal_ts.get(index, 0.0)) < self.ENTRY_COOLDOWN_SEC:
+                        logger.info("TRI_WAVE_ENTRY_COOLDOWN | index=%s | side=CE | remaining=%.2f", index, self.ENTRY_COOLDOWN_SEC - (now_ts - self.last_signal_ts.get(index, 0.0)))
+                        return self._signal(index, "NO_TRADE", None, 0.0, "ENTRY_COOLDOWN", state)
+                    if self.last_entry_side.get(index) == "CE" and (now_ts - self.last_entry_ts.get(index, 0.0)) < self.REENTRY_SAME_SIDE_COOLDOWN_SEC:
+                        logger.info("TRI_WAVE_REENTRY_BLOCK | index=%s | side=CE | remaining=%.2f", index, self.REENTRY_SAME_SIDE_COOLDOWN_SEC - (now_ts - self.last_entry_ts.get(index, 0.0)))
+                        return self._signal(index, "NO_TRADE", None, 0.0, "REENTRY_SAME_SIDE_COOLDOWN", state)
+                    self.last_entry_side[index] = "CE"
+                    self.last_entry_ts[index] = now_ts
                     return self._signal(index, "BUY_CE", "CE", conf, "+".join(reasons + reason_parts), state)
             if (fut_down or fut_turn_down) and pe_expand and ce_weaken:
                 conf = 0.70 + conf_adj + (0.03 if ps.get("bull_turn_score", 0) and ps.get("bull_turn_score", 0) > 0 else 0)
                 reasons = ["FUT_TURN_DOWN" if fut_turn_down else "FUT_TREND_DOWN", "PE_EXPAND", "CE_WEAKEN"]
                 if conf >= self.ENTRY_CONFIDENCE:
+                    if (now_ts - self.last_signal_ts.get(index, 0.0)) < self.ENTRY_COOLDOWN_SEC:
+                        logger.info("TRI_WAVE_ENTRY_COOLDOWN | index=%s | side=PE | remaining=%.2f", index, self.ENTRY_COOLDOWN_SEC - (now_ts - self.last_signal_ts.get(index, 0.0)))
+                        return self._signal(index, "NO_TRADE", None, 0.0, "ENTRY_COOLDOWN", state)
+                    if self.last_entry_side.get(index) == "PE" and (now_ts - self.last_entry_ts.get(index, 0.0)) < self.REENTRY_SAME_SIDE_COOLDOWN_SEC:
+                        logger.info("TRI_WAVE_REENTRY_BLOCK | index=%s | side=PE | remaining=%.2f", index, self.REENTRY_SAME_SIDE_COOLDOWN_SEC - (now_ts - self.last_entry_ts.get(index, 0.0)))
+                        return self._signal(index, "NO_TRADE", None, 0.0, "REENTRY_SAME_SIDE_COOLDOWN", state)
+                    self.last_entry_side[index] = "PE"
+                    self.last_entry_ts[index] = now_ts
                     return self._signal(index, "BUY_PE", "PE", conf, "+".join(reasons + reason_parts), state)
             logger.info("TRI_WAVE_REJECT | index=%s | reason=LOW_CONFIDENCE", index)
             return self._signal(index, "NO_TRADE", None, 0.0, "LOW_CONFIDENCE", state)
@@ -202,33 +243,41 @@ class TriWaveTickBrain:
         emergency = pnl_pct <= self.EMERGENCY_LOSS_PCT
         side = active_position.get("side")
         if side == "CE":
-            flip = (fut_down or fut_turn_down) and pe_expand and (ce_weaken or cs["strength"] < 0)
-            exit_hit = ce_weaken or fut_down or fut_turn_down or ps["strength"] >= self.OPPOSITE_EXPAND_MIN_STRENGTH
-            if (exit_hit or flip) and not emergency and hold_sec < self.MIN_HOLD_BEFORE_NORMAL_EXIT_SEC:
-                logger.info("TRI_WAVE_REJECT | index=%s | reason=EXIT_HOLD_PROTECTION", index)
-                return self._signal(index, "NO_TRADE", None, 0.0, "EXIT_HOLD_PROTECTION", state)
-            if flip:
+            ce_real_reversal = (fut_down or fut_turn_down) and ps["strength"] >= self.OPPOSITE_EXPAND_MIN_STRENGTH and cs["strength"] <= self.CURRENT_WEAKEN_MIN_STRENGTH
+            ce_profit_protect = pnl_pct > 0.35 and cs["strength"] <= -0.10 and ps["strength"] >= 0.18
+            ce_emergency = pnl_pct <= self.EMERGENCY_LOSS_PCT
+            logger.info("TRI_WAVE_EXIT_WATCH | index=%s | side=CE | hold=%.2f | pnl_pct=%.2f | current_strength=%.2f | opposite_strength=%.2f | fut_strength=%.2f | confirm_count=%s", index, hold_sec, pnl_pct, cs["strength"], ps["strength"], fs["strength"], self.exit_confirm[index]["count"])
+            ce_exit_reason = "REAL_REVERSAL" if ce_real_reversal else "PROFIT_PROTECT" if ce_profit_protect else "NONE"
+            ce_confirmed = self._confirm_exit(index, "CE", ce_real_reversal or ce_profit_protect, ce_exit_reason, now_ts)
+            if ce_emergency:
+                return self._signal(index, "EXIT_CE", "CE", 0.65 + conf_adj, "EMERGENCY_LOSS", state)
+            if hold_sec >= self.MIN_HOLD_BEFORE_FLIP_SEC and ce_real_reversal and ce_confirmed:
                 conf = 0.74 + conf_adj
                 if conf >= self.FLIP_CONFIDENCE:
                     return self._signal(index, "FLIP_TO_PE", "PE", conf, "FUT_TURN_DOWN+PE_EXPAND+CE_WEAKEN", state)
-            if exit_hit:
+            if hold_sec >= self.MIN_HOLD_BEFORE_NORMAL_EXIT_SEC and ce_confirmed:
                 conf = 0.65 + conf_adj
                 if conf >= self.EXIT_CONFIDENCE:
-                    return self._signal(index, "EXIT_CE", "CE", conf, "CE_WEAKEN+OPPOSITE_PREMIUM_EXPAND", state)
+                    reason = "CE_REAL_REVERSAL_CONFIRMED" if ce_exit_reason == "REAL_REVERSAL" else "CE_PROFIT_PROTECT_CONFIRMED"
+                    return self._signal(index, "EXIT_CE", "CE", conf, reason, state)
         if side == "PE":
-            flip = (fut_up or fut_turn_up) and ce_expand and (pe_weaken or ps["strength"] < 0)
-            exit_hit = pe_weaken or fut_up or fut_turn_up or cs["strength"] >= self.OPPOSITE_EXPAND_MIN_STRENGTH
-            if (exit_hit or flip) and not emergency and hold_sec < self.MIN_HOLD_BEFORE_NORMAL_EXIT_SEC:
-                logger.info("TRI_WAVE_REJECT | index=%s | reason=EXIT_HOLD_PROTECTION", index)
-                return self._signal(index, "NO_TRADE", None, 0.0, "EXIT_HOLD_PROTECTION", state)
-            if flip:
+            pe_real_reversal = (fut_up or fut_turn_up) and cs["strength"] >= self.OPPOSITE_EXPAND_MIN_STRENGTH and ps["strength"] <= self.CURRENT_WEAKEN_MIN_STRENGTH
+            pe_profit_protect = pnl_pct > 0.35 and ps["strength"] <= -0.10 and cs["strength"] >= 0.18
+            pe_emergency = pnl_pct <= self.EMERGENCY_LOSS_PCT
+            logger.info("TRI_WAVE_EXIT_WATCH | index=%s | side=PE | hold=%.2f | pnl_pct=%.2f | current_strength=%.2f | opposite_strength=%.2f | fut_strength=%.2f | confirm_count=%s", index, hold_sec, pnl_pct, ps["strength"], cs["strength"], fs["strength"], self.exit_confirm[index]["count"])
+            pe_exit_reason = "REAL_REVERSAL" if pe_real_reversal else "PROFIT_PROTECT" if pe_profit_protect else "NONE"
+            pe_confirmed = self._confirm_exit(index, "PE", pe_real_reversal or pe_profit_protect, pe_exit_reason, now_ts)
+            if pe_emergency:
+                return self._signal(index, "EXIT_PE", "PE", 0.65 + conf_adj, "EMERGENCY_LOSS", state)
+            if hold_sec >= self.MIN_HOLD_BEFORE_FLIP_SEC and pe_real_reversal and pe_confirmed:
                 conf = 0.74 + conf_adj
                 if conf >= self.FLIP_CONFIDENCE:
                     return self._signal(index, "FLIP_TO_CE", "CE", conf, "FUT_TURN_UP+CE_EXPAND+PE_WEAKEN", state)
-            if exit_hit:
+            if hold_sec >= self.MIN_HOLD_BEFORE_NORMAL_EXIT_SEC and pe_confirmed:
                 conf = 0.65 + conf_adj
                 if conf >= self.EXIT_CONFIDENCE:
-                    return self._signal(index, "EXIT_PE", "PE", conf, "PE_WEAKEN+OPPOSITE_PREMIUM_EXPAND", state)
+                    reason = "PE_REAL_REVERSAL_CONFIRMED" if pe_exit_reason == "REAL_REVERSAL" else "PE_PROFIT_PROTECT_CONFIRMED"
+                    return self._signal(index, "EXIT_PE", "PE", conf, reason, state)
 
         if self.last_signal.get(index) in {"BUY_CE", "BUY_PE"} and active_position:
             pass
