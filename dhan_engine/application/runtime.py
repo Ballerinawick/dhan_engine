@@ -14,6 +14,7 @@ from dhan_engine.config.settings import RuntimeSettings
 from dhan_engine.domain.features.depth_micro_features import DepthMicroFeatureBuilder
 from dhan_engine.domain.market.market_state_engine import MarketStateEngine
 from dhan_engine.domain.market.turn_detection_engine import TurnDetectionEngine
+from dhan_engine.domain.market.tri_wave_tick_brain import TriWaveTickBrain
 from dhan_engine.domain.state import PairRuntimeState
 from dhan_engine.domain.strategy.institutional_decision_engine import InstitutionalDecisionEngine
 from dhan_engine.domain.strategy.institutional_trailing_exit_engine import InstitutionalTrailingExitEngine
@@ -123,6 +124,8 @@ class TradingRuntimeCoordinator:
         }
         self.flow_reversal_state: Dict[int, dict] = {}
         self._tick_exit_guard: Dict[int, dict] = {}
+        self.tri_wave_brain = TriWaveTickBrain(debug=True)
+
         self.metrics = {
             "exit_reason_counts": defaultdict(int),
             "hold_time_buckets": defaultdict(int),
@@ -317,6 +320,12 @@ class TradingRuntimeCoordinator:
                     "ask_qty": list(getattr(depth, "ask_qty", []) or []),
                 }
             )
+            self.tri_wave_brain.on_future_tick(
+                index=index,
+                secid=int(secid),
+                ltp=float(ltp),
+                quote=self.pairs[index].underlying_quote,
+            )
             if self._all_underlyings_ready():
                 self._future_ready.set()
             self._reselect_option_pair_if_needed(index)
@@ -457,6 +466,128 @@ class TradingRuntimeCoordinator:
             pair.update_option_depth(secid, raw)
             self._process_option_update(index, pair, secid, tag, raw)
 
+    def _get_active_position_for_pair(self, pair: PairRuntimeState) -> Optional[dict]:
+        if pair.ce_id and pair.ce_id in self.paper_trader.positions:
+            p = self.paper_trader.positions[pair.ce_id]
+            return {
+                "side": "CE",
+                "secid": pair.ce_id,
+                "tag": f"{pair.index}_CE",
+                "entry": float(p.get("entry", 0) or 0),
+                "entry_ts": float(p.get("entry_ts", time.time())),
+                "ltp": float(p.get("ltp", p.get("entry", 0)) or 0),
+                "pnl_pct": ((float(p.get("ltp", p.get("entry", 0)) or 0) - float(p.get("entry", 0) or 0)) / max(float(p.get("entry", 0) or 0), 1e-9)) * 100.0,
+            }
+        if pair.pe_id and pair.pe_id in self.paper_trader.positions:
+            p = self.paper_trader.positions[pair.pe_id]
+            return {
+                "side": "PE",
+                "secid": pair.pe_id,
+                "tag": f"{pair.index}_PE",
+                "entry": float(p.get("entry", 0) or 0),
+                "entry_ts": float(p.get("entry_ts", time.time())),
+                "ltp": float(p.get("ltp", p.get("entry", 0)) or 0),
+                "pnl_pct": ((float(p.get("ltp", p.get("entry", 0)) or 0) - float(p.get("entry", 0) or 0)) / max(float(p.get("entry", 0) or 0), 1e-9)) * 100.0,
+            }
+        return None
+
+    def _register_momentum_trade_from_entry(self, secid: int, ltp: float, raw: Optional[dict] = None) -> None:
+        raw = raw or {}
+        trade = {
+            "type": "TRI_WAVE",
+            "side": "LONG",
+            "entry": float(ltp),
+            "ts": time.time(),
+            "best_price": float(ltp),
+            "worst_price": float(ltp),
+            "mfe": 0.0,
+            "mae": 0.0,
+            "locked_price": None,
+            "breakeven_armed": False,
+            "profit_lock_armed": False,
+            "entry_spread": float(raw.get("spread", 0) or 0),
+        }
+        if hasattr(self.momentum_engine, "register_trade"):
+            self.momentum_engine.register_trade(secid, trade)
+        else:
+            self.momentum_engine.active_trade[secid] = trade
+
+    def _execute_tri_wave_signal(self, pair: PairRuntimeState, signal, raw: dict) -> bool:
+        action = signal.action
+        if action == "NO_TRADE":
+            return False
+
+        logger.info(
+            "TRI_WAVE_ROUTE | index=%s | action=%s | side=%s | conf=%.2f | reason=%s",
+            pair.index, action, signal.side, signal.confidence, signal.reason
+        )
+
+        if action == "BUY_CE":
+            secid = pair.ce_id
+            tag = f"{pair.index}_CE"
+            ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
+            if not secid:
+                return False
+            accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=f"TRI_WAVE_ENTRY:{signal.reason}")
+            if accepted:
+                self._register_momentum_trade_from_entry(secid, float(ltp), pair.ce_depth or raw)
+                logger.info("TRI_WAVE_ENTRY_COMMITTED | %s | ltp=%.2f | reason=%s", tag, float(ltp), signal.reason)
+            return bool(accepted)
+
+        if action == "BUY_PE":
+            secid = pair.pe_id
+            tag = f"{pair.index}_PE"
+            ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
+            if not secid:
+                return False
+            accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=f"TRI_WAVE_ENTRY:{signal.reason}")
+            if accepted:
+                self._register_momentum_trade_from_entry(secid, float(ltp), pair.pe_depth or raw)
+                logger.info("TRI_WAVE_ENTRY_COMMITTED | %s | ltp=%.2f | reason=%s", tag, float(ltp), signal.reason)
+            return bool(accepted)
+
+        if action == "EXIT_CE":
+            secid = pair.ce_id
+            tag = f"{pair.index}_CE"
+            ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
+            return bool(secid and self._attempt_exit_once(pair, secid, tag, float(ltp), f"TRI_WAVE_EXIT:{signal.reason}"))
+
+        if action == "EXIT_PE":
+            secid = pair.pe_id
+            tag = f"{pair.index}_PE"
+            ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
+            return bool(secid and self._attempt_exit_once(pair, secid, tag, float(ltp), f"TRI_WAVE_EXIT:{signal.reason}"))
+
+        if action == "FLIP_TO_CE":
+            old_secid = pair.pe_id
+            old_tag = f"{pair.index}_PE"
+            old_ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
+            if old_secid and old_secid in self.paper_trader.positions and not self._attempt_exit_once(pair, old_secid, old_tag, float(old_ltp), f"TRI_WAVE_FLIP_EXIT:{signal.reason}"):
+                return False
+            if self.paper_trader.has_open_position() or not pair.ce_id:
+                return False
+            new_ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
+            accepted = self.paper_trader.on_entry(pair.ce_id, f"{pair.index}_CE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}")
+            if accepted:
+                self._register_momentum_trade_from_entry(pair.ce_id, float(new_ltp), pair.ce_depth or raw)
+            return bool(accepted)
+
+        if action == "FLIP_TO_PE":
+            old_secid = pair.ce_id
+            old_tag = f"{pair.index}_CE"
+            old_ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
+            if old_secid and old_secid in self.paper_trader.positions and not self._attempt_exit_once(pair, old_secid, old_tag, float(old_ltp), f"TRI_WAVE_FLIP_EXIT:{signal.reason}"):
+                return False
+            if self.paper_trader.has_open_position() or not pair.pe_id:
+                return False
+            new_ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
+            accepted = self.paper_trader.on_entry(pair.pe_id, f"{pair.index}_PE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}")
+            if accepted:
+                self._register_momentum_trade_from_entry(pair.pe_id, float(new_ltp), pair.pe_depth or raw)
+            return bool(accepted)
+
+        return False
+
     def _process_option_update(self, index: str, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
         if not self.market_open():
             return
@@ -489,7 +620,27 @@ class TradingRuntimeCoordinator:
             pair.ready_logged = True
             logger.info("PAIR_STATE_READY | %s | CE+PE+UNDERLYING LIVE", index)
 
+        if side:
+            self.tri_wave_brain.on_option_tick(
+                index=index,
+                side=side,
+                secid=int(secid),
+                ltp=float(raw["ltp"]),
+                features=raw,
+            )
+
         if pair.is_ready():
+            active_position = self._get_active_position_for_pair(pair)
+            tri_signal = self.tri_wave_brain.evaluate(pair.index, active_position=active_position)
+            if tri_signal and tri_signal.action != "NO_TRADE":
+                executed = self._execute_tri_wave_signal(pair, tri_signal, raw)
+                if executed:
+                    logger.info(
+                        "TRI_WAVE_EXECUTED | index=%s | action=%s | reason=%s",
+                        pair.index, tri_signal.action, tri_signal.reason
+                    )
+                    self._process_exit_engines(pair, secid, tag, raw)
+                    return
             self._update_market_snapshot(pair, raw, secid, tag)
 
         self._process_exit_engines(pair, secid, tag, raw)
@@ -523,6 +674,23 @@ class TradingRuntimeCoordinator:
         if not turn_signal:
             print("TURN_SIGNAL_NONE →", pair.index)
             return
+
+        latest_tri = self.tri_wave_brain.get_latest_state(pair.index) if hasattr(self, "tri_wave_brain") else {}
+        if latest_tri.get("sync_ready") is True:
+            old_signal = str(turn_signal.get("signal", ""))
+            tri_bias = latest_tri.get("bias")
+            if old_signal == "BULLISH_CONTINUATION" and tri_bias != "CE":
+                logger.info(
+                    "OLD_SIGNAL_BLOCKED_BY_TRIWAVE | index=%s | signal=%s | tri_bias=%s | tri_reason=%s",
+                    pair.index, old_signal, tri_bias, latest_tri.get("reason")
+                )
+                return
+            if old_signal == "BEARISH_CONTINUATION" and tri_bias != "PE":
+                logger.info(
+                    "OLD_SIGNAL_BLOCKED_BY_TRIWAVE | index=%s | signal=%s | tri_bias=%s | tri_reason=%s",
+                    pair.index, old_signal, tri_bias, latest_tri.get("reason")
+                )
+                return
 
         pair.last_turn_signal = turn_signal
         route_secid, route_tag, route_ltp = pair.route_for_signal(turn_signal.get("signal"), tag, raw["ltp"])
@@ -635,6 +803,7 @@ class TradingRuntimeCoordinator:
             pnl_pct = ((ltp - entry) / entry) * 100 if entry > 0 else 0
 
             logger.info("GLOBAL_HOLD_CHECK | %.2f sec | pnl=%.2f%%", hold_sec, pnl_pct)
+            logger.info("EXIT_GATE | tag=%s | reason=%s | hold=%.2f | pnl_pct=%.2f", tag, reason, hold_sec, pnl_pct)
 
             if hold_sec < 40:
                 if pnl_pct < -8:
