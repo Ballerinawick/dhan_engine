@@ -49,6 +49,7 @@ class TradingRuntimeCoordinator:
     FLOW_REVERSAL_CONFIRM_MIN_INTERVAL_SEC = 1.0
     FLOW_REVERSAL_DECISION_COOLDOWN_SEC = 1.0
     PREMATURE_EXIT_THRESHOLD_SEC = 20
+    TRI_WAVE_ONLY_MODE = True
 
     EXIT_REASON_PRIORITY = {
         "TRI_WAVE_EMERGENCY_EXIT": 1,
@@ -557,6 +558,9 @@ class TradingRuntimeCoordinator:
             accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=f"TRI_WAVE_ENTRY:{signal.reason}", metadata=tri_meta)
             if accepted:
                 self._register_momentum_trade_from_entry(secid, float(ltp), pair.ce_depth or raw, tri_wave_metadata=tri_meta)
+                if hasattr(self.tri_wave_brain, "reset_trade_state"):
+                    self.tri_wave_brain.reset_trade_state(pair.index, "CE", float(ltp))
+                    logger.info("TRI_WAVE_TRADE_STATE_RESET | index=%s | side=%s | entry=%.2f", pair.index, "CE", float(ltp))
                 logger.info("TRI_WAVE_ENTRY_COMMITTED | %s | ltp=%.2f | reason=%s", tag, float(ltp), signal.reason)
             return bool(accepted)
 
@@ -569,6 +573,9 @@ class TradingRuntimeCoordinator:
             accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=f"TRI_WAVE_ENTRY:{signal.reason}", metadata=tri_meta)
             if accepted:
                 self._register_momentum_trade_from_entry(secid, float(ltp), pair.pe_depth or raw, tri_wave_metadata=tri_meta)
+                if hasattr(self.tri_wave_brain, "reset_trade_state"):
+                    self.tri_wave_brain.reset_trade_state(pair.index, "PE", float(ltp))
+                    logger.info("TRI_WAVE_TRADE_STATE_RESET | index=%s | side=%s | entry=%.2f", pair.index, "PE", float(ltp))
                 logger.info("TRI_WAVE_ENTRY_COMMITTED | %s | ltp=%.2f | reason=%s", tag, float(ltp), signal.reason)
             return bool(accepted)
 
@@ -672,6 +679,19 @@ class TradingRuntimeCoordinator:
         if pair.is_ready():
             active_position = self._get_active_position_for_pair(pair)
             tri_signal = self.tri_wave_brain.evaluate(pair.index, active_position=active_position)
+            if self.TRI_WAVE_ONLY_MODE:
+                if tri_signal and tri_signal.action != "NO_TRADE":
+                    executed = self._execute_tri_wave_signal(pair, tri_signal, raw)
+                    if executed:
+                        logger.info(
+                            "TRI_WAVE_ONLY_EXECUTED | index=%s | action=%s | reason=%s",
+                            pair.index, tri_signal.action, tri_signal.reason
+                        )
+                logger.info(
+                    "LEGACY_SYSTEM_SKIPPED_BY_TRI_WAVE_ONLY | index=%s | secid=%s | tag=%s",
+                    pair.index, secid, tag
+                )
+                return
             if tri_signal and tri_signal.action != "NO_TRADE":
                 executed = self._execute_tri_wave_signal(pair, tri_signal, raw)
                 if executed:
@@ -686,6 +706,12 @@ class TradingRuntimeCoordinator:
         self._process_exit_engines(pair, secid, tag, raw)
 
     def _update_market_snapshot(self, pair: PairRuntimeState, raw: dict, secid: int, tag: str) -> None:
+        if getattr(self, "TRI_WAVE_ONLY_MODE", False):
+            logger.info(
+                "LEGACY_MARKET_SNAPSHOT_SKIPPED_TRI_WAVE_ONLY | index=%s | secid=%s | tag=%s",
+                pair.index, secid, tag
+            )
+            return
         if not self.market_open():
             return
 
@@ -768,6 +794,12 @@ class TradingRuntimeCoordinator:
         print("DECISION_RESULT →", decision)
 
     def _process_exit_engines(self, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
+        if getattr(self, "TRI_WAVE_ONLY_MODE", False):
+            logger.info(
+                "LEGACY_EXIT_ENGINE_SKIPPED_TRI_WAVE_ONLY | secid=%s | tag=%s",
+                secid, tag
+            )
+            return
         action = self.momentum_engine.on_tick(secid, raw)
         decision = {"exit_allowed": True}
         tick_bucket = int(time.time() * 10)

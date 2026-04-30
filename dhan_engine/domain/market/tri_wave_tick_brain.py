@@ -313,6 +313,28 @@ class TriWaveTickBrain:
             logger.info("TRI_WAVE_SIGNAL | index=%s | action=%s | conf=%.2f | reason=%s", index, action, confidence, reason)
         return sig
 
+    def reset_trade_state(self, index: str, side: str, entry_price: float) -> None:
+        now_ts = time.time()
+        self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
+        self.last_entry_side[index] = side
+        self.last_entry_ts[index] = now_ts
+        self.trade_peak_state[index] = {
+            "entry_price": float(entry_price),
+            "best_price": float(entry_price),
+            "best_pnl_pct": 0.0,
+            "mfe_pct": 0.0,
+            "last_peak_ts": now_ts,
+        }
+
+    def _guard_exit_or_flip(self, index: str, side: str, action: str, reason: str, hold_sec: float, pnl_pct: float, state: dict) -> Optional[TriWaveSignal]:
+        if hold_sec < self.MIN_BREATHING_HOLD_SEC and reason != "FAST_ADVERSE_EXIT":
+            logger.error(
+                "TRI_WAVE_EXIT_BUG_BLOCKED | index=%s | side=%s | action=%s | reason=%s | hold_sec=%.2f | pnl_pct=%.2f",
+                index, side, action, reason, hold_sec, pnl_pct
+            )
+            return self._signal(index, "NO_TRADE", None, 0.0, "EXIT_BUG_BLOCKED_BREATHING_WINDOW", state)
+        return None
+
     def evaluate(self, index: str, active_position: Optional[dict] = None) -> TriWaveSignal:
         now_ts = time.time()
         fut = self._fresh(self.ticks[index]["FUT"], now_ts)
@@ -440,6 +462,18 @@ class TriWaveTickBrain:
         current_price = float(active_position.get("ltp", entry_price) or entry_price)
         pnl_pct = ((current_price - max(entry_price, 1e-9)) / max(entry_price, 1e-9)) * 100.0
         side = active_position.get("side")
+        allow_emergency_exit = (
+            hold_sec >= self.EARLY_FAST_ADVERSE_HOLD_SEC
+            and pnl_pct <= self.EARLY_FAST_ADVERSE_PCT
+        )
+        if hold_sec < self.MIN_BREATHING_HOLD_SEC and not allow_emergency_exit:
+            self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
+            logger.info(
+                "TRI_WAVE_EXIT_GUARD | index=%s | side=%s | hold_sec=%.2f | pnl_pct=%.2f | guard=GLOBAL_BREATHING_WINDOW_ACTIVE",
+                index, side, hold_sec, pnl_pct
+            )
+            return self._signal(index, "NO_TRADE", None, 0.0, "GLOBAL_BREATHING_WINDOW_ACTIVE", state)
+
         if side == "CE":
             scalp_eval = self._evaluate_premium_scalp_exit(index, "CE", entry_price, current_price, fs, cs, ps, hold_sec)
             reason_candidate, required_ticks = scalp_eval["reason"], scalp_eval["confirm_required"]
@@ -461,10 +495,13 @@ class TriWaveTickBrain:
                     return self._signal(index, "NO_TRADE", None, 0.0, "EXIT_CONFIRMATION_PENDING", state)
                 action = "EXIT_CE"
                 logger.info("TRI_WAVE_EXIT_CONFIRMED | action=%s | reason=TRI_WAVE_EXIT:%s | hold_sec=%.2f | pnl_pct=%.2f | best_pnl_pct=%.2f | giveback_pct=%.2f | confirm_count=%s", action, reason_candidate, hold_sec, pnl_pct, float(peak.get("best_pnl_pct", 0.0)), float(peak.get("giveback_pct", 0.0)), self.exit_confirm[index]["count"])
+                guard_signal = self._guard_exit_or_flip(index, side, action, reason_candidate, hold_sec, pnl_pct, state)
+                if guard_signal:
+                    return guard_signal
                 return self._signal(index, action, side, 0.80, reason_candidate, state)
 
-            ce_real_reversal = (fut_down or fut_turn_down) and ps["strength"] >= self.OPPOSITE_EXPAND_MIN_STRENGTH and cs["strength"] <= self.CURRENT_WEAKEN_MIN_STRENGTH
-            ce_profit_protect = pnl_pct > 0.35 and cs["strength"] <= -0.10 and ps["strength"] >= 0.18
+            ce_real_reversal = hold_sec >= self.NORMAL_EXIT_MIN_HOLD_SEC and (fut_down or fut_turn_down) and ps["strength"] >= self.OPPOSITE_EXPAND_MIN_STRENGTH and cs["strength"] <= self.CURRENT_WEAKEN_MIN_STRENGTH
+            ce_profit_protect = hold_sec >= self.NORMAL_EXIT_MIN_HOLD_SEC and pnl_pct > 0.35 and cs["strength"] <= -0.10 and ps["strength"] >= 0.18
             ce_flip_candidate = ce_real_reversal
 
             ce_exit_reason = "REAL_REVERSAL" if ce_real_reversal else "PROFIT_PROTECT" if ce_profit_protect else "NONE"
@@ -479,6 +516,9 @@ class TriWaveTickBrain:
                     conf = 0.74 + conf_adj
                     if conf >= self.FLIP_CONFIDENCE:
                         logger.info("TRI_WAVE_EXIT_CONFIRMED | action=FLIP_TO_PE | reason=TRI_WAVE_FLIP_EXIT:FUT_TURN_DOWN+PE_EXPAND+CE_WEAKEN | hold_sec=%.2f | pnl_pct=%.2f | confirm_count=%s", hold_sec, pnl_pct, self.exit_confirm[index]["count"])
+                        guard_signal = self._guard_exit_or_flip(index, side, "FLIP_TO_PE", "FUT_TURN_DOWN+PE_EXPAND+CE_WEAKEN", hold_sec, pnl_pct, state)
+                        if guard_signal:
+                            return guard_signal
                         return self._signal(index, "FLIP_TO_PE", "PE", conf, "FUT_TURN_DOWN+PE_EXPAND+CE_WEAKEN", state)
                 else:
                     logger.info("TRI_WAVE_EXIT_BLOCKED | reason=CONFIRMATION_NOT_MET | count=%s | required=%s", self.exit_confirm[index]["count"], self.FLIP_CONFIRM_TICKS)
@@ -490,6 +530,9 @@ class TriWaveTickBrain:
                 if conf >= self.EXIT_CONFIDENCE:
                     reason = "CE_REAL_REVERSAL_CONFIRMED" if ce_exit_reason == "REAL_REVERSAL" else "CE_PROFIT_PROTECT_CONFIRMED"
                     logger.info("TRI_WAVE_EXIT_CONFIRMED | action=EXIT_CE | reason=TRI_WAVE_EXIT:%s | hold_sec=%.2f | pnl_pct=%.2f | confirm_count=%s", reason, hold_sec, pnl_pct, self.exit_confirm[index]["count"])
+                    guard_signal = self._guard_exit_or_flip(index, side, "EXIT_CE", reason, hold_sec, pnl_pct, state)
+                    if guard_signal:
+                        return guard_signal
                     return self._signal(index, "EXIT_CE", "CE", conf, reason, state)
         if side == "PE":
             scalp_eval = self._evaluate_premium_scalp_exit(index, "PE", entry_price, current_price, fs, cs, ps, hold_sec)
@@ -512,10 +555,13 @@ class TriWaveTickBrain:
                     return self._signal(index, "NO_TRADE", None, 0.0, "EXIT_CONFIRMATION_PENDING", state)
                 action = "EXIT_PE"
                 logger.info("TRI_WAVE_EXIT_CONFIRMED | action=%s | reason=TRI_WAVE_EXIT:%s | hold_sec=%.2f | pnl_pct=%.2f | best_pnl_pct=%.2f | giveback_pct=%.2f | confirm_count=%s", action, reason_candidate, hold_sec, pnl_pct, float(peak.get("best_pnl_pct", 0.0)), float(peak.get("giveback_pct", 0.0)), self.exit_confirm[index]["count"])
+                guard_signal = self._guard_exit_or_flip(index, side, action, reason_candidate, hold_sec, pnl_pct, state)
+                if guard_signal:
+                    return guard_signal
                 return self._signal(index, action, side, 0.80, reason_candidate, state)
 
-            pe_real_reversal = (fut_up or fut_turn_up) and cs["strength"] >= self.OPPOSITE_EXPAND_MIN_STRENGTH and ps["strength"] <= self.CURRENT_WEAKEN_MIN_STRENGTH
-            pe_profit_protect = pnl_pct > 0.35 and ps["strength"] <= -0.10 and cs["strength"] >= 0.18
+            pe_real_reversal = hold_sec >= self.NORMAL_EXIT_MIN_HOLD_SEC and (fut_up or fut_turn_up) and cs["strength"] >= self.OPPOSITE_EXPAND_MIN_STRENGTH and ps["strength"] <= self.CURRENT_WEAKEN_MIN_STRENGTH
+            pe_profit_protect = hold_sec >= self.NORMAL_EXIT_MIN_HOLD_SEC and pnl_pct > 0.35 and ps["strength"] <= -0.10 and cs["strength"] >= 0.18
             pe_flip_candidate = pe_real_reversal
 
             pe_exit_reason = "REAL_REVERSAL" if pe_real_reversal else "PROFIT_PROTECT" if pe_profit_protect else "NONE"
@@ -530,6 +576,9 @@ class TriWaveTickBrain:
                     conf = 0.74 + conf_adj
                     if conf >= self.FLIP_CONFIDENCE:
                         logger.info("TRI_WAVE_EXIT_CONFIRMED | action=FLIP_TO_CE | reason=TRI_WAVE_FLIP_EXIT:FUT_TURN_UP+CE_EXPAND+PE_WEAKEN | hold_sec=%.2f | pnl_pct=%.2f | confirm_count=%s", hold_sec, pnl_pct, self.exit_confirm[index]["count"])
+                        guard_signal = self._guard_exit_or_flip(index, side, "FLIP_TO_CE", "FUT_TURN_UP+CE_EXPAND+PE_WEAKEN", hold_sec, pnl_pct, state)
+                        if guard_signal:
+                            return guard_signal
                         return self._signal(index, "FLIP_TO_CE", "CE", conf, "FUT_TURN_UP+CE_EXPAND+PE_WEAKEN", state)
                 else:
                     logger.info("TRI_WAVE_EXIT_BLOCKED | reason=CONFIRMATION_NOT_MET | count=%s | required=%s", self.exit_confirm[index]["count"], self.FLIP_CONFIRM_TICKS)
@@ -541,6 +590,9 @@ class TriWaveTickBrain:
                 if conf >= self.EXIT_CONFIDENCE:
                     reason = "PE_REAL_REVERSAL_CONFIRMED" if pe_exit_reason == "REAL_REVERSAL" else "PE_PROFIT_PROTECT_CONFIRMED"
                     logger.info("TRI_WAVE_EXIT_CONFIRMED | action=EXIT_PE | reason=TRI_WAVE_EXIT:%s | hold_sec=%.2f | pnl_pct=%.2f | confirm_count=%s", reason, hold_sec, pnl_pct, self.exit_confirm[index]["count"])
+                    guard_signal = self._guard_exit_or_flip(index, side, "EXIT_PE", reason, hold_sec, pnl_pct, state)
+                    if guard_signal:
+                        return guard_signal
                     return self._signal(index, "EXIT_PE", "PE", conf, reason, state)
 
         if self.last_signal.get(index) in {"BUY_CE", "BUY_PE"} and active_position:
