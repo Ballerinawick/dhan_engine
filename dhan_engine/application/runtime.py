@@ -50,6 +50,14 @@ class TradingRuntimeCoordinator:
     FLOW_REVERSAL_DECISION_COOLDOWN_SEC = 1.0
     PREMATURE_EXIT_THRESHOLD_SEC = 20
     TRI_WAVE_ONLY_MODE = True
+    TRI_WAVE_REENTRY_COOLDOWN_SEC = 90
+    TRI_WAVE_LOSS_REENTRY_COOLDOWN_SEC = 180
+    TRI_WAVE_PROFIT_REENTRY_COOLDOWN_SEC = 60
+    TRI_WAVE_DAILY_PROFIT_LOCK = 1000
+    TRI_WAVE_DAILY_MAX_LOSS = -1000
+    TRI_WAVE_MAX_TRADES_PER_DAY = 20
+    TRI_WAVE_PEAK_PROFIT_TRACKING = True
+    TRI_WAVE_PROFIT_DECAY_FROM_PEAK = 400
 
     EXIT_REASON_PRIORITY = {
         "TRI_WAVE_EMERGENCY_EXIT": 1,
@@ -129,6 +137,11 @@ class TradingRuntimeCoordinator:
         self.flow_reversal_state: Dict[int, dict] = {}
         self._tick_exit_guard: Dict[int, dict] = {}
         self.tri_wave_brain = TriWaveTickBrain(debug=True)
+        self.tri_wave_last_exit_ts: Dict[str, float] = {}
+        self.tri_wave_last_exit_reason: Dict[str, str] = {}
+        self.tri_wave_last_exit_net_pnl: Dict[str, float] = {}
+        self.tri_wave_peak_realized_pnl: Dict[str, float] = defaultdict(float)
+        self.tri_wave_trading_halted_for_day: Dict[str, bool] = defaultdict(bool)
 
         self.metrics = {
             "exit_reason_counts": defaultdict(int),
@@ -535,6 +548,9 @@ class TradingRuntimeCoordinator:
         action = signal.action
         if action == "NO_TRADE":
             return False
+        if action in {"BUY_CE", "BUY_PE", "FLIP_TO_CE", "FLIP_TO_PE"}:
+            if self._should_block_tri_wave_entry(pair.index, action):
+                return False
 
         logger.info(
             "TRI_WAVE_ROUTE | index=%s | action=%s | side=%s | conf=%.2f | reason=%s",
@@ -633,7 +649,71 @@ class TradingRuntimeCoordinator:
         else:
             self.momentum_engine.active_trade.pop(secid, None)
         self._record_exit_metrics(reason=final_reason, hold_sec=hold_sec, secid=secid, tag=str(tag))
+        self._record_tri_wave_exit(pair.index, final_reason)
         return True
+
+    def _record_tri_wave_exit(self, index: str, reason: str) -> None:
+        self.tri_wave_last_exit_ts[index] = time.time()
+        self.tri_wave_last_exit_reason[index] = str(reason)
+        net_pnl = float((self.paper_trader.last_trade_summary or {}).get("net_pnl", 0.0) or 0.0)
+        self.tri_wave_last_exit_net_pnl[index] = net_pnl
+
+    def _should_block_tri_wave_entry(self, index: str, action: str) -> bool:
+        now_ts = time.time()
+        self.paper_trader._maybe_reset_daily_counts(now_ts)
+        current_pnl = float(getattr(self.paper_trader, "realized_pnl", 0.0) or 0.0)
+        opened_today = int(getattr(self.paper_trader, "opened_today", 0) or 0)
+
+        if self.TRI_WAVE_PEAK_PROFIT_TRACKING:
+            peak = float(self.tri_wave_peak_realized_pnl.get(index, 0.0))
+            if current_pnl > peak:
+                peak = current_pnl
+                self.tri_wave_peak_realized_pnl[index] = peak
+            if peak >= 700 and current_pnl <= (peak - self.TRI_WAVE_PROFIT_DECAY_FROM_PEAK):
+                self.tri_wave_trading_halted_for_day[index] = True
+                logger.info(
+                    "TRI_WAVE_PROFIT_DECAY_BLOCK | peak_pnl=%.2f | current_pnl=%.2f | decay=%.2f",
+                    peak, current_pnl, peak - current_pnl
+                )
+
+        guard_reason = None
+        if self.tri_wave_trading_halted_for_day.get(index):
+            guard_reason = "PROFIT_DECAY_LOCK"
+        elif current_pnl >= self.TRI_WAVE_DAILY_PROFIT_LOCK:
+            guard_reason = "DAILY_PROFIT_LOCK"
+            self.tri_wave_trading_halted_for_day[index] = True
+        elif current_pnl <= self.TRI_WAVE_DAILY_MAX_LOSS:
+            guard_reason = "DAILY_MAX_LOSS"
+            self.tri_wave_trading_halted_for_day[index] = True
+        elif opened_today >= self.TRI_WAVE_MAX_TRADES_PER_DAY:
+            guard_reason = "MAX_TRADES_PER_DAY"
+            self.tri_wave_trading_halted_for_day[index] = True
+
+        if guard_reason:
+            logger.info(
+                "TRI_WAVE_DAILY_GUARD_BLOCK | index=%s | reason=%s | net_pnl_after_fees=%.2f | opened_today=%s",
+                index, guard_reason, current_pnl, opened_today
+            )
+            return True
+
+        last_exit_ts = self.tri_wave_last_exit_ts.get(index)
+        if last_exit_ts:
+            elapsed = now_ts - float(last_exit_ts)
+            last_reason = str(self.tri_wave_last_exit_reason.get(index, "UNKNOWN"))
+            last_net = float(self.tri_wave_last_exit_net_pnl.get(index, 0.0))
+            required = self.TRI_WAVE_REENTRY_COOLDOWN_SEC
+            reason_u = last_reason.upper()
+            if last_net <= 0 or "LOSS" in reason_u or "ADVERSE" in reason_u:
+                required = self.TRI_WAVE_LOSS_REENTRY_COOLDOWN_SEC
+            elif last_net > 0:
+                required = self.TRI_WAVE_PROFIT_REENTRY_COOLDOWN_SEC
+            if elapsed < required:
+                logger.info(
+                    "TRI_WAVE_ENTRY_COOLDOWN_BLOCK | index=%s | action=%s | elapsed=%.2f | required=%.2f | last_exit_reason=%s",
+                    index, action, elapsed, required, last_reason
+                )
+                return True
+        return False
 
     def _process_option_update(self, index: str, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
         if not self.market_open():
