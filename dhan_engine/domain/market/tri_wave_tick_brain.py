@@ -100,6 +100,14 @@ class TriWaveTickBrain:
     MIN_EXPECTED_MOVE_PCT = 1.20
     MIN_TARGET_STRENGTH_FOR_ENTRY = 0.35
     MAX_OPPOSITE_STRENGTH_FOR_ENTRY = 0.10
+    ENABLE_CONTROLLED_CONTINUATION_ENTRY = True
+    CONTROLLED_ENTRY_MIN_FUT_STRENGTH = 0.45
+    CONTROLLED_ENTRY_MIN_TARGET_STRENGTH = 0.45
+    CONTROLLED_ENTRY_MAX_TARGET_POS = 0.62
+    CONTROLLED_ENTRY_MAX_OPPOSITE_STRENGTH = 0.05
+    CONTROLLED_ENTRY_MIN_LAST5_DELTA = 0.20
+    CONTROLLED_ENTRY_MIN_EXPECTED_MOVE_PCT = 0.80
+    CONTROLLED_ENTRY_MAX_SPOOF_RISK = 0.85
 
     SPREAD_MAX_PCT = 0.025
     SPOOF_RISK_BLOCK = 0.72
@@ -339,6 +347,61 @@ class TriWaveTickBrain:
             return False, "LOW_EXPECTED_REWARD"
         return True, "EXPECTED_REWARD_OK"
 
+    def _expected_move_filter_with_min(self, index: str, side: str, target: dict, opposite: dict, min_expected_move_pct: float) -> tuple[bool, str]:
+        expected_move_pct = max(0.0, float(target.get("from_recent_high_pct", 0.0) or 0.0) * -1.0)
+        target_strength = float(target.get("strength", 0.0) or 0.0)
+        opposite_strength = float(opposite.get("strength", 0.0) or 0.0)
+        target_pos = float(target.get("position_in_range", 0.0) or 0.0)
+        if target_strength < self.MIN_TARGET_STRENGTH_FOR_ENTRY:
+            ok = False
+        elif opposite_strength > self.MAX_OPPOSITE_STRENGTH_FOR_ENTRY:
+            ok = False
+        elif target_pos >= self.ENTRY_MAX_POSITION_IN_RANGE:
+            ok = False
+        elif expected_move_pct < min_expected_move_pct:
+            ok = False
+        else:
+            ok = True
+        if not ok:
+            logger.info(
+                "TRI_WAVE_ENTRY_REJECT | index=%s | side=%s | reason=LOW_EXPECTED_REWARD | expected_move_pct=%.2f | threshold=%.2f | target_strength=%.2f | opposite_strength=%.2f | target_pos=%.2f",
+                index, side, expected_move_pct, min_expected_move_pct, target_strength, opposite_strength, target_pos
+            )
+            return False, "LOW_EXPECTED_REWARD"
+        return True, "EXPECTED_REWARD_OK"
+
+    def _controlled_continuation_ok(self, side: str, fs: dict, cs: dict, ps: dict) -> tuple[bool, str]:
+        if side == "CE":
+            target = cs
+            opposite = ps
+            if fs["strength"] < self.CONTROLLED_ENTRY_MIN_FUT_STRENGTH:
+                return False, "CONTROLLED_CE_FUT_WEAK"
+            if target["strength"] < self.CONTROLLED_ENTRY_MIN_TARGET_STRENGTH:
+                return False, "CONTROLLED_CE_TARGET_WEAK"
+            if target["position_in_range"] > self.CONTROLLED_ENTRY_MAX_TARGET_POS:
+                return False, "CONTROLLED_CE_TOO_HIGH"
+            if opposite["strength"] > self.CONTROLLED_ENTRY_MAX_OPPOSITE_STRENGTH:
+                return False, "CONTROLLED_CE_OPPOSITE_NOT_WEAK"
+            if target["last_5_delta"] < self.CONTROLLED_ENTRY_MIN_LAST5_DELTA:
+                return False, "CONTROLLED_CE_NO_RECENT_PUSH"
+            return True, "CE_CONTROLLED_PULLBACK_CONTINUATION_CONFIRMED"
+
+        if side == "PE":
+            target = ps
+            opposite = cs
+            if fs["strength"] > -self.CONTROLLED_ENTRY_MIN_FUT_STRENGTH:
+                return False, "CONTROLLED_PE_FUT_WEAK"
+            if target["strength"] < self.CONTROLLED_ENTRY_MIN_TARGET_STRENGTH:
+                return False, "CONTROLLED_PE_TARGET_WEAK"
+            if target["position_in_range"] > self.CONTROLLED_ENTRY_MAX_TARGET_POS:
+                return False, "CONTROLLED_PE_TOO_HIGH"
+            if opposite["strength"] > self.CONTROLLED_ENTRY_MAX_OPPOSITE_STRENGTH:
+                return False, "CONTROLLED_PE_OPPOSITE_NOT_WEAK"
+            if target["last_5_delta"] < self.CONTROLLED_ENTRY_MIN_LAST5_DELTA:
+                return False, "CONTROLLED_PE_NO_RECENT_PUSH"
+            return True, "PE_CONTROLLED_PULLBACK_CONTINUATION_CONFIRMED"
+        return False, "UNKNOWN_SIDE"
+
     def reset_trade_state(self, index: str, side: str, entry_price: float) -> None:
         now_ts = time.time()
         self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
@@ -386,9 +449,13 @@ class TriWaveTickBrain:
         if ce_sp_pct > self.SPREAD_MAX_PCT or pe_sp_pct > self.SPREAD_MAX_PCT:
             reason_parts.append("WIDE_SPREAD")
             conf_adj -= 0.10
-        if max(float(cs.get("spoof_risk", 0.0)), float(ps.get("spoof_risk", 0.0))) > self.SPOOF_RISK_BLOCK:
-            logger.info("TRI_WAVE_REJECT | index=%s | reason=SPOOF_RISK", index)
-            return self._signal(index, "NO_TRADE", None, 0.0, "SPOOF_RISK", {"sync_ready": True, "reason": "SPOOF_RISK", "bias": None})
+        max_spoof_risk = max(float(cs.get("spoof_risk", 0.0)), float(ps.get("spoof_risk", 0.0)))
+        if max_spoof_risk >= 0.90:
+            logger.info("TRI_WAVE_REJECT | index=%s | reason=SPOOF_RISK_EXTREME | spoof_risk=%.2f", index, max_spoof_risk)
+            return self._signal(index, "NO_TRADE", None, 0.0, "SPOOF_RISK_EXTREME", {"sync_ready": True, "reason": "SPOOF_RISK_EXTREME", "bias": None})
+        if self.SPOOF_RISK_BLOCK <= max_spoof_risk < 0.90:
+            reason_parts.append("SPOOF_CAUTION")
+            conf_adj -= 0.08
 
         fut_up = fs["slope"] > 0 and fs["strength"] >= self.FUT_MIN_STRENGTH
         fut_down = fs["slope"] < 0 and fs["strength"] <= -self.FUT_MIN_STRENGTH
@@ -424,6 +491,14 @@ class TriWaveTickBrain:
                 bias,
                 (active_position or {}).get("side"),
             )
+            primary_ce_possible, _ = self._entry_quality_ok("CE", fs, cs, ps)
+            controlled_ce_possible, _ = self._controlled_continuation_ok("CE", fs, cs, ps)
+            primary_pe_possible, _ = self._entry_quality_ok("PE", fs, cs, ps)
+            controlled_pe_possible, reject_hint = self._controlled_continuation_ok("PE", fs, cs, ps)
+            logger.info(
+                "TRI_WAVE_ENTRY_MODE_STATE | index=%s | primary_ce_possible=%s | controlled_ce_possible=%s | primary_pe_possible=%s | controlled_pe_possible=%s | reject_hint=%s",
+                index, primary_ce_possible, controlled_ce_possible, primary_pe_possible, controlled_pe_possible, reject_hint
+            )
 
         # entries
         if not active_position:
@@ -433,15 +508,23 @@ class TriWaveTickBrain:
                 reasons = ["FUT_TURN_UP" if fut_turn_up else "FUT_TREND_UP", "CE_EXPAND", "PE_WEAKEN"]
                 if conf >= self.ENTRY_CONFIDENCE:
                     quality_ok, quality_reason = self._entry_quality_ok("CE", fs, cs, ps)
-                    if not quality_ok:
+                    controlled_ok, controlled_reason = False, "CONTROLLED_DISABLED"
+                    expected_threshold = self.MIN_EXPECTED_MOVE_PCT
+                    if not quality_ok and self.ENABLE_CONTROLLED_CONTINUATION_ENTRY:
+                        controlled_ok, controlled_reason = self._controlled_continuation_ok("CE", fs, cs, ps)
+                        if controlled_ok:
+                            expected_threshold = self.CONTROLLED_ENTRY_MIN_EXPECTED_MOVE_PCT
+                            reasons = ["FUT_TREND_UP", "CE_EXPAND", "PE_WEAKEN", controlled_reason]
+                    if not quality_ok and not controlled_ok:
                         logger.info(
-                            "TRI_WAVE_ENTRY_REJECT | index=%s | side=CE | reason=%s | fut_strength=%.2f | ce_strength=%.2f | pe_strength=%.2f | ce_pos=%.2f | pe_pos=%.2f | ce_turn_up=%s | pe_turn_up=%s | ce_last5=%.2f | pe_last5=%.2f",
-                            index, quality_reason, fs["strength"], cs["strength"], ps["strength"],
-                            cs["position_in_range"], ps["position_in_range"],
-                            cs["turn_up"], ps["turn_up"], cs["last_5_delta"], ps["last_5_delta"]
+                            "TRI_WAVE_ENTRY_REJECT | index=%s | side=CE | primary_reason=%s | controlled_reason=%s | fut_strength=%.2f | ce_strength=%.2f | pe_strength=%.2f | ce_pos=%.2f | pe_pos=%.2f | ce_last5=%.2f | pe_last5=%.2f",
+                            index, quality_reason, controlled_reason, fs["strength"], cs["strength"], ps["strength"],
+                            cs["position_in_range"], ps["position_in_range"], cs["last_5_delta"], ps["last_5_delta"]
                         )
                         return self._signal(index, "NO_TRADE", None, 0.0, quality_reason, state)
-                    expected_ok, expected_reason = self._expected_move_filter(index, "CE", cs, ps)
+                    if quality_ok:
+                        reasons.append(quality_reason)
+                    expected_ok, expected_reason = self._expected_move_filter_with_min(index, "CE", cs, ps, expected_threshold)
                     if not expected_ok:
                         return self._signal(index, "NO_TRADE", None, 0.0, expected_reason, state)
                     if (now_ts - self.last_signal_ts.get(index, 0.0)) < self.ENTRY_COOLDOWN_SEC:
@@ -450,27 +533,34 @@ class TriWaveTickBrain:
                     if self.last_entry_side.get(index) == "CE" and (now_ts - self.last_entry_ts.get(index, 0.0)) < self.REENTRY_SAME_SIDE_COOLDOWN_SEC:
                         logger.info("TRI_WAVE_REENTRY_BLOCK | index=%s | side=CE | remaining=%.2f", index, self.REENTRY_SAME_SIDE_COOLDOWN_SEC - (now_ts - self.last_entry_ts.get(index, 0.0)))
                         return self._signal(index, "NO_TRADE", None, 0.0, "REENTRY_SAME_SIDE_COOLDOWN", state)
-                    reasons.append(quality_reason)
                     self.last_entry_side[index] = "CE"
                     self.last_entry_ts[index] = now_ts
                     self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
                     self.trade_peak_state[index] = {"entry_price": float(cs["last"]), "best_price": float(cs["last"]), "best_pnl_pct": 0.0, "mfe_pct": 0.0, "last_peak_ts": now_ts}
                     logger.info("TRI_WAVE_TRADE_STATE_RESET | index=%s | side=%s | entry=%.2f", index, "CE", float(cs["last"]))
-                    return self._signal(index, "BUY_CE", "CE", conf, "+".join(reasons + reason_parts), state)
+                    return self._signal(index, "BUY_CE", "CE", conf, f"TRI_WAVE_ENTRY:{'+'.join(reasons + reason_parts)}", state)
             if (fut_down or fut_turn_down) and pe_expand and ce_weaken:
                 conf = 0.70 + conf_adj + (0.03 if ps.get("bull_turn_score", 0) and ps.get("bull_turn_score", 0) > 0 else 0)
                 reasons = ["FUT_TURN_DOWN" if fut_turn_down else "FUT_TREND_DOWN", "PE_EXPAND", "CE_WEAKEN"]
                 if conf >= self.ENTRY_CONFIDENCE:
                     quality_ok, quality_reason = self._entry_quality_ok("PE", fs, cs, ps)
-                    if not quality_ok:
+                    controlled_ok, controlled_reason = False, "CONTROLLED_DISABLED"
+                    expected_threshold = self.MIN_EXPECTED_MOVE_PCT
+                    if not quality_ok and self.ENABLE_CONTROLLED_CONTINUATION_ENTRY:
+                        controlled_ok, controlled_reason = self._controlled_continuation_ok("PE", fs, cs, ps)
+                        if controlled_ok:
+                            expected_threshold = self.CONTROLLED_ENTRY_MIN_EXPECTED_MOVE_PCT
+                            reasons = ["FUT_TREND_DOWN", "PE_EXPAND", "CE_WEAKEN", controlled_reason]
+                    if not quality_ok and not controlled_ok:
                         logger.info(
-                            "TRI_WAVE_ENTRY_REJECT | index=%s | side=PE | reason=%s | fut_strength=%.2f | ce_strength=%.2f | pe_strength=%.2f | ce_pos=%.2f | pe_pos=%.2f | ce_turn_up=%s | pe_turn_up=%s | ce_last5=%.2f | pe_last5=%.2f",
-                            index, quality_reason, fs["strength"], cs["strength"], ps["strength"],
-                            cs["position_in_range"], ps["position_in_range"],
-                            cs["turn_up"], ps["turn_up"], cs["last_5_delta"], ps["last_5_delta"]
+                            "TRI_WAVE_ENTRY_REJECT | index=%s | side=PE | primary_reason=%s | controlled_reason=%s | fut_strength=%.2f | ce_strength=%.2f | pe_strength=%.2f | ce_pos=%.2f | pe_pos=%.2f | ce_last5=%.2f | pe_last5=%.2f",
+                            index, quality_reason, controlled_reason, fs["strength"], cs["strength"], ps["strength"],
+                            cs["position_in_range"], ps["position_in_range"], cs["last_5_delta"], ps["last_5_delta"]
                         )
                         return self._signal(index, "NO_TRADE", None, 0.0, quality_reason, state)
-                    expected_ok, expected_reason = self._expected_move_filter(index, "PE", ps, cs)
+                    if quality_ok:
+                        reasons.append(quality_reason)
+                    expected_ok, expected_reason = self._expected_move_filter_with_min(index, "PE", ps, cs, expected_threshold)
                     if not expected_ok:
                         return self._signal(index, "NO_TRADE", None, 0.0, expected_reason, state)
                     if (now_ts - self.last_signal_ts.get(index, 0.0)) < self.ENTRY_COOLDOWN_SEC:
@@ -479,13 +569,12 @@ class TriWaveTickBrain:
                     if self.last_entry_side.get(index) == "PE" and (now_ts - self.last_entry_ts.get(index, 0.0)) < self.REENTRY_SAME_SIDE_COOLDOWN_SEC:
                         logger.info("TRI_WAVE_REENTRY_BLOCK | index=%s | side=PE | remaining=%.2f", index, self.REENTRY_SAME_SIDE_COOLDOWN_SEC - (now_ts - self.last_entry_ts.get(index, 0.0)))
                         return self._signal(index, "NO_TRADE", None, 0.0, "REENTRY_SAME_SIDE_COOLDOWN", state)
-                    reasons.append(quality_reason)
                     self.last_entry_side[index] = "PE"
                     self.last_entry_ts[index] = now_ts
                     self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
                     self.trade_peak_state[index] = {"entry_price": float(ps["last"]), "best_price": float(ps["last"]), "best_pnl_pct": 0.0, "mfe_pct": 0.0, "last_peak_ts": now_ts}
                     logger.info("TRI_WAVE_TRADE_STATE_RESET | index=%s | side=%s | entry=%.2f", index, "PE", float(ps["last"]))
-                    return self._signal(index, "BUY_PE", "PE", conf, "+".join(reasons + reason_parts), state)
+                    return self._signal(index, "BUY_PE", "PE", conf, f"TRI_WAVE_ENTRY:{'+'.join(reasons + reason_parts)}", state)
             logger.info("TRI_WAVE_REJECT | index=%s | reason=LOW_CONFIDENCE", index)
             return self._signal(index, "NO_TRADE", None, 0.0, "LOW_CONFIDENCE", state)
 
