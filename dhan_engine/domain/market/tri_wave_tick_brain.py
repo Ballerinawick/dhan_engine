@@ -42,6 +42,12 @@ class TriWaveTickBrain:
     FLIP_CONFIDENCE = 0.72
 
     MIN_EXIT_HOLD_SEC = 20
+    MIN_BREATHING_HOLD_SEC = 20
+    EARLY_FAST_ADVERSE_HOLD_SEC = 10
+    EARLY_FAST_ADVERSE_PCT = -4.0
+    NORMAL_EXIT_MIN_HOLD_SEC = 20
+    PROFIT_EXIT_MIN_HOLD_SEC = 25
+    BREAKEVEN_EXIT_MIN_HOLD_SEC = 35
     MAX_SCALP_HOLD_SEC = 600
     MIN_DYNAMIC_EXIT_HOLD_SEC = MIN_EXIT_HOLD_SEC
     MAX_DYNAMIC_EXIT_HOLD_SEC = MAX_SCALP_HOLD_SEC
@@ -146,31 +152,36 @@ class TriWaveTickBrain:
         peak["giveback_pct"] = max(0.0, peak["best_pnl_pct"] - pnl_pct)
         self.trade_peak_state[index] = peak
 
+        if hold_sec < self.MIN_BREATHING_HOLD_SEC:
+            if hold_sec >= self.EARLY_FAST_ADVERSE_HOLD_SEC and pnl_pct <= self.EARLY_FAST_ADVERSE_PCT:
+                return {"exit": True, "reason": "FAST_ADVERSE_EXIT", "confirm_required": self.FAST_EXIT_CONFIRM_TICKS}
+            return {"exit": False, "reason": "BREATHING_WINDOW_ACTIVE", "confirm_required": self.EXIT_CONFIRM_TICKS}
+
         reason = "NONE"
         confirm_required = self.EXIT_CONFIRM_TICKS
-        if pnl_pct <= self.FAST_ADVERSE_EXIT_PCT and hold_sec >= 10:
+        if pnl_pct <= self.FAST_ADVERSE_EXIT_PCT and hold_sec >= self.EARLY_FAST_ADVERSE_HOLD_SEC:
             reason, confirm_required = "FAST_ADVERSE_EXIT", self.FAST_EXIT_CONFIRM_TICKS
-        elif pnl_pct <= self.ADVERSE_EXIT_PCT and hold_sec >= self.MIN_EXIT_HOLD_SEC:
+        elif pnl_pct <= self.ADVERSE_EXIT_PCT and hold_sec >= self.NORMAL_EXIT_MIN_HOLD_SEC:
             reason = "ADVERSE_MOVE_CONFIRMED"
         elif hold_sec >= self.TIME_LOSS_EXIT_SEC and pnl_pct <= self.TIME_LOSS_EXIT_PCT:
             reason = "TIME_LOSS_EXIT"
-        elif pnl_pct >= self.PROFIT_ARM_PCT and target["position_in_range"] >= self.TOP_ZONE_POSITION and target["turn_down"] is True:
-            reason = "PROFIT_TOP_TURN_EXIT"
-        elif pnl_pct >= self.STRONG_PROFIT_PCT and target["position_in_range"] >= self.TOP_ZONE_POSITION and target["last_5_delta"] <= 0:
-            reason = "PROFIT_STALL_TOP_EXIT"
-        elif pnl_pct >= self.BIG_PROFIT_PCT and target["position_in_range"] >= self.EXTREME_TOP_ZONE_POSITION:
+        elif pnl_pct >= self.BIG_PROFIT_PCT and hold_sec >= self.EARLY_FAST_ADVERSE_HOLD_SEC and target["position_in_range"] >= self.EXTREME_TOP_ZONE_POSITION:
             reason, confirm_required = "EXTREME_TOP_PROFIT_EXIT", self.FAST_EXIT_CONFIRM_TICKS
-        elif peak["best_pnl_pct"] >= self.BIG_PROFIT_PCT and peak["giveback_pct"] >= self.BIG_PROFIT_GIVEBACK_EXIT_PCT:
+        elif hold_sec >= self.PROFIT_EXIT_MIN_HOLD_SEC and pnl_pct >= self.PROFIT_ARM_PCT and target["position_in_range"] >= self.TOP_ZONE_POSITION and target["turn_down"] is True:
+            reason = "PROFIT_TOP_TURN_EXIT"
+        elif hold_sec >= self.PROFIT_EXIT_MIN_HOLD_SEC and pnl_pct >= self.STRONG_PROFIT_PCT and target["position_in_range"] >= self.TOP_ZONE_POSITION and target["last_5_delta"] <= 0:
+            reason = "PROFIT_STALL_TOP_EXIT"
+        elif hold_sec >= self.PROFIT_EXIT_MIN_HOLD_SEC and peak["best_pnl_pct"] >= self.BIG_PROFIT_PCT and peak["giveback_pct"] >= self.BIG_PROFIT_GIVEBACK_EXIT_PCT:
             reason = "BIG_PROFIT_GIVEBACK_EXIT"
-        elif peak["best_pnl_pct"] >= self.STRONG_PROFIT_PCT and peak["giveback_pct"] >= self.PROFIT_GIVEBACK_EXIT_PCT:
+        elif hold_sec >= self.PROFIT_EXIT_MIN_HOLD_SEC and peak["best_pnl_pct"] >= self.STRONG_PROFIT_PCT and peak["giveback_pct"] >= self.PROFIT_GIVEBACK_EXIT_PCT:
             reason = "PROFIT_GIVEBACK_EXIT"
-        elif peak["best_pnl_pct"] >= self.BREAKEVEN_PROTECT_AFTER_MFE_PCT and pnl_pct <= self.BREAKEVEN_PROTECT_PNL_PCT:
+        elif hold_sec >= self.BREAKEVEN_EXIT_MIN_HOLD_SEC and peak["best_pnl_pct"] >= self.BREAKEVEN_PROTECT_AFTER_MFE_PCT and pnl_pct <= self.BREAKEVEN_PROTECT_PNL_PCT:
             reason = "BREAKEVEN_PROTECT"
-        elif target["last_5_delta"] <= self.TARGET_BREAKDOWN_LAST5_DELTA and target["strength"] <= self.TARGET_BREAKDOWN_STRENGTH:
+        elif hold_sec >= self.NORMAL_EXIT_MIN_HOLD_SEC and target["last_5_delta"] <= self.TARGET_BREAKDOWN_LAST5_DELTA and target["strength"] <= self.TARGET_BREAKDOWN_STRENGTH:
             reason = "TARGET_PREMIUM_BREAKDOWN"
-        elif opposite["strength"] >= self.OPPOSITE_EXPAND_STRENGTH and target["strength"] <= self.TARGET_WEAK_STRENGTH:
+        elif hold_sec >= self.NORMAL_EXIT_MIN_HOLD_SEC and opposite["strength"] >= self.OPPOSITE_EXPAND_STRENGTH and target["strength"] <= self.TARGET_WEAK_STRENGTH:
             reason = "OPPOSITE_EXPAND_TARGET_WEAKEN"
-        elif ((active_side == "CE" and fs["strength"] <= -self.FUTURE_REVERSAL_STRENGTH) or (active_side == "PE" and fs["strength"] >= self.FUTURE_REVERSAL_STRENGTH)) and target["strength"] <= self.TARGET_WEAK_STRENGTH:
+        elif hold_sec >= self.NORMAL_EXIT_MIN_HOLD_SEC and ((active_side == "CE" and fs["strength"] <= -self.FUTURE_REVERSAL_STRENGTH) or (active_side == "PE" and fs["strength"] >= self.FUTURE_REVERSAL_STRENGTH)) and target["strength"] <= self.TARGET_WEAK_STRENGTH:
             reason = "FUTURE_REVERSAL_TARGET_WEAKEN"
         elif hold_sec >= self.MAX_SCALP_HOLD_SEC and pnl_pct < self.STRONG_PROFIT_PCT:
             reason = "MAX_SCALP_HOLD_EXIT"
@@ -391,6 +402,9 @@ class TriWaveTickBrain:
                     reasons.append(quality_reason)
                     self.last_entry_side[index] = "CE"
                     self.last_entry_ts[index] = now_ts
+                    self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
+                    self.trade_peak_state[index] = {"entry_price": float(cs["last"]), "best_price": float(cs["last"]), "best_pnl_pct": 0.0, "mfe_pct": 0.0, "last_peak_ts": now_ts}
+                    logger.info("TRI_WAVE_TRADE_STATE_RESET | index=%s | side=%s | entry=%.2f", index, "CE", float(cs["last"]))
                     return self._signal(index, "BUY_CE", "CE", conf, "+".join(reasons + reason_parts), state)
             if (fut_down or fut_turn_down) and pe_expand and ce_weaken:
                 conf = 0.70 + conf_adj + (0.03 if ps.get("bull_turn_score", 0) and ps.get("bull_turn_score", 0) > 0 else 0)
@@ -414,6 +428,9 @@ class TriWaveTickBrain:
                     reasons.append(quality_reason)
                     self.last_entry_side[index] = "PE"
                     self.last_entry_ts[index] = now_ts
+                    self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
+                    self.trade_peak_state[index] = {"entry_price": float(ps["last"]), "best_price": float(ps["last"]), "best_pnl_pct": 0.0, "mfe_pct": 0.0, "last_peak_ts": now_ts}
+                    logger.info("TRI_WAVE_TRADE_STATE_RESET | index=%s | side=%s | entry=%.2f", index, "PE", float(ps["last"]))
                     return self._signal(index, "BUY_PE", "PE", conf, "+".join(reasons + reason_parts), state)
             logger.info("TRI_WAVE_REJECT | index=%s | reason=LOW_CONFIDENCE", index)
             return self._signal(index, "NO_TRADE", None, 0.0, "LOW_CONFIDENCE", state)
@@ -432,6 +449,11 @@ class TriWaveTickBrain:
                 "TRI_WAVE_EXIT_WATCH | index=%s | active_side=%s | hold_sec=%.2f | entry=%.2f | ltp=%.2f | pnl_pct=%.2f | best_pnl_pct=%.2f | giveback_pct=%.2f | fut_strength=%.2f | ce_strength=%.2f | pe_strength=%.2f | target_pos=%.2f | target_turn_down=%s | target_last5_delta=%.2f | reason_candidate=%s | confirm_count=%s",
                 index, side, hold_sec, entry_price, current_price, pnl_pct, float(peak.get("best_pnl_pct", 0.0)), float(peak.get("giveback_pct", 0.0)), fs["strength"], cs["strength"], ps["strength"], target["position_in_range"], target["turn_down"], target["last_5_delta"], reason_candidate, self.exit_confirm[index]["count"]
             )
+            if reason_candidate in {"NONE", "BREATHING_WINDOW_ACTIVE"}:
+                self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
+            if reason_candidate == "BREATHING_WINDOW_ACTIVE":
+                blocked_candidate = "FAST_ADVERSE_EXIT" if pnl_pct <= self.EARLY_FAST_ADVERSE_PCT else "NONE"
+                logger.info("TRI_WAVE_EXIT_GUARD | index=%s | side=%s | hold_sec=%.2f | pnl_pct=%.2f | guard=BREATHING_WINDOW_ACTIVE | blocked_candidate=%s", index, side, hold_sec, pnl_pct, blocked_candidate)
             if scalp_eval["exit"]:
                 confirmed = self._confirm_exit(index, side, True, reason_candidate, now_ts, required_ticks)
                 if not confirmed:
@@ -478,6 +500,11 @@ class TriWaveTickBrain:
                 "TRI_WAVE_EXIT_WATCH | index=%s | active_side=%s | hold_sec=%.2f | entry=%.2f | ltp=%.2f | pnl_pct=%.2f | best_pnl_pct=%.2f | giveback_pct=%.2f | fut_strength=%.2f | ce_strength=%.2f | pe_strength=%.2f | target_pos=%.2f | target_turn_down=%s | target_last5_delta=%.2f | reason_candidate=%s | confirm_count=%s",
                 index, side, hold_sec, entry_price, current_price, pnl_pct, float(peak.get("best_pnl_pct", 0.0)), float(peak.get("giveback_pct", 0.0)), fs["strength"], cs["strength"], ps["strength"], target["position_in_range"], target["turn_down"], target["last_5_delta"], reason_candidate, self.exit_confirm[index]["count"]
             )
+            if reason_candidate in {"NONE", "BREATHING_WINDOW_ACTIVE"}:
+                self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
+            if reason_candidate == "BREATHING_WINDOW_ACTIVE":
+                blocked_candidate = "FAST_ADVERSE_EXIT" if pnl_pct <= self.EARLY_FAST_ADVERSE_PCT else "NONE"
+                logger.info("TRI_WAVE_EXIT_GUARD | index=%s | side=%s | hold_sec=%.2f | pnl_pct=%.2f | guard=BREATHING_WINDOW_ACTIVE | blocked_candidate=%s", index, side, hold_sec, pnl_pct, blocked_candidate)
             if scalp_eval["exit"]:
                 confirmed = self._confirm_exit(index, side, True, reason_candidate, now_ts, required_ticks)
                 if not confirmed:
