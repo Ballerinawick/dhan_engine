@@ -97,6 +97,9 @@ class TriWaveTickBrain:
     ENTRY_MIN_RECOVERY_STRENGTH = 0.12
     ENTRY_MAX_CHASE_STRENGTH = 0.82
     ENTRY_MIN_OPPOSITE_WEAKEN = -0.10
+    MIN_EXPECTED_MOVE_PCT = 1.20
+    MIN_TARGET_STRENGTH_FOR_ENTRY = 0.35
+    MAX_OPPOSITE_STRENGTH_FOR_ENTRY = 0.10
 
     SPREAD_MAX_PCT = 0.025
     SPOOF_RISK_BLOCK = 0.72
@@ -313,6 +316,29 @@ class TriWaveTickBrain:
             logger.info("TRI_WAVE_SIGNAL | index=%s | action=%s | conf=%.2f | reason=%s", index, action, confidence, reason)
         return sig
 
+    def _expected_move_filter(self, index: str, side: str, target: dict, opposite: dict) -> tuple[bool, str]:
+        expected_move_pct = max(0.0, float(target.get("from_recent_high_pct", 0.0) or 0.0) * -1.0)
+        target_strength = float(target.get("strength", 0.0) or 0.0)
+        opposite_strength = float(opposite.get("strength", 0.0) or 0.0)
+        target_pos = float(target.get("position_in_range", 0.0) or 0.0)
+        if target_strength < self.MIN_TARGET_STRENGTH_FOR_ENTRY:
+            ok = False
+        elif opposite_strength > self.MAX_OPPOSITE_STRENGTH_FOR_ENTRY:
+            ok = False
+        elif target_pos >= self.ENTRY_MAX_POSITION_IN_RANGE:
+            ok = False
+        elif expected_move_pct < self.MIN_EXPECTED_MOVE_PCT:
+            ok = False
+        else:
+            ok = True
+        if not ok:
+            logger.info(
+                "TRI_WAVE_ENTRY_REJECT | index=%s | side=%s | reason=LOW_EXPECTED_REWARD | expected_move_pct=%.2f | target_strength=%.2f | opposite_strength=%.2f | target_pos=%.2f",
+                index, side, expected_move_pct, target_strength, opposite_strength, target_pos
+            )
+            return False, "LOW_EXPECTED_REWARD"
+        return True, "EXPECTED_REWARD_OK"
+
     def reset_trade_state(self, index: str, side: str, entry_price: float) -> None:
         now_ts = time.time()
         self.exit_confirm[index] = {"side": None, "count": 0, "first_ts": 0.0, "reason": None}
@@ -415,6 +441,9 @@ class TriWaveTickBrain:
                             cs["turn_up"], ps["turn_up"], cs["last_5_delta"], ps["last_5_delta"]
                         )
                         return self._signal(index, "NO_TRADE", None, 0.0, quality_reason, state)
+                    expected_ok, expected_reason = self._expected_move_filter(index, "CE", cs, ps)
+                    if not expected_ok:
+                        return self._signal(index, "NO_TRADE", None, 0.0, expected_reason, state)
                     if (now_ts - self.last_signal_ts.get(index, 0.0)) < self.ENTRY_COOLDOWN_SEC:
                         logger.info("TRI_WAVE_ENTRY_COOLDOWN | index=%s | side=CE | remaining=%.2f", index, self.ENTRY_COOLDOWN_SEC - (now_ts - self.last_signal_ts.get(index, 0.0)))
                         return self._signal(index, "NO_TRADE", None, 0.0, "ENTRY_COOLDOWN", state)
@@ -441,6 +470,9 @@ class TriWaveTickBrain:
                             cs["turn_up"], ps["turn_up"], cs["last_5_delta"], ps["last_5_delta"]
                         )
                         return self._signal(index, "NO_TRADE", None, 0.0, quality_reason, state)
+                    expected_ok, expected_reason = self._expected_move_filter(index, "PE", ps, cs)
+                    if not expected_ok:
+                        return self._signal(index, "NO_TRADE", None, 0.0, expected_reason, state)
                     if (now_ts - self.last_signal_ts.get(index, 0.0)) < self.ENTRY_COOLDOWN_SEC:
                         logger.info("TRI_WAVE_ENTRY_COOLDOWN | index=%s | side=PE | remaining=%.2f", index, self.ENTRY_COOLDOWN_SEC - (now_ts - self.last_signal_ts.get(index, 0.0)))
                         return self._signal(index, "NO_TRADE", None, 0.0, "ENTRY_COOLDOWN", state)
