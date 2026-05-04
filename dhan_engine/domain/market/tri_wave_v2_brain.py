@@ -18,6 +18,7 @@ class TriWavePositionState:
 class TriWaveV2Brain:
     MIN_BREATHING_HOLD_SEC=20;SOFT_EXIT_MIN_HOLD_SEC=45;NORMAL_EXIT_MIN_HOLD_SEC=60;PROFIT_EXIT_MIN_HOLD_SEC=45
     FAST_ADVERSE_PCT=-4.0;FAST_ADVERSE_MIN_HOLD_SEC=10;ADVERSE_EXIT_PCT=-2.0;ADVERSE_EXIT_MIN_HOLD_SEC=30
+    LOT_SIZE=65;ROUND_TRIP_FEE=60.0;MIN_NET_PROFIT_EXIT=100.0;MIN_GROSS_POINTS_FOR_PROFIT_EXIT=2.50
     TIME_LOSS_EXIT_SEC=120;TIME_LOSS_EXIT_PCT=-1.0;DEAD_TRADE_EXIT_SEC=180;DEAD_TRADE_MIN_PROFIT_PCT=0.20
     PROFIT_ARM_PCT=1.20;PROFIT_GIVEBACK_RATIO=0.50;MIN_PEAK_PNL_FOR_GIVEBACK_PCT=1.20;MAX_HOLD_SEC=600
     def __init__(self):
@@ -50,31 +51,44 @@ class TriWaveV2Brain:
         if not ce.stats or not pe.stats or not fut.stats: return TriWaveV2Signal()
         if active_position:
             side=active_position.get("side"); tgt=ce if side=="CE" else pe; p=self.pos[index]; entry=active_position.get("entry",p.entry_price or tgt.last_ltp); pnl=((tgt.last_ltp-entry)/max(entry,1e-9))*100.0; hold=now-float(active_position.get("entry_ts",p.entry_ts or now)); p.best_price=max(p.best_price,tgt.last_ltp); p.peak_pnl_pct=max(p.peak_pnl_pct,pnl)
-            fast_adverse_allowed=hold>=self.FAST_ADVERSE_MIN_HOLD_SEC and pnl<=self.FAST_ADVERSE_PCT
+            gross_points=tgt.last_ltp-entry; gross_rupees=gross_points*self.LOT_SIZE; net_rupees=gross_rupees-self.ROUND_TRIP_FEE
+            profit_enough=(net_rupees>=self.MIN_NET_PROFIT_EXIT or gross_points>=self.MIN_GROSS_POINTS_FOR_PROFIT_EXIT)
+            fast_adverse_allowed=hold>=self.FAST_ADVERSE_MIN_HOLD_SEC and pnl<=self.FAST_ADVERSE_PCT and tgt.last_ltp<entry
             if hold<self.MIN_BREATHING_HOLD_SEC:
                 candidate="FAST_ADVERSE" if pnl<=self.FAST_ADVERSE_PCT else "NONE"; allowed=(candidate=="FAST_ADVERSE" and fast_adverse_allowed); blocked_reason="BELOW_MIN_BREATHING_HOLD"
-                logger.info("TRI_WAVE_V2_EXIT_WATCH | index=%s | side=%s | hold=%.2f | pnl_pct=%.2f | peak_pnl_pct=%.2f | target_phase=%s | target_last5=%.2f | target_exh=%.2f | target_clean=%.2f | candidate=%s | allowed=%s | blocked_reason=%s | confirm=%s",index,side,hold,pnl,p.peak_pnl_pct,tgt.phase,tgt.stats.get("last_5_delta",0.0),tgt.stats.get("exhaustion_score",0.0),tgt.stats.get("clean_trade_score",0.0),candidate,allowed,blocked_reason,"NA")
+                if candidate=="FAST_ADVERSE" and tgt.last_ltp>=entry:
+                    logger.info("TRI_WAVE_V2_EXIT_BUG_BLOCKED | reason=FAST_ADVERSE_NOT_NEGATIVE | hold=%.2f | entry=%.2f | price=%.2f | pnl_pct=%.2f",hold,entry,tgt.last_ltp,pnl)
+                    allowed=False; blocked_reason="FAST_ADVERSE_NOT_NEGATIVE"
+                logger.info("TRI_WAVE_V2_EXIT_WATCH | index=%s | side=%s | hold=%.2f | pnl_pct=%.2f | peak_pnl_pct=%.2f | gross_points=%.2f | gross_rupees=%.2f | net_rupees=%.2f | target_phase=%s | target_last5=%.2f | target_exh=%.2f | target_clean=%.2f | candidate=%s | allowed=%s | blocked_reason=%s | confirm=%s",index,side,hold,pnl,p.peak_pnl_pct,gross_points,gross_rupees,net_rupees,tgt.phase,tgt.stats.get("last_5_delta",0.0),tgt.stats.get("exhaustion_score",0.0),tgt.stats.get("clean_trade_score",0.0),candidate,allowed,blocked_reason,"NA")
                 if fast_adverse_allowed: return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason="TRI_WAVE_V2_EXIT:FAST_ADVERSE",confidence=0.95)
                 return TriWaveV2Signal()
             reasons=[]
             if hold>=self.ADVERSE_EXIT_MIN_HOLD_SEC and pnl<=self.ADVERSE_EXIT_PCT: reasons.append("ADVERSE_MOVE")
             if hold>=self.TIME_LOSS_EXIT_SEC and pnl<=self.TIME_LOSS_EXIT_PCT: reasons.append("TIME_LOSS")
             if hold>=self.DEAD_TRADE_EXIT_SEC and pnl<self.DEAD_TRADE_MIN_PROFIT_PCT: reasons.append("DEAD_TRADE")
-            if hold>=self.SOFT_EXIT_MIN_HOLD_SEC and tgt.phase in {"EXHAUSTION","REVERSAL"} and tgt.stats.get("last_5_delta",0.0)<0 and (tgt.stats.get("exhaustion_score",0.0)>=0.55 or tgt.stats.get("clean_trade_score",1.0)<0.35): reasons.append("WAVE_EXHAUSTION")
+            if hold>=self.SOFT_EXIT_MIN_HOLD_SEC and pnl>0 and tgt.phase in {"EXHAUSTION","REVERSAL"} and tgt.stats.get("last_5_delta",0.0)<0 and (tgt.stats.get("exhaustion_score",0.0)>=0.55 or tgt.stats.get("clean_trade_score",1.0)<0.35): reasons.append("WAVE_PROFIT_EXHAUSTION")
+            if hold>=self.SOFT_EXIT_MIN_HOLD_SEC and pnl<=-1.0 and tgt.phase in {"EXHAUSTION","REVERSAL"} and tgt.stats.get("last_5_delta",0.0)<0: reasons.append("WAVE_FAILURE_EXIT")
             giveback=p.peak_pnl_pct-pnl
             if hold>=self.PROFIT_EXIT_MIN_HOLD_SEC and p.peak_pnl_pct>=self.MIN_PEAK_PNL_FOR_GIVEBACK_PCT and giveback>=p.peak_pnl_pct*self.PROFIT_GIVEBACK_RATIO: reasons.append("PROFIT_GIVEBACK")
             if hold>=self.MAX_HOLD_SEC: reasons.append("MAX_HOLD")
-            if hold<self.NORMAL_EXIT_MIN_HOLD_SEC: reasons=[r for r in reasons if r in {"ADVERSE_MOVE","PROFIT_GIVEBACK","WAVE_EXHAUSTION","MAX_HOLD","TIME_LOSS","DEAD_TRADE"}]
+            if hold<self.NORMAL_EXIT_MIN_HOLD_SEC: reasons=[r for r in reasons if r in {"ADVERSE_MOVE","PROFIT_GIVEBACK","WAVE_PROFIT_EXHAUSTION","WAVE_FAILURE_EXIT","MAX_HOLD","TIME_LOSS","DEAD_TRADE"}]
             candidate=reasons[0] if reasons else "NONE"; required=0.0; blocked_reason="NONE"; allowed=bool(reasons)
             if candidate=="ADVERSE_MOVE" and hold<self.ADVERSE_EXIT_MIN_HOLD_SEC: required=self.ADVERSE_EXIT_MIN_HOLD_SEC
-            elif candidate=="WAVE_EXHAUSTION" and hold<self.SOFT_EXIT_MIN_HOLD_SEC: required=self.SOFT_EXIT_MIN_HOLD_SEC
+            elif candidate in {"WAVE_PROFIT_EXHAUSTION","WAVE_FAILURE_EXIT"} and hold<self.SOFT_EXIT_MIN_HOLD_SEC: required=self.SOFT_EXIT_MIN_HOLD_SEC
             elif candidate=="PROFIT_GIVEBACK" and hold<self.PROFIT_EXIT_MIN_HOLD_SEC: required=self.PROFIT_EXIT_MIN_HOLD_SEC
             elif hold<self.MIN_BREATHING_HOLD_SEC: required=self.MIN_BREATHING_HOLD_SEC
+            if candidate=="FAST_ADVERSE" and tgt.last_ltp>=entry:
+                logger.info("TRI_WAVE_V2_EXIT_BUG_BLOCKED | reason=FAST_ADVERSE_NOT_NEGATIVE | hold=%.2f | entry=%.2f | price=%.2f | pnl_pct=%.2f",hold,entry,tgt.last_ltp,pnl)
+                allowed=False; blocked_reason="FAST_ADVERSE_NOT_NEGATIVE"
+            if candidate in {"PROFIT_GIVEBACK","WAVE_PROFIT_EXHAUSTION"} or (candidate=="FLOW_QUALITY_COLLAPSE" and pnl>0):
+                if not profit_enough:
+                    allowed=False; blocked_reason="PROFIT_BELOW_FEES"
+                    logger.info("TRI_WAVE_V2_PROFIT_EXIT_BLOCKED_BY_FEES | index=%s | side=%s | candidate=%s | gross_rupees=%.2f | net_rupees=%.2f | gross_points=%.2f | required_net=%.2f",index,side,candidate,gross_rupees,net_rupees,gross_points,self.MIN_NET_PROFIT_EXIT)
             if required>0 and hold<required:
                 allowed=False; blocked_reason="EXIT_TOO_EARLY"
                 logger.info("TRI_WAVE_V2_EXIT_BLOCKED | reason=EXIT_TOO_EARLY | candidate=%s | hold=%.2f | required=%.2f | pnl_pct=%.2f | peak_pnl_pct=%.2f",candidate,hold,required,pnl,p.peak_pnl_pct)
             if (now-self._last_visual[index]>=3) or reasons:
-                logger.info("TRI_WAVE_V2_EXIT_WATCH | index=%s | side=%s | hold=%.2f | pnl_pct=%.2f | peak_pnl_pct=%.2f | target_phase=%s | target_last5=%.2f | target_exh=%.2f | target_clean=%.2f | candidate=%s | allowed=%s | blocked_reason=%s | confirm=%s",index,side,hold,pnl,p.peak_pnl_pct,tgt.phase,tgt.stats.get("last_5_delta",0.0),tgt.stats.get("exhaustion_score",0.0),tgt.stats.get("clean_trade_score",0.0),candidate,allowed,blocked_reason,self._exit_conf.get(f"{index}:{side}:{candidate}",0))
+                logger.info("TRI_WAVE_V2_EXIT_WATCH | index=%s | side=%s | hold=%.2f | pnl_pct=%.2f | peak_pnl_pct=%.2f | gross_points=%.2f | gross_rupees=%.2f | net_rupees=%.2f | target_phase=%s | target_last5=%.2f | target_exh=%.2f | target_clean=%.2f | candidate=%s | allowed=%s | blocked_reason=%s | confirm=%s",index,side,hold,pnl,p.peak_pnl_pct,gross_points,gross_rupees,net_rupees,tgt.phase,tgt.stats.get("last_5_delta",0.0),tgt.stats.get("exhaustion_score",0.0),tgt.stats.get("clean_trade_score",0.0),candidate,allowed,blocked_reason,self._exit_conf.get(f"{index}:{side}:{candidate}",0))
                 self._last_visual[index]=now
             if reasons and allowed:
                 key=f"{index}:{side}:{candidate}"; self._exit_conf[key]+=1

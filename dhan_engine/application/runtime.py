@@ -140,9 +140,9 @@ class TradingRuntimeCoordinator:
         self._tick_exit_guard: Dict[int, dict] = {}
         self.tri_wave_brain = TriWaveTickBrain(debug=True)
         self.tri_wave_v2_brain = TriWaveV2Brain()
-        self.tri_wave_last_exit_ts: Dict[str, float] = {}
-        self.tri_wave_last_exit_reason: Dict[str, str] = {}
-        self.tri_wave_last_exit_net_pnl: Dict[str, float] = {}
+        self.tri_wave_v2_last_exit_ts: Dict[str, float] = {}
+        self.tri_wave_v2_last_exit_reason: Dict[str, str] = {}
+        self.tri_wave_v2_last_exit_net_pnl: Dict[str, float] = {}
         self.tri_wave_peak_realized_pnl: Dict[str, float] = defaultdict(float)
         self.tri_wave_trading_halted_for_day: Dict[str, bool] = defaultdict(bool)
 
@@ -665,10 +665,10 @@ class TradingRuntimeCoordinator:
         return True
 
     def _record_tri_wave_exit(self, index: str, reason: str) -> None:
-        self.tri_wave_last_exit_ts[index] = time.time()
-        self.tri_wave_last_exit_reason[index] = str(reason)
+        self.tri_wave_v2_last_exit_ts[index] = time.time()
+        self.tri_wave_v2_last_exit_reason[index] = str(reason)
         net_pnl = float((self.paper_trader.last_trade_summary or {}).get("net_pnl", 0.0) or 0.0)
-        self.tri_wave_last_exit_net_pnl[index] = net_pnl
+        self.tri_wave_v2_last_exit_net_pnl[index] = net_pnl
 
     def _should_block_tri_wave_entry(self, index: str, action: str) -> bool:
         now_ts = time.time()
@@ -708,21 +708,31 @@ class TradingRuntimeCoordinator:
             )
             return True
 
-        last_exit_ts = self.tri_wave_last_exit_ts.get(index)
+        fees_paid = float(getattr(self.paper_trader, "fees_paid_today", 0.0) or getattr(self.paper_trader, "fees_paid", 0.0) or 0.0)
+        if (fees_paid >= 900 and current_pnl <= 0) or (opened_today >= 15 and current_pnl <= 0):
+            logger.info(
+                "TRI_WAVE_V2_FEE_GUARD_BLOCK | fees_paid=%.2f | opened_today=%s | net_pnl_after_fees=%.2f",
+                fees_paid, opened_today, current_pnl
+            )
+            return True
+
+        last_exit_ts = self.tri_wave_v2_last_exit_ts.get(index)
         if last_exit_ts:
             elapsed = now_ts - float(last_exit_ts)
-            last_reason = str(self.tri_wave_last_exit_reason.get(index, "UNKNOWN"))
-            last_net = float(self.tri_wave_last_exit_net_pnl.get(index, 0.0))
+            last_reason = str(self.tri_wave_v2_last_exit_reason.get(index, "UNKNOWN"))
+            last_net = float(self.tri_wave_v2_last_exit_net_pnl.get(index, 0.0))
             required = self.TRI_WAVE_REENTRY_COOLDOWN_SEC
-            reason_u = last_reason.upper()
-            if last_net <= 0 or "LOSS" in reason_u or "ADVERSE" in reason_u:
-                required = self.TRI_WAVE_LOSS_REENTRY_COOLDOWN_SEC
-            elif last_net > 0:
+            if last_net > 0:
                 required = self.TRI_WAVE_PROFIT_REENTRY_COOLDOWN_SEC
+            elif last_net <= 0:
+                required = self.TRI_WAVE_LOSS_REENTRY_COOLDOWN_SEC
+            reason_u = last_reason.upper()
+            if last_net <= 0 and ("PROFIT" in reason_u or "GIVEBACK" in reason_u or "EXHAUSTION" in reason_u):
+                required = max(required, 120)
             if elapsed < required:
                 logger.info(
-                    "TRI_WAVE_ENTRY_COOLDOWN_BLOCK | index=%s | action=%s | elapsed=%.2f | required=%.2f | last_exit_reason=%s",
-                    index, action, elapsed, required, last_reason
+                    "TRI_WAVE_V2_ENTRY_COOLDOWN_BLOCK | index=%s | elapsed=%.2f | required=%.2f | last_exit_reason=%s | last_net_pnl=%.2f",
+                    index, elapsed, required, last_reason, last_net
                 )
                 return True
         return False
