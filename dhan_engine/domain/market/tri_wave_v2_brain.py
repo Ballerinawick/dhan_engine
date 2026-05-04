@@ -16,7 +16,10 @@ class TriWavePositionState:
     active_side:Optional[str]=None; entry_price:float=0.0; entry_ts:float=0.0; best_price:float=0.0; worst_price:float=0.0; peak_pnl_pct:float=0.0; owner:str="TRI_WAVE_V2"
 
 class TriWaveV2Brain:
-    MIN_BREATHING_HOLD_SEC=20;EARLY_FAST_ADVERSE_HOLD_SEC=10;FAST_ADVERSE_PCT=-4.0;ADVERSE_EXIT_PCT=-2.0;TIME_LOSS_EXIT_SEC=120;TIME_LOSS_EXIT_PCT=-1.0;DEAD_TRADE_EXIT_SEC=180;DEAD_TRADE_MIN_PROFIT_PCT=0.20;PROFIT_ARM_PCT=1.20;PROFIT_GIVEBACK_PCT=0.50;MAX_HOLD_SEC=600
+    MIN_BREATHING_HOLD_SEC=20;SOFT_EXIT_MIN_HOLD_SEC=45;NORMAL_EXIT_MIN_HOLD_SEC=60;PROFIT_EXIT_MIN_HOLD_SEC=45
+    FAST_ADVERSE_PCT=-4.0;FAST_ADVERSE_MIN_HOLD_SEC=10;ADVERSE_EXIT_PCT=-2.0;ADVERSE_EXIT_MIN_HOLD_SEC=30
+    TIME_LOSS_EXIT_SEC=120;TIME_LOSS_EXIT_PCT=-1.0;DEAD_TRADE_EXIT_SEC=180;DEAD_TRADE_MIN_PROFIT_PCT=0.20
+    PROFIT_ARM_PCT=1.20;PROFIT_GIVEBACK_RATIO=0.50;MIN_PEAK_PNL_FOR_GIVEBACK_PCT=1.20;MAX_HOLD_SEC=600
     def __init__(self):
         self.streams=defaultdict(lambda:{k:TriWaveStreamState(stream=k) for k in ("FUT","CE","PE")}); self.pos=defaultdict(TriWavePositionState); self._exit_conf=defaultdict(int); self._last_wait_log=defaultdict(float); self._last_visual=defaultdict(float)
     def _update(self,index,stream,secid,ltp,features):
@@ -47,18 +50,35 @@ class TriWaveV2Brain:
         if not ce.stats or not pe.stats or not fut.stats: return TriWaveV2Signal()
         if active_position:
             side=active_position.get("side"); tgt=ce if side=="CE" else pe; p=self.pos[index]; entry=active_position.get("entry",p.entry_price or tgt.last_ltp); pnl=((tgt.last_ltp-entry)/max(entry,1e-9))*100.0; hold=now-float(active_position.get("entry_ts",p.entry_ts or now)); p.best_price=max(p.best_price,tgt.last_ltp); p.peak_pnl_pct=max(p.peak_pnl_pct,pnl)
-            if hold>=10 and pnl<=-4: return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason="TRI_WAVE_V2_EXIT:FAST_ADVERSE",confidence=0.95)
-            if hold<20: logger.info("TRI_WAVE_V2_EXIT_GUARD | index=%s | side=%s | hold=%.2f | pnl_pct=%.2f",index,side,hold,pnl); return TriWaveV2Signal()
+            fast_adverse_allowed=hold>=self.FAST_ADVERSE_MIN_HOLD_SEC and pnl<=self.FAST_ADVERSE_PCT
+            if hold<self.MIN_BREATHING_HOLD_SEC:
+                candidate="FAST_ADVERSE" if pnl<=self.FAST_ADVERSE_PCT else "NONE"; allowed=(candidate=="FAST_ADVERSE" and fast_adverse_allowed); blocked_reason="BELOW_MIN_BREATHING_HOLD"
+                logger.info("TRI_WAVE_V2_EXIT_WATCH | index=%s | side=%s | hold=%.2f | pnl_pct=%.2f | peak_pnl_pct=%.2f | target_phase=%s | target_last5=%.2f | target_exh=%.2f | target_clean=%.2f | candidate=%s | allowed=%s | blocked_reason=%s | confirm=%s",index,side,hold,pnl,p.peak_pnl_pct,tgt.phase,tgt.stats.get("last_5_delta",0.0),tgt.stats.get("exhaustion_score",0.0),tgt.stats.get("clean_trade_score",0.0),candidate,allowed,blocked_reason,"NA")
+                if fast_adverse_allowed: return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason="TRI_WAVE_V2_EXIT:FAST_ADVERSE",confidence=0.95)
+                return TriWaveV2Signal()
             reasons=[]
-            if pnl<=-2: reasons.append("ADVERSE_MOVE")
-            if hold>=120 and pnl<=-1: reasons.append("TIME_LOSS")
-            if hold>=180 and pnl<0.2: reasons.append("DEAD_TRADE")
-            if tgt.phase in {"EXHAUSTION","REVERSAL"}: reasons.append("WAVE_EXHAUSTION")
-            if p.peak_pnl_pct>=1.2 and (p.peak_pnl_pct-pnl)>=p.peak_pnl_pct*0.5: reasons.append("PROFIT_GIVEBACK")
-            if hold>=600: reasons.append("MAX_HOLD")
-            if reasons:
-                key=f"{index}:{side}:{reasons[0]}"; self._exit_conf[key]+=1
-                if self._exit_conf[key]>=2: self._exit_conf[key]=0; return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason=f"TRI_WAVE_V2_EXIT:{reasons[0]}",confidence=0.8)
+            if hold>=self.ADVERSE_EXIT_MIN_HOLD_SEC and pnl<=self.ADVERSE_EXIT_PCT: reasons.append("ADVERSE_MOVE")
+            if hold>=self.TIME_LOSS_EXIT_SEC and pnl<=self.TIME_LOSS_EXIT_PCT: reasons.append("TIME_LOSS")
+            if hold>=self.DEAD_TRADE_EXIT_SEC and pnl<self.DEAD_TRADE_MIN_PROFIT_PCT: reasons.append("DEAD_TRADE")
+            if hold>=self.SOFT_EXIT_MIN_HOLD_SEC and tgt.phase in {"EXHAUSTION","REVERSAL"} and tgt.stats.get("last_5_delta",0.0)<0 and (tgt.stats.get("exhaustion_score",0.0)>=0.55 or tgt.stats.get("clean_trade_score",1.0)<0.35): reasons.append("WAVE_EXHAUSTION")
+            giveback=p.peak_pnl_pct-pnl
+            if hold>=self.PROFIT_EXIT_MIN_HOLD_SEC and p.peak_pnl_pct>=self.MIN_PEAK_PNL_FOR_GIVEBACK_PCT and giveback>=p.peak_pnl_pct*self.PROFIT_GIVEBACK_RATIO: reasons.append("PROFIT_GIVEBACK")
+            if hold>=self.MAX_HOLD_SEC: reasons.append("MAX_HOLD")
+            if hold<self.NORMAL_EXIT_MIN_HOLD_SEC: reasons=[r for r in reasons if r in {"ADVERSE_MOVE","PROFIT_GIVEBACK","WAVE_EXHAUSTION","MAX_HOLD","TIME_LOSS","DEAD_TRADE"}]
+            candidate=reasons[0] if reasons else "NONE"; required=0.0; blocked_reason="NONE"; allowed=bool(reasons)
+            if candidate=="ADVERSE_MOVE" and hold<self.ADVERSE_EXIT_MIN_HOLD_SEC: required=self.ADVERSE_EXIT_MIN_HOLD_SEC
+            elif candidate=="WAVE_EXHAUSTION" and hold<self.SOFT_EXIT_MIN_HOLD_SEC: required=self.SOFT_EXIT_MIN_HOLD_SEC
+            elif candidate=="PROFIT_GIVEBACK" and hold<self.PROFIT_EXIT_MIN_HOLD_SEC: required=self.PROFIT_EXIT_MIN_HOLD_SEC
+            elif hold<self.MIN_BREATHING_HOLD_SEC: required=self.MIN_BREATHING_HOLD_SEC
+            if required>0 and hold<required:
+                allowed=False; blocked_reason="EXIT_TOO_EARLY"
+                logger.info("TRI_WAVE_V2_EXIT_BLOCKED | reason=EXIT_TOO_EARLY | candidate=%s | hold=%.2f | required=%.2f | pnl_pct=%.2f | peak_pnl_pct=%.2f",candidate,hold,required,pnl,p.peak_pnl_pct)
+            if (now-self._last_visual[index]>=3) or reasons:
+                logger.info("TRI_WAVE_V2_EXIT_WATCH | index=%s | side=%s | hold=%.2f | pnl_pct=%.2f | peak_pnl_pct=%.2f | target_phase=%s | target_last5=%.2f | target_exh=%.2f | target_clean=%.2f | candidate=%s | allowed=%s | blocked_reason=%s | confirm=%s",index,side,hold,pnl,p.peak_pnl_pct,tgt.phase,tgt.stats.get("last_5_delta",0.0),tgt.stats.get("exhaustion_score",0.0),tgt.stats.get("clean_trade_score",0.0),candidate,allowed,blocked_reason,self._exit_conf.get(f"{index}:{side}:{candidate}",0))
+                self._last_visual[index]=now
+            if reasons and allowed:
+                key=f"{index}:{side}:{candidate}"; self._exit_conf[key]+=1
+                if self._exit_conf[key]>=2: self._exit_conf[key]=0; return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason=f"TRI_WAVE_V2_EXIT:{candidate}",confidence=0.8)
             return TriWaveV2Signal()
         ce_ok=(ce.phase in {"RECOVERY","EXPANSION"} and ce.prev_phase in {"PULLBACK","REVERSAL","NOISE","INIT"} and ce.stats["position_in_range"]<0.78 and ce.stats["clean_trade_score"]>=0.45 and (ce.stats["recovery_score"]>=0.40 or sum([ce.stats["flow"]>0,ce.stats["ofi"]>0,ce.stats["depth_imbalance_5"]>0])>=2) and not (pe.phase=="EXPANSION" and pe.stats["strength"]>0.25) and (fut.stats["strength"]>=0.10 or fut.phase in {"RECOVERY","EXPANSION"}))
         pe_ok=(pe.phase in {"RECOVERY","EXPANSION"} and pe.prev_phase in {"PULLBACK","REVERSAL","NOISE","INIT"} and pe.stats["position_in_range"]<0.78 and pe.stats["clean_trade_score"]>=0.45 and (pe.stats["recovery_score"]>=0.40 or sum([pe.stats["flow"]>0,pe.stats["ofi"]>0,pe.stats["depth_imbalance_5"]>0])>=2) and not (ce.phase=="EXPANSION" and ce.stats["strength"]>0.25) and (fut.stats["strength"]<=-0.10 or fut.phase in {"PULLBACK","REVERSAL"}))
