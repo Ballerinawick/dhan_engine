@@ -21,8 +21,9 @@ class TriWaveV2Brain:
     LOT_SIZE=65;ROUND_TRIP_FEE=60.0;MIN_NET_PROFIT_EXIT=100.0;MIN_GROSS_POINTS_FOR_PROFIT_EXIT=2.50
     TIME_LOSS_EXIT_SEC=120;TIME_LOSS_EXIT_PCT=-1.0;DEAD_TRADE_EXIT_SEC=180;DEAD_TRADE_MIN_PROFIT_PCT=0.20
     PROFIT_ARM_PCT=1.20;PROFIT_GIVEBACK_RATIO=0.50;MIN_PEAK_PNL_FOR_GIVEBACK_PCT=1.20;MAX_HOLD_SEC=600
+    ENTRY_CONFIRM_TICKS=3;ENTRY_CONFIRM_MAX_WINDOW_SEC=8;ENTRY_CONFIRM_MIN_INTERVAL_SEC=0.8;ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC=2.0
     def __init__(self):
-        self.streams=defaultdict(lambda:{k:TriWaveStreamState(stream=k) for k in ("FUT","CE","PE")}); self.pos=defaultdict(TriWavePositionState); self._exit_conf=defaultdict(int); self._last_wait_log=defaultdict(float); self._last_visual=defaultdict(float)
+        self.streams=defaultdict(lambda:{k:TriWaveStreamState(stream=k) for k in ("FUT","CE","PE")}); self.pos=defaultdict(TriWavePositionState); self._exit_conf=defaultdict(int); self._last_wait_log=defaultdict(float); self._last_visual=defaultdict(float); self._entry_confirm=defaultdict(lambda:{"side":None,"count":0,"first_ts":0.0,"last_ts":0.0,"last_reason":None})
     def _update(self,index,stream,secid,ltp,features):
         s=self.streams[index][stream]; s.secid=int(secid); s.last_ltp=float(ltp); s.ticks.append(float(ltp))
         p=list(s.ticks); n=len(p); rng=max(max(p)-min(p),0.01) if p else 1.0
@@ -52,10 +53,12 @@ class TriWaveV2Brain:
     def on_option_tick(self,index,side,secid,ltp,features): self._update(index,side,secid,ltp,features or {})
     def reset_trade_state(self,index,side,entry_price): self.pos[index]=TriWavePositionState(active_side=side,entry_price=entry_price,entry_ts=time.time(),best_price=entry_price,worst_price=entry_price)
     def clear_trade_state(self,index): self.pos[index]=TriWavePositionState()
-    def _entry_check(self, side, fut, ce, pe):
+    def _entry_check(self, side, fut, ce, pe, now):
         if side=="CE":
             if ce.phase not in {"RECOVERY","EXPANSION"}: return False,"CE_PHASE_NOT_READY"
+            if ce.phase in {"RECOVERY","EXPANSION"} and (now-ce.phase_ts)<self.ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC: return False,"CE_RECOVERY_TOO_NEW"
             if ce.prev_phase not in {"PULLBACK","REVERSAL","NOISE","INIT"}: return False,"CE_NOT_FRESH_TURN"
+            if ce.stats["last_5_delta"]<=0 or ce.stats["velocity"]<0: return False,"CE_NO_PRICE_FOLLOW_THROUGH"
             if ce.stats["position_in_range"]>=0.78: return False,"CE_TOP_ZONE"
             if ce.stats["clean_trade_score"]<0.45: return False,"CE_CLEAN_LOW"
             if not (ce.stats["recovery_score"]>=0.40 or sum([ce.stats["flow"]>0,ce.stats["ofi"]>0,ce.stats["depth_imbalance_5"]>0])>=2): return False,"CE_RECOVERY_LOW"
@@ -63,13 +66,26 @@ class TriWaveV2Brain:
             if not (fut.stats["strength"]>=0.10 or fut.phase in {"RECOVERY","EXPANSION"}): return False,"FUT_NOT_SUPPORTING_CE"
             return True,"CE_OK"
         if pe.phase not in {"RECOVERY","EXPANSION"}: return False,"PE_PHASE_NOT_READY"
+        if pe.phase in {"RECOVERY","EXPANSION"} and (now-pe.phase_ts)<self.ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC: return False,"PE_RECOVERY_TOO_NEW"
         if pe.prev_phase not in {"PULLBACK","REVERSAL","NOISE","INIT"}: return False,"PE_NOT_FRESH_TURN"
+        if pe.stats["last_5_delta"]<=0 or pe.stats["velocity"]<0: return False,"PE_NO_PRICE_FOLLOW_THROUGH"
         if pe.stats["position_in_range"]>=0.78: return False,"PE_TOP_ZONE"
         if pe.stats["clean_trade_score"]<0.45: return False,"PE_CLEAN_LOW"
         if not (pe.stats["recovery_score"]>=0.40 or sum([pe.stats["flow"]>0,pe.stats["ofi"]>0,pe.stats["depth_imbalance_5"]>0])>=2): return False,"PE_RECOVERY_LOW"
         if ce.phase=="EXPANSION" and ce.stats["strength"]>0.25: return False,"CE_OPPOSITE_EXPANDING"
         if not (fut.stats["strength"]<=-0.10 or fut.phase in {"PULLBACK","REVERSAL"}): return False,"FUT_NOT_SUPPORTING_PE"
         return True,"PE_OK"
+
+
+    def _confirm_entry(self,index:str,side:str,reason:str,now:float)->tuple[bool,int]:
+        state=self._entry_confirm[index]
+        if state["side"]!=side or state["last_reason"]!=reason:
+            state["side"]=side; state["count"]=0; state["first_ts"]=now; state["last_ts"]=0.0; state["last_reason"]=reason
+        if now-state["first_ts"]>self.ENTRY_CONFIRM_MAX_WINDOW_SEC:
+            state["count"]=0; state["first_ts"]=now; state["last_ts"]=0.0
+        if state.get("last_ts",0.0) and now-state["last_ts"]<self.ENTRY_CONFIRM_MIN_INTERVAL_SEC: return False,state["count"]
+        state["count"]+=1; state["last_ts"]=now
+        return state["count"]>=self.ENTRY_CONFIRM_TICKS,state["count"]
 
     def evaluate(self,index,active_position=None):
         fut,ce,pe=[self.streams[index][x] for x in ("FUT","CE","PE")]; now=time.time()
@@ -119,15 +135,32 @@ class TriWaveV2Brain:
                 key=f"{index}:{side}:{candidate}"; self._exit_conf[key]+=1
                 if self._exit_conf[key]>=2: self._exit_conf[key]=0; return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason=f"TRI_WAVE_V2_EXIT:{candidate}",confidence=0.8)
             return TriWaveV2Signal()
-        ce_ok,ce_reason=self._entry_check("CE",fut,ce,pe)
-        pe_ok,pe_reason=self._entry_check("PE",fut,ce,pe)
+        ce_ok,ce_reason=self._entry_check("CE",fut,ce,pe,now)
+        pe_ok,pe_reason=self._entry_check("PE",fut,ce,pe,now)
         if now-self._last_wait_log[index]>=5:
             self._last_wait_log[index]=now; logger.info("TRI_WAVE_V2_ENTRY_BLOCK | index=%s | ce_ok=%s | ce_reason=%s | pe_ok=%s | pe_reason=%s | fut_phase=%s | fut_strength=%.2f | ce_phase=%s | ce_prev=%s | ce_pos=%.2f | ce_rec=%.2f | ce_clean=%.2f | ce_flow=%.2f | ce_ofi=%.2f | ce_imb=%.2f | ce_source=%s | pe_phase=%s | pe_prev=%s | pe_pos=%.2f | pe_rec=%.2f | pe_clean=%.2f | pe_flow=%.2f | pe_ofi=%.2f | pe_imb=%.2f | pe_source=%s",index,ce_ok,ce_reason,pe_ok,pe_reason,fut.phase,fut.stats.get("strength",0.0),ce.phase,ce.prev_phase,ce.stats["position_in_range"],ce.stats["recovery_score"],ce.stats["clean_trade_score"],ce.stats["flow"],ce.stats["ofi"],ce.stats["depth_imbalance_5"],ce.stats.get("feature_source","UNKNOWN"),pe.phase,pe.prev_phase,pe.stats["position_in_range"],pe.stats["recovery_score"],pe.stats["clean_trade_score"],pe.stats["flow"],pe.stats["ofi"],pe.stats["depth_imbalance_5"],pe.stats.get("feature_source","UNKNOWN"))
         if not ce_ok and not pe_ok:
+            self._entry_confirm[index]={"side":None,"count":0,"first_ts":0.0,"last_ts":0.0,"last_reason":None}
             return TriWaveV2Signal()
         if now-self._last_visual[index]>=5:
             self._last_visual[index]=now; logger.info("TRI_WAVE_V2_VISUAL | index=%s | FUT phase=%s strength=%.2f | CE phase=%s ltp=%.2f pos=%.2f rec=%.2f exh=%.2f clean=%.2f | PE phase=%s ltp=%.2f pos=%.2f rec=%.2f exh=%.2f clean=%.2f | active=%s pnl_pct=%.2f",index,fut.phase,fut.stats['strength'],ce.phase,ce.last_ltp,ce.stats['position_in_range'],ce.stats['recovery_score'],ce.stats['exhaustion_score'],ce.stats['clean_trade_score'],pe.phase,pe.last_ltp,pe.stats['position_in_range'],pe.stats['recovery_score'],pe.stats['exhaustion_score'],pe.stats['clean_trade_score'],"NONE",0.0)
-        if ce_ok and not pe_ok: return TriWaveV2Signal(action="BUY_CE",side="CE",reason="TRI_WAVE_V2_ENTRY:CE_WAVE_RECOVERY",confidence=0.8)
-        if pe_ok and not ce_ok: return TriWaveV2Signal(action="BUY_PE",side="PE",reason="TRI_WAVE_V2_ENTRY:PE_WAVE_RECOVERY",confidence=0.8)
+        if ce_ok and not pe_ok:
+            confirmed,count=self._confirm_entry(index,"CE",ce_reason,now)
+            if not confirmed:
+                logger.info("TRI_WAVE_V2_ENTRY_CONFIRM_WAIT | index=%s | side=CE | count=%s | required=%s | reason=%s | phase=%s | pos=%.2f | rec=%.2f | clean=%.2f | flow=%.2f | ofi=%.2f",index,count,self.ENTRY_CONFIRM_TICKS,ce_reason,ce.phase,ce.stats["position_in_range"],ce.stats["recovery_score"],ce.stats["clean_trade_score"],ce.stats["flow"],ce.stats["ofi"])
+                return TriWaveV2Signal()
+            return TriWaveV2Signal(action="BUY_CE",side="CE",reason="TRI_WAVE_V2_ENTRY:CE_WAVE_RECOVERY",confidence=0.8)
+        if pe_ok and not ce_ok:
+            confirmed,count=self._confirm_entry(index,"PE",pe_reason,now)
+            if not confirmed:
+                logger.info("TRI_WAVE_V2_ENTRY_CONFIRM_WAIT | index=%s | side=PE | count=%s | required=%s | reason=%s | phase=%s | pos=%.2f | rec=%.2f | clean=%.2f | flow=%.2f | ofi=%.2f",index,count,self.ENTRY_CONFIRM_TICKS,pe_reason,pe.phase,pe.stats["position_in_range"],pe.stats["recovery_score"],pe.stats["clean_trade_score"],pe.stats["flow"],pe.stats["ofi"])
+                return TriWaveV2Signal()
+            return TriWaveV2Signal(action="BUY_PE",side="PE",reason="TRI_WAVE_V2_ENTRY:PE_WAVE_RECOVERY",confidence=0.8)
         best="CE" if (ce.stats["recovery_score"],ce.stats["clean_trade_score"],-ce.stats["position_in_range"])> (pe.stats["recovery_score"],pe.stats["clean_trade_score"],-pe.stats["position_in_range"]) else "PE"
+        reason=ce_reason if best=="CE" else pe_reason
+        confirmed,count=self._confirm_entry(index,best,reason,now)
+        target=ce if best=="CE" else pe
+        if not confirmed:
+            logger.info("TRI_WAVE_V2_ENTRY_CONFIRM_WAIT | index=%s | side=%s | count=%s | required=%s | reason=%s | phase=%s | pos=%.2f | rec=%.2f | clean=%.2f | flow=%.2f | ofi=%.2f",index,best,count,self.ENTRY_CONFIRM_TICKS,reason,target.phase,target.stats["position_in_range"],target.stats["recovery_score"],target.stats["clean_trade_score"],target.stats["flow"],target.stats["ofi"])
+            return TriWaveV2Signal()
         return TriWaveV2Signal(action=f"BUY_{best}",side=best,reason=f"TRI_WAVE_V2_ENTRY:{best}_WAVE_RECOVERY",confidence=0.78)
