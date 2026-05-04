@@ -50,7 +50,7 @@ class TradingRuntimeCoordinator:
     FLOW_REVERSAL_CONFIRM_MIN_INTERVAL_SEC = 1.0
     FLOW_REVERSAL_DECISION_COOLDOWN_SEC = 1.0
     PREMATURE_EXIT_THRESHOLD_SEC = 20
-    TRI_WAVE_ONLY_MODE = True
+    TRI_WAVE_ONLY_MODE = False
     TRI_WAVE_V2_ONLY_MODE = True
     TRI_WAVE_REENTRY_COOLDOWN_SEC = 90
     TRI_WAVE_LOSS_REENTRY_COOLDOWN_SEC = 180
@@ -121,6 +121,9 @@ class TradingRuntimeCoordinator:
         self.future_index_by_secid: Dict[int, str] = {}
         self.option_index_by_secid: Dict[int, str] = {}
         self.full_quote_secid_tag: Dict[int, str] = {}
+        self.latest_full_features_by_secid: Dict[int, dict] = {}
+        self.latest_full_raw_by_secid: Dict[int, dict] = {}
+        self.latest_depth_features_by_secid: Dict[int, dict] = {}
 
         self.premium_flow = {
             "CE": {"ltp": 0.0, "prev": 0.0, "velocity": 0.0},
@@ -156,6 +159,9 @@ class TradingRuntimeCoordinator:
     def run(self) -> None:
         logger.info("MODE: FUTURE_WS_STREAM + OPTION_WS_STREAM + OPTION_DEPTH_STREAM")
         logger.info("TRI_WAVE_BRAIN_VERSION | production_dynamic_exit_v3 | owner_locked=True | legacy_exit_skip=True | weak_exit_removed=True | static_40s_disabled_for_triwave=True")
+        if self.TRI_WAVE_V2_ONLY_MODE:
+            logger.info("TRI_WAVE_V2_ONLY_MODE_ACTIVE")
+            logger.info("LEGACY_SYSTEM_SKIPPED_BY_TRI_WAVE_V2_ONLY")
 
         self._configure_underlying_contracts()
         if self.future_quote_stream is None:
@@ -341,8 +347,25 @@ class TradingRuntimeCoordinator:
                     "ask_qty": list(getattr(depth, "ask_qty", []) or []),
                 }
             )
+            features = getattr(depth, "features", None) or {}
+            raw_full = getattr(depth, "raw", None) or {}
+            self.latest_full_features_by_secid[int(secid)] = dict(features)
+            self.latest_full_raw_by_secid[int(secid)] = dict(raw_full)
+
             if self.TRI_WAVE_V2_ONLY_MODE:
-                self.tri_wave_v2_brain.on_future_tick(index=index, secid=int(secid), ltp=float(ltp), features=getattr(depth, "features", {}) or self.pairs[index].underlying_quote)
+                if time.time() - getattr(self, "_last_v2_fut_route_log", 0.0) >= 5.0:
+                    self._last_v2_fut_route_log = time.time()
+                    logger.info(
+                        "TRI_WAVE_V2_FULL_FEATURE_ROUTE | stream=FUT | index=%s | secid=%s | ltp=%.2f | feature_keys=%s | recovery=%.2f | clean=%.2f | flow=%.2f | ofi=%.2f | volume_change=%s | oi_change=%s",
+                        index, secid, float(ltp), sorted(features.keys()),
+                        float(features.get("recovery_score", 0.0) or 0.0),
+                        float(features.get("clean_trade_score", 0.0) or 0.0),
+                        float(features.get("flow", 0.0) or 0.0),
+                        float(features.get("ofi", 0.0) or 0.0),
+                        features.get("volume_change_tick"),
+                        features.get("oi_change_tick"),
+                    )
+                self.tri_wave_v2_brain.on_future_tick(index=index, secid=int(secid), ltp=float(ltp), features=features or self.pairs[index].underlying_quote)
             else:
                 self.tri_wave_brain.on_future_tick(
                     index=index,
@@ -454,15 +477,22 @@ class TradingRuntimeCoordinator:
                 return
             pair.update_option_ltp(int(secid), float(ltp))
 
+            features = dict(getattr(depth, "features", None) or {})
+            raw_full = dict(getattr(depth, "raw", None) or {})
+            self.latest_full_features_by_secid[int(secid)] = dict(features)
+            self.latest_full_raw_by_secid[int(secid)] = dict(raw_full)
+
             existing = pair.ce_depth if int(secid) == pair.ce_id else pair.pe_depth if int(secid) == pair.pe_id else None
-            if not existing:
-                return
-            raw = dict(existing)
-            raw["ltp"] = float(ltp)
-            raw["secid"] = int(secid)
-            raw["tag"] = str(tag)
-            raw["ts"] = time.time()
-            self._process_option_update(index, pair, int(secid), str(tag), raw)
+            merged = {}
+            merged.update(features)
+            for k, v in (existing or {}).items():
+                merged.setdefault(k, v)
+            merged["ltp"] = float(ltp)
+            merged["secid"] = int(secid)
+            merged["tag"] = str(tag)
+            merged["ts"] = time.time()
+            merged["feature_source"] = "FULL_QUOTE_PRIMARY"
+            self._process_option_update(index, pair, int(secid), str(tag), merged)
 
     def on_option_depth(self, secid: int, tag: str, bid, ask) -> None:
         if not self.market_open():
@@ -472,9 +502,18 @@ class TradingRuntimeCoordinator:
         if not raw:
             return
 
-        raw["secid"] = int(secid)
-        raw["tag"] = str(tag)
-        raw["ts"] = time.time()
+        secid = int(secid)
+        self.latest_depth_features_by_secid[secid] = dict(raw)
+
+        full = self.latest_full_features_by_secid.get(secid, {})
+        merged = dict(raw)
+        for k, v in (full or {}).items():
+            if v is not None:
+                merged[k] = v
+
+        merged["secid"] = secid
+        merged["tag"] = str(tag)
+        merged["ts"] = time.time()
 
         index = self.option_index_by_secid.get(int(secid))
         if index is None:
@@ -485,10 +524,10 @@ class TradingRuntimeCoordinator:
 
         with self._lock:
             ws_ltp = pair.ce_ltp if secid == pair.ce_id else pair.pe_ltp if secid == pair.pe_id else None
-            if ws_ltp and ws_ltp > 0:
-                raw["ltp"] = float(ws_ltp)
-            pair.update_option_depth(secid, raw)
-            self._process_option_update(index, pair, secid, tag, raw)
+            merged["ltp"] = float(ws_ltp) if ws_ltp and ws_ltp > 0 else merged.get("ltp", raw.get("ltp", 0))
+            merged["feature_source"] = "DEPTH_PLUS_FULL" if full else "DEPTH_ONLY"
+            pair.update_option_depth(secid, merged)
+            self._process_option_update(index, pair, secid, tag, merged)
 
     def _get_active_position_for_pair(self, pair: PairRuntimeState) -> Optional[dict]:
         if pair.ce_id and pair.ce_id in self.paper_trader.positions:
@@ -771,6 +810,18 @@ class TradingRuntimeCoordinator:
 
         if side:
             if self.TRI_WAVE_V2_ONLY_MODE:
+                log_key = f"{index}:{side}"
+                if time.time() - getattr(self, "_last_v2_opt_route_log", {}).get(log_key, 0.0) >= 5.0:
+                    self._last_v2_opt_route_log = getattr(self, "_last_v2_opt_route_log", {})
+                    self._last_v2_opt_route_log[log_key] = time.time()
+                    logger.info(
+                        "TRI_WAVE_V2_OPTION_FEATURE_ROUTE | index=%s | side=%s | secid=%s | source=%s | ltp=%.2f | keys=%s | recovery=%.2f | clean=%.2f | exhaustion=%.2f | flow=%.2f | ofi=%.2f | depth_imb=%.2f | market_q_imb=%.2f | volume_change=%s | oi_change=%s",
+                        index, side, secid, raw.get("feature_source", "UNKNOWN"), float(raw.get("ltp", 0.0) or 0.0),
+                        sorted(raw.keys()), float(raw.get("recovery_score", 0.0) or 0.0), float(raw.get("clean_trade_score", 0.0) or 0.0),
+                        float(raw.get("exhaustion_score", 0.0) or 0.0), float(raw.get("flow", 0.0) or 0.0), float(raw.get("ofi", 0.0) or 0.0),
+                        float(raw.get("depth_imbalance_5", 0.0) or 0.0), float(raw.get("market_queue_imbalance", 0.0) or 0.0),
+                        raw.get("volume_change_tick"), raw.get("oi_change_tick")
+                    )
                 self.tri_wave_v2_brain.on_option_tick(index=index, side=side, secid=int(secid), ltp=float(raw["ltp"]), features=raw)
             else:
                 self.tri_wave_brain.on_option_tick(
@@ -793,7 +844,7 @@ class TradingRuntimeCoordinator:
                             pair.index, tri_signal.action, tri_signal.reason
                         )
                 logger.info(
-                    "LEGACY_SYSTEM_SKIPPED_BY_TRI_WAVE_ONLY | index=%s | secid=%s | tag=%s",
+                    "LEGACY_SYSTEM_SKIPPED_BY_TRI_WAVE_V2_ONLY | index=%s | secid=%s | tag=%s",
                     pair.index, secid, tag
                 )
                 return
