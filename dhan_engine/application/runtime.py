@@ -15,6 +15,7 @@ from dhan_engine.domain.features.depth_micro_features import DepthMicroFeatureBu
 from dhan_engine.domain.market.market_state_engine import MarketStateEngine
 from dhan_engine.domain.market.turn_detection_engine import TurnDetectionEngine
 from dhan_engine.domain.market.tri_wave_tick_brain import TriWaveTickBrain
+from dhan_engine.domain.market.tri_wave_v2_brain import TriWaveV2Brain
 from dhan_engine.domain.state import PairRuntimeState
 from dhan_engine.domain.strategy.institutional_decision_engine import InstitutionalDecisionEngine
 from dhan_engine.domain.strategy.institutional_trailing_exit_engine import InstitutionalTrailingExitEngine
@@ -50,6 +51,7 @@ class TradingRuntimeCoordinator:
     FLOW_REVERSAL_DECISION_COOLDOWN_SEC = 1.0
     PREMATURE_EXIT_THRESHOLD_SEC = 20
     TRI_WAVE_ONLY_MODE = True
+    TRI_WAVE_V2_ONLY_MODE = True
     TRI_WAVE_REENTRY_COOLDOWN_SEC = 90
     TRI_WAVE_LOSS_REENTRY_COOLDOWN_SEC = 180
     TRI_WAVE_PROFIT_REENTRY_COOLDOWN_SEC = 60
@@ -137,6 +139,7 @@ class TradingRuntimeCoordinator:
         self.flow_reversal_state: Dict[int, dict] = {}
         self._tick_exit_guard: Dict[int, dict] = {}
         self.tri_wave_brain = TriWaveTickBrain(debug=True)
+        self.tri_wave_v2_brain = TriWaveV2Brain()
         self.tri_wave_last_exit_ts: Dict[str, float] = {}
         self.tri_wave_last_exit_reason: Dict[str, str] = {}
         self.tri_wave_last_exit_net_pnl: Dict[str, float] = {}
@@ -338,12 +341,15 @@ class TradingRuntimeCoordinator:
                     "ask_qty": list(getattr(depth, "ask_qty", []) or []),
                 }
             )
-            self.tri_wave_brain.on_future_tick(
-                index=index,
-                secid=int(secid),
-                ltp=float(ltp),
-                quote=self.pairs[index].underlying_quote,
-            )
+            if self.TRI_WAVE_V2_ONLY_MODE:
+                self.tri_wave_v2_brain.on_future_tick(index=index, secid=int(secid), ltp=float(ltp), features=getattr(depth, "features", {}) or self.pairs[index].underlying_quote)
+            else:
+                self.tri_wave_brain.on_future_tick(
+                    index=index,
+                    secid=int(secid),
+                    ltp=float(ltp),
+                    quote=self.pairs[index].underlying_quote,
+                )
             if self._all_underlyings_ready():
                 self._future_ready.set()
             self._reselect_option_pair_if_needed(index)
@@ -558,7 +564,7 @@ class TradingRuntimeCoordinator:
         )
 
         tri_meta = {
-            "strategy_owner": "TRI_WAVE",
+            "strategy_owner": "TRI_WAVE_V2" if self.TRI_WAVE_V2_ONLY_MODE else "TRI_WAVE",
             "entry_reason_source": "TRI_WAVE",
             "tri_wave_action": action,
             "tri_wave_confidence": signal.confidence,
@@ -571,10 +577,12 @@ class TradingRuntimeCoordinator:
             ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
             if not secid:
                 return False
-            accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=f"TRI_WAVE_ENTRY:{signal.reason}", metadata=tri_meta)
+            accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=signal.reason, metadata=tri_meta)
             if accepted:
                 self._register_momentum_trade_from_entry(secid, float(ltp), pair.ce_depth or raw, tri_wave_metadata=tri_meta)
-                if hasattr(self.tri_wave_brain, "reset_trade_state"):
+                if self.TRI_WAVE_V2_ONLY_MODE:
+                    self.tri_wave_v2_brain.reset_trade_state(pair.index, "CE", float(ltp))
+                elif hasattr(self.tri_wave_brain, "reset_trade_state"):
                     self.tri_wave_brain.reset_trade_state(pair.index, "CE", float(ltp))
                     logger.info("TRI_WAVE_TRADE_STATE_RESET | index=%s | side=%s | entry=%.2f", pair.index, "CE", float(ltp))
                 logger.info("TRI_WAVE_ENTRY_COMMITTED | %s | ltp=%.2f | reason=%s", tag, float(ltp), signal.reason)
@@ -586,10 +594,12 @@ class TradingRuntimeCoordinator:
             ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
             if not secid:
                 return False
-            accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=f"TRI_WAVE_ENTRY:{signal.reason}", metadata=tri_meta)
+            accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=signal.reason, metadata=tri_meta)
             if accepted:
                 self._register_momentum_trade_from_entry(secid, float(ltp), pair.pe_depth or raw, tri_wave_metadata=tri_meta)
-                if hasattr(self.tri_wave_brain, "reset_trade_state"):
+                if self.TRI_WAVE_V2_ONLY_MODE:
+                    self.tri_wave_v2_brain.reset_trade_state(pair.index, "PE", float(ltp))
+                elif hasattr(self.tri_wave_brain, "reset_trade_state"):
                     self.tri_wave_brain.reset_trade_state(pair.index, "PE", float(ltp))
                     logger.info("TRI_WAVE_TRADE_STATE_RESET | index=%s | side=%s | entry=%.2f", pair.index, "PE", float(ltp))
                 logger.info("TRI_WAVE_ENTRY_COMMITTED | %s | ltp=%.2f | reason=%s", tag, float(ltp), signal.reason)
@@ -640,7 +650,7 @@ class TradingRuntimeCoordinator:
         if not active:
             return False
         tag = active.get("tag", f"{pair.index}_{'CE' if secid == pair.ce_id else 'PE'}")
-        final_reason = f"TRI_WAVE_EXIT:{reason}"
+        final_reason = reason if str(reason).startswith("TRI_WAVE_V2_EXIT:") else f"TRI_WAVE_EXIT:{reason}"
         hold_sec = max(time.time() - float(active.get("entry_ts", time.time())), 0.0)
         self.paper_trader.on_exit(secid, float(ltp), reason=final_reason)
         self.flow_reversal_state.pop(secid, None)
@@ -650,6 +660,8 @@ class TradingRuntimeCoordinator:
             self.momentum_engine.active_trade.pop(secid, None)
         self._record_exit_metrics(reason=final_reason, hold_sec=hold_sec, secid=secid, tag=str(tag))
         self._record_tri_wave_exit(pair.index, final_reason)
+        if self.TRI_WAVE_V2_ONLY_MODE:
+            self.tri_wave_v2_brain.clear_trade_state(pair.index)
         return True
 
     def _record_tri_wave_exit(self, index: str, reason: str) -> None:
@@ -748,18 +760,21 @@ class TradingRuntimeCoordinator:
             logger.info("PAIR_STATE_READY | %s | CE+PE+UNDERLYING LIVE", index)
 
         if side:
-            self.tri_wave_brain.on_option_tick(
-                index=index,
-                side=side,
-                secid=int(secid),
-                ltp=float(raw["ltp"]),
-                features=raw,
-            )
+            if self.TRI_WAVE_V2_ONLY_MODE:
+                self.tri_wave_v2_brain.on_option_tick(index=index, side=side, secid=int(secid), ltp=float(raw["ltp"]), features=raw)
+            else:
+                self.tri_wave_brain.on_option_tick(
+                    index=index,
+                    side=side,
+                    secid=int(secid),
+                    ltp=float(raw["ltp"]),
+                    features=raw,
+                )
 
         if pair.is_ready():
             active_position = self._get_active_position_for_pair(pair)
-            tri_signal = self.tri_wave_brain.evaluate(pair.index, active_position=active_position)
-            if self.TRI_WAVE_ONLY_MODE:
+            tri_signal = self.tri_wave_v2_brain.evaluate(pair.index, active_position=active_position) if self.TRI_WAVE_V2_ONLY_MODE else self.tri_wave_brain.evaluate(pair.index, active_position=active_position)
+            if self.TRI_WAVE_ONLY_MODE or self.TRI_WAVE_V2_ONLY_MODE:
                 if tri_signal and tri_signal.action != "NO_TRADE":
                     executed = self._execute_tri_wave_signal(pair, tri_signal, raw)
                     if executed:
@@ -786,7 +801,7 @@ class TradingRuntimeCoordinator:
         self._process_exit_engines(pair, secid, tag, raw)
 
     def _update_market_snapshot(self, pair: PairRuntimeState, raw: dict, secid: int, tag: str) -> None:
-        if getattr(self, "TRI_WAVE_ONLY_MODE", False):
+        if getattr(self, "TRI_WAVE_ONLY_MODE", False) or getattr(self, "TRI_WAVE_V2_ONLY_MODE", False):
             logger.info(
                 "LEGACY_MARKET_SNAPSHOT_SKIPPED_TRI_WAVE_ONLY | index=%s | secid=%s | tag=%s",
                 pair.index, secid, tag
@@ -874,7 +889,7 @@ class TradingRuntimeCoordinator:
         print("DECISION_RESULT →", decision)
 
     def _process_exit_engines(self, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
-        if getattr(self, "TRI_WAVE_ONLY_MODE", False):
+        if getattr(self, "TRI_WAVE_ONLY_MODE", False) or getattr(self, "TRI_WAVE_V2_ONLY_MODE", False):
             logger.info(
                 "LEGACY_EXIT_ENGINE_SKIPPED_TRI_WAVE_ONLY | secid=%s | tag=%s",
                 secid, tag
