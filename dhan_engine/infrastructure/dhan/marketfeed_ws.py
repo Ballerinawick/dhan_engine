@@ -3,6 +3,8 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
+import logging
+from dhan_engine.domain.market.full_data_feature_extractor import derive_full_data_features
 
 import websocket
 
@@ -13,6 +15,7 @@ except Exception:  # pragma: no cover - optional dependency path
 
 
 REQ_FULL = 21
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -22,6 +25,8 @@ class QuoteDepth:
     ask_price: List[float]
     ask_qty: List[int]
     ts: float
+    raw: Optional[dict] = None
+    features: Optional[dict] = None
 
 
 class DhanLiveMarketFeedWS:
@@ -54,6 +59,8 @@ class DhanLiveMarketFeedWS:
         self._tags: Dict[int, str] = {}
         self._reconnect_attempt = 0
         self._lock = threading.Lock()
+        self._previous_features: Dict[int, dict] = {}
+        self._last_feature_log_ts: Dict[int, float] = {}
         self._feed_parser = (
             DhanFeed(
                 client_id=self.client_id,
@@ -181,8 +188,11 @@ class DhanLiveMarketFeedWS:
 
                 if parsed.get("type") == "Full Data":
                     secid = int(parsed.get("security_id"))
-                    ltp = float(parsed.get("LTP"))
                     tag = self._tags.get(secid, str(secid))
+                    previous = self._previous_features.get(secid)
+                    features = derive_full_data_features(parsed, previous)
+                    self._previous_features[secid] = features
+                    ltp = float(features.get("ltp",0.0) or 0.0)
 
                     depth = parsed.get("depth") or []
                     bid_price = [float(item.get("bid_price", 0.0)) for item in depth]
@@ -190,7 +200,10 @@ class DhanLiveMarketFeedWS:
                     ask_price = [float(item.get("ask_price", 0.0)) for item in depth]
                     ask_qty = [int(item.get("ask_quantity", 0)) for item in depth]
 
-                    print("🔥 FUTURE LTP:", secid, ltp)
+                    now=time.time()
+                    if now-self._last_feature_log_ts.get(secid,0)>=3:
+                        self._last_feature_log_ts[secid]=now
+                        logger.info("FULL_DATA_FEATURES | secid=%s | tag=%s | ltp=%.2f | spread_pct=%.4f | depth_imbalance_5=%.2f | top_depth_imbalance=%.2f | market_queue_imbalance=%.2f | volume_change=%s | oi_change=%s | recovery_score=%.2f | exhaustion_score=%.2f | clean_trade_score=%.2f",secid,tag,ltp,features.get("spread_pct",0.0),features.get("depth_imbalance_5",0.0),features.get("top_depth_imbalance",0.0),features.get("market_queue_imbalance",0.0),features.get("volume_change_tick",0),features.get("oi_change_tick",0),features.get("recovery_score",0.0),features.get("exhaustion_score",0.0),features.get("clean_trade_score",0.0))
 
                     if self.on_full:
                         self.on_full(
@@ -203,6 +216,8 @@ class DhanLiveMarketFeedWS:
                                 ask_price=ask_price,
                                 ask_qty=ask_qty,
                                 ts=time.time(),
+                                raw=parsed,
+                                features=features,
                             ),
                         )
         except Exception as e:
