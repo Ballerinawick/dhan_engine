@@ -101,21 +101,21 @@ class TriWaveV2Brain:
     def on_option_tick(self,index,side,secid,ltp,features): self._update(index,side,secid,ltp,features or {})
     def reset_trade_state(self,index,side,entry_price): self.pos[index]=TriWavePositionState(active_side=side,entry_price=entry_price,entry_ts=time.time(),best_price=entry_price,worst_price=entry_price)
     def clear_trade_state(self,index): self.pos[index]=TriWavePositionState()
-    def _entry_check(self, side, fut, ce, pe, now):
+    def _entry_check(self, index, side, fut, ce, pe, now):
         if side=="CE":
             if ce.phase not in {"RECOVERY","EXPANSION"}: return False,"CE_PHASE_NOT_READY"
             if ce.phase in {"RECOVERY","EXPANSION"} and (now-ce.phase_ts)<self.ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC: return False,"CE_RECOVERY_TOO_NEW"
             if ce.stats["dynamic_support_score"]<=ce.stats["dynamic_risk_score"]: return False,"CE_SUPPORT_NOT_ABOVE_RISK"
-            if ce.stats["dynamic_edge"]<=pe.stats["dynamic_edge"]: return False,"CE_DYNAMIC_EDGE_NOT_DOMINANT"
-            if pe.stats["dynamic_risk_score"]+0.10<ce.stats["dynamic_risk_score"]: return False,"PE_DYNAMIC_RISK_CLEARY_LOWER"
-            if fut.stats["dynamic_edge"]<-0.20: return False,"FUT_DYNAMIC_EDGE_AGAINST_CE"
+            fut_supports_ce=(fut.stats.get("last_5_delta",0.0)>=0 or fut.stats.get("velocity",0.0)>=0 or fut.phase in {"RECOVERY","EXPANSION"})
+            if not fut_supports_ce and fut.phase in {"PULLBACK","REVERSAL"}: return False,"FUT_FLOW_AGAINST_CE"
+            logger.info("TRI_WAVE_V2_ENTRY_CANDIDATE_OK | index=%s | side=%s | phase=%s | support=%.2f | risk=%.2f | edge=%.2f | fut_phase=%s | fut_last5=%.2f | fut_velocity=%.2f | opposite_edge=%.2f",index,"CE",ce.phase,ce.stats.get("dynamic_support_score",0.0),ce.stats.get("dynamic_risk_score",0.0),ce.stats.get("dynamic_edge",0.0),fut.phase,fut.stats.get("last_5_delta",0.0),fut.stats.get("velocity",0.0),pe.stats.get("dynamic_edge",0.0))
             return True,"CE_OK"
         if pe.phase not in {"RECOVERY","EXPANSION"}: return False,"PE_PHASE_NOT_READY"
         if pe.phase in {"RECOVERY","EXPANSION"} and (now-pe.phase_ts)<self.ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC: return False,"PE_RECOVERY_TOO_NEW"
         if pe.stats["dynamic_support_score"]<=pe.stats["dynamic_risk_score"]: return False,"PE_SUPPORT_NOT_ABOVE_RISK"
-        if pe.stats["dynamic_edge"]<=ce.stats["dynamic_edge"]: return False,"PE_DYNAMIC_EDGE_NOT_DOMINANT"
-        if ce.stats["dynamic_risk_score"]+0.10<pe.stats["dynamic_risk_score"]: return False,"CE_DYNAMIC_RISK_CLEARY_LOWER"
-        if fut.stats["dynamic_edge"]<-0.20: return False,"FUT_DYNAMIC_EDGE_AGAINST_PE"
+        fut_supports_pe=(fut.stats.get("last_5_delta",0.0)<=0 or fut.stats.get("velocity",0.0)<=0 or fut.phase in {"PULLBACK","REVERSAL","EXHAUSTION"})
+        if not fut_supports_pe and fut.phase in {"RECOVERY","EXPANSION"}: return False,"FUT_FLOW_AGAINST_PE"
+        logger.info("TRI_WAVE_V2_ENTRY_CANDIDATE_OK | index=%s | side=%s | phase=%s | support=%.2f | risk=%.2f | edge=%.2f | fut_phase=%s | fut_last5=%.2f | fut_velocity=%.2f | opposite_edge=%.2f",index,"PE",pe.phase,pe.stats.get("dynamic_support_score",0.0),pe.stats.get("dynamic_risk_score",0.0),pe.stats.get("dynamic_edge",0.0),fut.phase,fut.stats.get("last_5_delta",0.0),fut.stats.get("velocity",0.0),ce.stats.get("dynamic_edge",0.0))
         return True,"PE_OK"
 
 
@@ -177,8 +177,8 @@ class TriWaveV2Brain:
                 key=f"{index}:{side}:{candidate}"; self._exit_conf[key]+=1
                 if self._exit_conf[key]>=2: self._exit_conf[key]=0; return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason=f"TRI_WAVE_V2_EXIT:{candidate}",confidence=0.8)
             return TriWaveV2Signal()
-        ce_ok,ce_reason=self._entry_check("CE",fut,ce,pe,now)
-        pe_ok,pe_reason=self._entry_check("PE",fut,ce,pe,now)
+        ce_ok,ce_reason=self._entry_check(index,"CE",fut,ce,pe,now)
+        pe_ok,pe_reason=self._entry_check(index,"PE",fut,ce,pe,now)
         if now-self._last_wait_log[index]>=5:
             self._last_wait_log[index]=now; logger.info("TRI_WAVE_V2_ENTRY_BLOCK | index=%s | ce_ok=%s | ce_reason=%s | pe_ok=%s | pe_reason=%s | ce_support=%.2f | ce_risk=%.2f | ce_edge=%.2f | pe_support=%.2f | pe_risk=%.2f | pe_edge=%.2f | fut_support=%.2f | fut_risk=%.2f | fut_edge=%.2f | fut_phase=%s | fut_strength=%.2f | ce_phase=%s | ce_prev=%s | ce_pos=%.2f | ce_rec=%.2f | ce_clean=%.2f | ce_flow=%.2f | ce_ofi=%.2f | ce_imb=%.2f | ce_source=%s | pe_phase=%s | pe_prev=%s | pe_pos=%.2f | pe_rec=%.2f | pe_clean=%.2f | pe_flow=%.2f | pe_ofi=%.2f | pe_imb=%.2f | pe_source=%s",index,ce_ok,ce_reason,pe_ok,pe_reason,ce.stats.get("dynamic_support_score",0.0),ce.stats.get("dynamic_risk_score",0.0),ce.stats.get("dynamic_edge",0.0),pe.stats.get("dynamic_support_score",0.0),pe.stats.get("dynamic_risk_score",0.0),pe.stats.get("dynamic_edge",0.0),fut.stats.get("dynamic_support_score",0.0),fut.stats.get("dynamic_risk_score",0.0),fut.stats.get("dynamic_edge",0.0),fut.phase,fut.stats.get("strength",0.0),ce.phase,ce.prev_phase,ce.stats["position_in_range"],ce.stats["recovery_score"],ce.stats["clean_trade_score"],ce.stats["flow"],ce.stats["ofi"],ce.stats["depth_imbalance_5"],ce.stats.get("feature_source","UNKNOWN"),pe.phase,pe.prev_phase,pe.stats["position_in_range"],pe.stats["recovery_score"],pe.stats["clean_trade_score"],pe.stats["flow"],pe.stats["ofi"],pe.stats["depth_imbalance_5"],pe.stats.get("feature_source","UNKNOWN"))
         if now-self._last_wait_log.get(f"entry_confirm:{index}",0.0)>=5:
