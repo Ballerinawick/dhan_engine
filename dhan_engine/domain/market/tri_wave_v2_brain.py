@@ -21,7 +21,7 @@ class TriWaveV2Brain:
     LOT_SIZE=65;ROUND_TRIP_FEE=60.0;MIN_NET_PROFIT_EXIT=100.0;MIN_GROSS_POINTS_FOR_PROFIT_EXIT=2.50
     TIME_LOSS_EXIT_SEC=120;TIME_LOSS_EXIT_PCT=-1.0;DEAD_TRADE_EXIT_SEC=180;DEAD_TRADE_MIN_PROFIT_PCT=0.20
     PROFIT_ARM_PCT=1.20;PROFIT_GIVEBACK_RATIO=0.50;MIN_PEAK_PNL_FOR_GIVEBACK_PCT=1.20;MAX_HOLD_SEC=600
-    ENTRY_CONFIRM_TICKS=3;ENTRY_CONFIRM_MAX_WINDOW_SEC=8;ENTRY_CONFIRM_MIN_INTERVAL_SEC=0.8;ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC=2.0
+    ENTRY_CONFIRM_TICKS=3;ENTRY_CONFIRM_MAX_WINDOW_SEC=8;ENTRY_CONFIRM_MIN_INTERVAL_SEC=0.8;ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC=0.0
     def __init__(self):
         self.streams=defaultdict(lambda:{k:TriWaveStreamState(stream=k) for k in ("FUT","CE","PE")}); self.pos=defaultdict(TriWavePositionState); self._exit_conf=defaultdict(int); self._last_wait_log=defaultdict(float); self._last_visual=defaultdict(float); self._entry_confirm=defaultdict(lambda:{"side":None,"count":0,"first_ts":0.0,"last_ts":0.0,"last_reason":None})
 
@@ -104,30 +104,35 @@ class TriWaveV2Brain:
     def _entry_check(self, index, side, fut, ce, pe, now):
         if side=="CE":
             if ce.phase not in {"RECOVERY","EXPANSION"}: return False,"CE_PHASE_NOT_READY"
-            if ce.phase in {"RECOVERY","EXPANSION"} and (now-ce.phase_ts)<self.ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC: return False,"CE_RECOVERY_TOO_NEW"
             if ce.stats["dynamic_support_score"]<=ce.stats["dynamic_risk_score"]: return False,"CE_SUPPORT_NOT_ABOVE_RISK"
+            if ce.stats.get("last_5_delta",0.0)<0: return False,"CE_LAST5_NEGATIVE"
+            ce_edge=ce.stats.get("dynamic_edge",0.0); pe_edge=pe.stats.get("dynamic_edge",0.0)
+            if not (ce_edge>0 or ce_edge>=pe_edge): return False,"CE_EDGE_NOT_POSITIVE_OR_IMPROVING"
             fut_supports_ce=(fut.stats.get("last_5_delta",0.0)>=0 or fut.stats.get("velocity",0.0)>=0 or fut.phase in {"RECOVERY","EXPANSION"})
             if not fut_supports_ce and fut.phase in {"PULLBACK","REVERSAL"}: return False,"FUT_FLOW_AGAINST_CE"
             logger.info("TRI_WAVE_V2_ENTRY_CANDIDATE_OK | index=%s | side=%s | phase=%s | support=%.2f | risk=%.2f | edge=%.2f | fut_phase=%s | fut_last5=%.2f | fut_velocity=%.2f | opposite_edge=%.2f",index,"CE",ce.phase,ce.stats.get("dynamic_support_score",0.0),ce.stats.get("dynamic_risk_score",0.0),ce.stats.get("dynamic_edge",0.0),fut.phase,fut.stats.get("last_5_delta",0.0),fut.stats.get("velocity",0.0),pe.stats.get("dynamic_edge",0.0))
             return True,"CE_OK"
         if pe.phase not in {"RECOVERY","EXPANSION"}: return False,"PE_PHASE_NOT_READY"
-        if pe.phase in {"RECOVERY","EXPANSION"} and (now-pe.phase_ts)<self.ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC: return False,"PE_RECOVERY_TOO_NEW"
         if pe.stats["dynamic_support_score"]<=pe.stats["dynamic_risk_score"]: return False,"PE_SUPPORT_NOT_ABOVE_RISK"
+        if pe.stats.get("last_5_delta",0.0)<0: return False,"PE_LAST5_NEGATIVE"
+        pe_edge=pe.stats.get("dynamic_edge",0.0); ce_edge=ce.stats.get("dynamic_edge",0.0)
+        if not (pe_edge>0 or pe_edge>=ce_edge): return False,"PE_EDGE_NOT_POSITIVE_OR_IMPROVING"
         fut_supports_pe=(fut.stats.get("last_5_delta",0.0)<=0 or fut.stats.get("velocity",0.0)<=0 or fut.phase in {"PULLBACK","REVERSAL","EXHAUSTION"})
         if not fut_supports_pe and fut.phase in {"RECOVERY","EXPANSION"}: return False,"FUT_FLOW_AGAINST_PE"
         logger.info("TRI_WAVE_V2_ENTRY_CANDIDATE_OK | index=%s | side=%s | phase=%s | support=%.2f | risk=%.2f | edge=%.2f | fut_phase=%s | fut_last5=%.2f | fut_velocity=%.2f | opposite_edge=%.2f",index,"PE",pe.phase,pe.stats.get("dynamic_support_score",0.0),pe.stats.get("dynamic_risk_score",0.0),pe.stats.get("dynamic_edge",0.0),fut.phase,fut.stats.get("last_5_delta",0.0),fut.stats.get("velocity",0.0),ce.stats.get("dynamic_edge",0.0))
         return True,"PE_OK"
 
 
-    def _confirm_entry(self,index:str,side:str,reason:str,now:float)->tuple[bool,int]:
+    def _confirm_entry(self,index:str,side:str,reason:str,now:float)->tuple[bool,int,bool]:
         state=self._entry_confirm[index]
+        started=False
         if state["side"]!=side or state["last_reason"]!=reason:
-            state["side"]=side; state["count"]=0; state["first_ts"]=now; state["last_ts"]=0.0; state["last_reason"]=reason
+            state["side"]=side; state["count"]=0; state["first_ts"]=now; state["last_ts"]=0.0; state["last_reason"]=reason; started=True
         if now-state["first_ts"]>self.ENTRY_CONFIRM_MAX_WINDOW_SEC:
-            state["count"]=0; state["first_ts"]=now; state["last_ts"]=0.0
-        if state.get("last_ts",0.0) and now-state["last_ts"]<self.ENTRY_CONFIRM_MIN_INTERVAL_SEC: return False,state["count"]
+            state["count"]=0; state["first_ts"]=now; state["last_ts"]=0.0; started=True
+        if state.get("last_ts",0.0) and now-state["last_ts"]<self.ENTRY_CONFIRM_MIN_INTERVAL_SEC: return False,state["count"],started
         state["count"]+=1; state["last_ts"]=now
-        return state["count"]>=self.ENTRY_CONFIRM_TICKS,state["count"]
+        return state["count"]>=self.ENTRY_CONFIRM_TICKS,state["count"],(started or state["count"]==1)
 
     def evaluate(self,index,active_position=None):
         fut,ce,pe=[self.streams[index][x] for x in ("FUT","CE","PE")]; now=time.time()
@@ -199,21 +204,27 @@ class TriWaveV2Brain:
         if now-self._last_visual[index]>=5:
             self._last_visual[index]=now; logger.info("TRI_WAVE_V2_VISUAL | index=%s | FUT phase=%s strength=%.2f | CE phase=%s ltp=%.2f pos=%.2f rec=%.2f exh=%.2f clean=%.2f | PE phase=%s ltp=%.2f pos=%.2f rec=%.2f exh=%.2f clean=%.2f | active=%s pnl_pct=%.2f",index,fut.phase,fut.stats['strength'],ce.phase,ce.last_ltp,ce.stats['position_in_range'],ce.stats['recovery_score'],ce.stats['exhaustion_score'],ce.stats['clean_trade_score'],pe.phase,pe.last_ltp,pe.stats['position_in_range'],pe.stats['recovery_score'],pe.stats['exhaustion_score'],pe.stats['clean_trade_score'],"NONE",0.0)
         if ce_ok and not pe_ok:
-            confirmed,count=self._confirm_entry(index,"CE",ce_reason,now)
+            confirmed,count,started=self._confirm_entry(index,"CE",ce_reason,now)
+            if started:
+                logger.info("TRI_WAVE_V2_ENTRY_CONFIRM_START | index=%s | side=%s | phase=%s | support=%.2f | risk=%.2f | edge=%.2f | last5=%.2f | flow=%.2f | ofi=%.2f",index,"CE",ce.phase,ce.stats.get("dynamic_support_score",0.0),ce.stats.get("dynamic_risk_score",0.0),ce.stats.get("dynamic_edge",0.0),ce.stats.get("last_5_delta",0.0),ce.stats.get("flow",0.0),ce.stats.get("ofi",0.0))
             if not confirmed:
                 logger.info("TRI_WAVE_V2_ENTRY_CONFIRM_WAIT | index=%s | side=CE | count=%s | required=%s | reason=%s | phase=%s | pos=%.2f | rec=%.2f | clean=%.2f | flow=%.2f | ofi=%.2f",index,count,self.ENTRY_CONFIRM_TICKS,ce_reason,ce.phase,ce.stats["position_in_range"],ce.stats["recovery_score"],ce.stats["clean_trade_score"],ce.stats["flow"],ce.stats["ofi"])
                 return TriWaveV2Signal()
             return TriWaveV2Signal(action="BUY_CE",side="CE",reason="TRI_WAVE_V2_ENTRY:CE_WAVE_RECOVERY",confidence=0.8)
         if pe_ok and not ce_ok:
-            confirmed,count=self._confirm_entry(index,"PE",pe_reason,now)
+            confirmed,count,started=self._confirm_entry(index,"PE",pe_reason,now)
+            if started:
+                logger.info("TRI_WAVE_V2_ENTRY_CONFIRM_START | index=%s | side=%s | phase=%s | support=%.2f | risk=%.2f | edge=%.2f | last5=%.2f | flow=%.2f | ofi=%.2f",index,"PE",pe.phase,pe.stats.get("dynamic_support_score",0.0),pe.stats.get("dynamic_risk_score",0.0),pe.stats.get("dynamic_edge",0.0),pe.stats.get("last_5_delta",0.0),pe.stats.get("flow",0.0),pe.stats.get("ofi",0.0))
             if not confirmed:
                 logger.info("TRI_WAVE_V2_ENTRY_CONFIRM_WAIT | index=%s | side=PE | count=%s | required=%s | reason=%s | phase=%s | pos=%.2f | rec=%.2f | clean=%.2f | flow=%.2f | ofi=%.2f",index,count,self.ENTRY_CONFIRM_TICKS,pe_reason,pe.phase,pe.stats["position_in_range"],pe.stats["recovery_score"],pe.stats["clean_trade_score"],pe.stats["flow"],pe.stats["ofi"])
                 return TriWaveV2Signal()
             return TriWaveV2Signal(action="BUY_PE",side="PE",reason="TRI_WAVE_V2_ENTRY:PE_WAVE_RECOVERY",confidence=0.8)
         best="CE" if (ce.stats.get("dynamic_edge",0.0),ce.stats.get("dynamic_support_score",0.0),-ce.stats.get("dynamic_risk_score",0.0))>(pe.stats.get("dynamic_edge",0.0),pe.stats.get("dynamic_support_score",0.0),-pe.stats.get("dynamic_risk_score",0.0)) else "PE"
         reason=ce_reason if best=="CE" else pe_reason
-        confirmed,count=self._confirm_entry(index,best,reason,now)
+        confirmed,count,started=self._confirm_entry(index,best,reason,now)
         target=ce if best=="CE" else pe
+        if started:
+            logger.info("TRI_WAVE_V2_ENTRY_CONFIRM_START | index=%s | side=%s | phase=%s | support=%.2f | risk=%.2f | edge=%.2f | last5=%.2f | flow=%.2f | ofi=%.2f",index,best,target.phase,target.stats.get("dynamic_support_score",0.0),target.stats.get("dynamic_risk_score",0.0),target.stats.get("dynamic_edge",0.0),target.stats.get("last_5_delta",0.0),target.stats.get("flow",0.0),target.stats.get("ofi",0.0))
         if not confirmed:
             logger.info("TRI_WAVE_V2_ENTRY_CONFIRM_WAIT | index=%s | side=%s | count=%s | required=%s | reason=%s | phase=%s | pos=%.2f | rec=%.2f | clean=%.2f | flow=%.2f | ofi=%.2f",index,best,count,self.ENTRY_CONFIRM_TICKS,reason,target.phase,target.stats["position_in_range"],target.stats["recovery_score"],target.stats["clean_trade_score"],target.stats["flow"],target.stats["ofi"])
             return TriWaveV2Signal()
