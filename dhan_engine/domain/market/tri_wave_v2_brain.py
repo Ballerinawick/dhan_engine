@@ -134,6 +134,51 @@ class TriWaveV2Brain:
         state["count"]+=1; state["last_ts"]=now
         return state["count"]>=self.ENTRY_CONFIRM_TICKS,state["count"],(started or state["count"]==1)
 
+    def get_state_snapshot(self, index: str, active_position=None) -> dict:
+        try:
+            fut = self.streams.get(index, {}).get("FUT")
+            ce = self.streams.get(index, {}).get("CE")
+            pe = self.streams.get(index, {}).get("PE")
+            fut_stats = getattr(fut, "stats", {}) or {}
+            ce_stats = getattr(ce, "stats", {}) or {}
+            pe_stats = getattr(pe, "stats", {}) or {}
+            return {
+                "index": index,
+                "fut": {
+                    "phase": getattr(fut, "phase", "INIT"),
+                    "ltp": getattr(fut, "last_ltp", None),
+                    "support": fut_stats.get("dynamic_support_score", 0.0),
+                    "risk": fut_stats.get("dynamic_risk_score", 0.0),
+                    "edge": fut_stats.get("dynamic_edge", 0.0),
+                    "last5": fut_stats.get("last_5_delta", 0.0),
+                    "velocity": fut_stats.get("velocity", 0.0),
+                },
+                "ce": {
+                    "phase": getattr(ce, "phase", "INIT"),
+                    "ltp": getattr(ce, "last_ltp", None),
+                    "support": ce_stats.get("dynamic_support_score", 0.0),
+                    "risk": ce_stats.get("dynamic_risk_score", 0.0),
+                    "edge": ce_stats.get("dynamic_edge", 0.0),
+                    "last5": ce_stats.get("last_5_delta", 0.0),
+                    "velocity": ce_stats.get("velocity", 0.0),
+                    "position_in_range": ce_stats.get("position_in_range", 0.0),
+                },
+                "pe": {
+                    "phase": getattr(pe, "phase", "INIT"),
+                    "ltp": getattr(pe, "last_ltp", None),
+                    "support": pe_stats.get("dynamic_support_score", 0.0),
+                    "risk": pe_stats.get("dynamic_risk_score", 0.0),
+                    "edge": pe_stats.get("dynamic_edge", 0.0),
+                    "last5": pe_stats.get("last_5_delta", 0.0),
+                    "velocity": pe_stats.get("velocity", 0.0),
+                    "position_in_range": pe_stats.get("position_in_range", 0.0),
+                },
+                "active_side": active_position.get("side") if active_position else None,
+                "pnl_pct": active_position.get("pnl_pct") if active_position else None,
+            }
+        except Exception:
+            return {"index": index, "active_side": active_position.get("side") if active_position else None, "pnl_pct": active_position.get("pnl_pct") if active_position else None}
+
     def evaluate(self,index,active_position=None):
         fut,ce,pe=[self.streams[index][x] for x in ("FUT","CE","PE")]; now=time.time()
         if not ce.stats or not pe.stats or not fut.stats: return TriWaveV2Signal()
