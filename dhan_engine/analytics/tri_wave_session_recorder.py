@@ -15,6 +15,13 @@ class TriWaveSessionRecorder:
         self.base_dir = str(base_dir)
         self.timezone = ZoneInfo(timezone)
         self._lock = threading.RLock()
+        self.ticks_written = 0
+        self.states_written = 0
+        self.signals_written = 0
+        self.trades_written = 0
+        self.portfolio_written = 0
+        self._last_heartbeat_ts = 0.0
+        self.heartbeat_interval_sec = 30.0
         self.session_date = datetime.now(self.timezone).strftime("%Y-%m-%d")
         self.session_dir = os.path.join(self.base_dir, self.session_date)
         self._handles = {}
@@ -38,9 +45,24 @@ class TriWaveSessionRecorder:
             return value
         return str(value)
 
-    def _write(self, filename: str, row: dict) -> None:
-        if not self.enabled:
+    def _maybe_log_heartbeat(self):
+        now = time.time()
+        if now - self._last_heartbeat_ts < self.heartbeat_interval_sec:
             return
+        self._last_heartbeat_ts = now
+        logger.info(
+            "TRI_WAVE_RECORDER_HEARTBEAT | dir=%s | ticks=%s | states=%s | signals=%s | trades=%s | portfolio=%s",
+            self.session_dir,
+            self.ticks_written,
+            self.states_written,
+            self.signals_written,
+            self.trades_written,
+            self.portfolio_written,
+        )
+
+    def _write(self, filename: str, row: dict) -> bool:
+        if not self.enabled:
+            return False
         try:
             with self._lock:
                 handle = self._handles.get(filename)
@@ -50,12 +72,14 @@ class TriWaveSessionRecorder:
                     self._handles[filename] = handle
                 handle.write(json.dumps(self._to_safe(row), ensure_ascii=False) + "\n")
                 handle.flush()
+                return True
         except Exception:
             logger.warning("TRI_WAVE_SESSION_RECORDER_WRITE_FAILED | file=%s", filename, exc_info=True)
+            return False
 
     def record_tick(self, index: str, stream: str, secid: int, ltp: float, features: dict):
         now = time.time()
-        self._write("ticks.jsonl", {
+        if self._write("ticks.jsonl", {
             "ts": now,
             "time": datetime.fromtimestamp(now, self.timezone).strftime("%H:%M:%S"),
             "index": index,
@@ -64,21 +88,31 @@ class TriWaveSessionRecorder:
             "ltp": float(ltp),
             "feature_source": (features or {}).get("feature_source"),
             "features": dict(features or {}),
-        })
+        }):
+            self.ticks_written += 1
+            self._maybe_log_heartbeat()
 
     def record_state(self, index: str, snapshot: dict):
         now = time.time()
-        self._write("states.jsonl", {"ts": now, "time": datetime.fromtimestamp(now, self.timezone).strftime("%H:%M:%S"), "index": index, "snapshot": snapshot or {}})
+        if self._write("states.jsonl", {"ts": now, "time": datetime.fromtimestamp(now, self.timezone).strftime("%H:%M:%S"), "index": index, "snapshot": snapshot or {}}):
+            self.states_written += 1
+            self._maybe_log_heartbeat()
 
     def record_signal(self, index: str, signal):
         now = time.time()
         data = signal if isinstance(signal, dict) else getattr(signal, "__dict__", {"value": str(signal)})
-        self._write("signals.jsonl", {"ts": now, "time": datetime.fromtimestamp(now, self.timezone).strftime("%H:%M:%S"), "index": index, "signal": data})
+        if self._write("signals.jsonl", {"ts": now, "time": datetime.fromtimestamp(now, self.timezone).strftime("%H:%M:%S"), "index": index, "signal": data}):
+            self.signals_written += 1
+            self._maybe_log_heartbeat()
 
     def record_trade(self, trade: dict):
         now = time.time()
-        self._write("trades.jsonl", {"ts": now, "time": datetime.fromtimestamp(now, self.timezone).strftime("%H:%M:%S"), "trade": trade or {}})
+        if self._write("trades.jsonl", {"ts": now, "time": datetime.fromtimestamp(now, self.timezone).strftime("%H:%M:%S"), "trade": trade or {}}):
+            self.trades_written += 1
+            self._maybe_log_heartbeat()
 
     def record_portfolio(self, portfolio: dict):
         now = time.time()
-        self._write("portfolio.jsonl", {"ts": now, "time": datetime.fromtimestamp(now, self.timezone).strftime("%H:%M:%S"), "portfolio": portfolio or {}})
+        if self._write("portfolio.jsonl", {"ts": now, "time": datetime.fromtimestamp(now, self.timezone).strftime("%H:%M:%S"), "portfolio": portfolio or {}}):
+            self.portfolio_written += 1
+            self._maybe_log_heartbeat()
