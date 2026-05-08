@@ -10,9 +10,10 @@ logger = logging.getLogger(__name__)
 
 
 class TriWaveSessionRecorder:
-    def __init__(self, enabled: bool = True, base_dir: str = "data/triwave_sessions", timezone: str = "Asia/Kolkata"):
+    def __init__(self, enabled: bool = True, base_dir: str | None = None, timezone: str = "Asia/Kolkata", expiry_key: str = "unknown"):
         self.enabled = bool(enabled)
-        self.base_dir = str(base_dir)
+        self.base_dir = str(base_dir or os.getenv("TRIWAVE_SESSION_BASE_DIR", "data/triwave_sessions"))
+        self.expiry_key = str(expiry_key or "unknown")
         self.timezone = ZoneInfo(timezone)
         self._lock = threading.RLock()
         self.ticks_written = 0
@@ -23,7 +24,11 @@ class TriWaveSessionRecorder:
         self._last_heartbeat_ts = 0.0
         self.heartbeat_interval_sec = 30.0
         self.session_date = datetime.now(self.timezone).strftime("%Y-%m-%d")
-        self.session_dir = os.path.join(self.base_dir, self.session_date)
+        self.session_dir = os.path.join(self.base_dir, self.session_date, f"expiry={self.expiry_key}")
+        persistent_hint = "VOLUME_OR_EXTERNAL" if self.base_dir.startswith("/data") or self.base_dir.startswith("/mnt") else "EPHEMERAL_CONTAINER"
+        logger.info("TRI_WAVE_SESSION_RECORDER_ACTIVE | dir=%s | persistent_hint=%s", self.session_dir, persistent_hint)
+        if self.expiry_key == "unknown":
+            logger.info("TRI_WAVE_RECORDER_EXPIRY_UNKNOWN")
         self._handles = {}
         if self.enabled:
             try:
@@ -77,7 +82,7 @@ class TriWaveSessionRecorder:
             logger.warning("TRI_WAVE_SESSION_RECORDER_WRITE_FAILED | file=%s", filename, exc_info=True)
             return False
 
-    def record_tick(self, index: str, stream: str, secid: int, ltp: float, features: dict):
+    def record_tick(self, index: str, stream: str, secid: int, ltp: float, features: dict, raw: dict | None = None, route_source: str | None = None):
         now = time.time()
         if self._write("ticks.jsonl", {
             "ts": now,
@@ -88,6 +93,8 @@ class TriWaveSessionRecorder:
             "ltp": float(ltp),
             "feature_source": (features or {}).get("feature_source"),
             "features": dict(features or {}),
+            "raw": raw if raw is not None else None,
+            "route_source": route_source,
         }):
             self.ticks_written += 1
             self._maybe_log_heartbeat()

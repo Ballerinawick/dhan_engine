@@ -10,6 +10,7 @@ from collections import defaultdict
 import requests
 
 from dhan_engine.application.market_data import FutureQuoteStream, OptionDepthStream
+from dhan_engine.analytics.tri_wave_live_analyzer import TriWaveLiveAnalyzer
 from dhan_engine.analytics.tri_wave_session_recorder import TriWaveSessionRecorder
 from dhan_engine.config.settings import RuntimeSettings
 from dhan_engine.domain.features.depth_micro_features import DepthMicroFeatureBuilder
@@ -144,8 +145,8 @@ class TradingRuntimeCoordinator:
         self._tick_exit_guard: Dict[int, dict] = {}
         self.tri_wave_brain = TriWaveTickBrain(debug=True)
         self.tri_wave_v2_brain = TriWaveV2Brain()
-        self.tri_wave_recorder = TriWaveSessionRecorder(enabled=True)
-        logger.info("TRI_WAVE_SESSION_RECORDER_ACTIVE | dir=%s", self.tri_wave_recorder.session_dir)
+        self.tri_wave_recorder = TriWaveSessionRecorder(enabled=True, expiry_key=os.getenv("TRIWAVE_EXPIRY_KEY", "unknown"))
+        self.tri_wave_live_analyzer = TriWaveLiveAnalyzer(self.tri_wave_recorder, interval_sec=300)
         self.tri_wave_v2_last_exit_ts: Dict[str, float] = {}
         self.tri_wave_v2_last_exit_reason: Dict[str, str] = {}
         self.tri_wave_v2_last_exit_net_pnl: Dict[str, float] = {}
@@ -878,6 +879,10 @@ class TradingRuntimeCoordinator:
                     snapshot = self.tri_wave_v2_brain.get_state_snapshot(pair.index, active_position=active_position)
                     self.tri_wave_recorder.record_state(pair.index, snapshot)
                     self.tri_wave_recorder.record_signal(pair.index, tri_signal)
+                    try:
+                        self.tri_wave_live_analyzer.maybe_analyze(self.paper_trader)
+                    except Exception:
+                        logger.exception("TRI_WAVE_LIVE_ANALYZER_ERROR")
                 except Exception:
                     logger.exception("TRI_WAVE_RECORDER_SIGNAL_STATE_ERROR | index=%s", pair.index)
             if self.TRI_WAVE_ONLY_MODE or self.TRI_WAVE_V2_ONLY_MODE:
@@ -1430,9 +1435,30 @@ class TradingRuntimeCoordinator:
 
     def _heartbeat_loop(self) -> None:
         last_heartbeat = 0.0
+        close_summary_logged_for_date = None
         logger.info("LIVE: INSTITUTIONAL OPTIONS ENGINE ACTIVE")
         while True:
             if not self.market_open():
+                now_dt = datetime.now(self.timezone)
+                if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute >= 30):
+                    session_date = now_dt.strftime("%Y-%m-%d")
+                    if close_summary_logged_for_date != session_date:
+                        close_summary_logged_for_date = session_date
+                        logger.info(
+                            "TRI_WAVE_MARKET_CLOSE_SUMMARY | date=%s | dir=%s | ticks=%s | states=%s | signals=%s | trades=%s | portfolio=%s",
+                            session_date,
+                            self.tri_wave_recorder.session_dir,
+                            self.tri_wave_recorder.ticks_written,
+                            self.tri_wave_recorder.states_written,
+                            self.tri_wave_recorder.signals_written,
+                            self.tri_wave_recorder.trades_written,
+                            self.tri_wave_recorder.portfolio_written,
+                        )
+                        logger.info(
+                            "TRI_WAVE_MARKET_CLOSE_ANALYZE_CMD | cmd=python scripts/analyze_triwave_session.py --date %s --expiry %s",
+                            session_date,
+                            getattr(self.tri_wave_recorder, "expiry_key", "unknown"),
+                        )
                 logger.info("⏸️ MARKET_CLOSED | idle mode")
                 time.sleep(30.0)
                 continue
