@@ -23,7 +23,7 @@ class TriWaveV2Brain:
     PROFIT_ARM_PCT=1.20;PROFIT_GIVEBACK_RATIO=0.50;MIN_PEAK_PNL_FOR_GIVEBACK_PCT=1.20;MAX_HOLD_SEC=600
     ENTRY_CONFIRM_TICKS=3;ENTRY_CONFIRM_MAX_WINDOW_SEC=8;ENTRY_CONFIRM_MIN_INTERVAL_SEC=0.8;ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC=0.0
     def __init__(self):
-        self.streams=defaultdict(lambda:{k:TriWaveStreamState(stream=k) for k in ("FUT","CE","PE")}); self.pos=defaultdict(TriWavePositionState); self._exit_conf=defaultdict(int); self._last_wait_log=defaultdict(float); self._last_visual=defaultdict(float); self._entry_confirm=defaultdict(lambda:{"side":None,"count":0,"first_ts":0.0,"last_ts":0.0,"last_reason":None})
+        self.streams=defaultdict(lambda:{k:TriWaveStreamState(stream=k) for k in ("FUT","CE","PE")}); self.pos=defaultdict(TriWavePositionState); self._exit_conf=defaultdict(int); self._last_wait_log=defaultdict(float); self._last_visual=defaultdict(float); self._entry_confirm=defaultdict(lambda:{"side":None,"count":0,"first_ts":0.0,"last_ts":0.0,"last_reason":None}); self._exit_health_memory=defaultdict(lambda:deque(maxlen=12))
 
     def _field_values(self,s,field,window=30):
         rows=list(s.feature_ticks); vals=[float(r.get(field,0.0) or 0.0) for r in rows[-window:]]; return vals
@@ -100,7 +100,14 @@ class TriWaveV2Brain:
     def on_future_tick(self,index,secid,ltp,features): self._update(index,"FUT",secid,ltp,features or {})
     def on_option_tick(self,index,side,secid,ltp,features): self._update(index,side,secid,ltp,features or {})
     def reset_trade_state(self,index,side,entry_price): self.pos[index]=TriWavePositionState(active_side=side,entry_price=entry_price,entry_ts=time.time(),best_price=entry_price,worst_price=entry_price)
-    def clear_trade_state(self,index): self.pos[index]=TriWavePositionState()
+    def clear_trade_state(self,index):
+        self.pos[index]=TriWavePositionState()
+        for side in ("CE","PE"):
+            mem_key=f"{index}:{side}"
+            self._exit_health_memory.pop(mem_key,None)
+            for conf_key in list(self._exit_conf.keys()):
+                if conf_key.startswith(f"{index}:{side}:"):
+                    self._exit_conf.pop(conf_key,None)
     def _entry_check(self, index, side, fut, ce, pe, now):
         if side=="CE":
             if ce.phase not in {"RECOVERY","EXPANSION"}: return False,"CE_PHASE_NOT_READY"
@@ -133,6 +140,15 @@ class TriWaveV2Brain:
         if state.get("last_ts",0.0) and now-state["last_ts"]<self.ENTRY_CONFIRM_MIN_INTERVAL_SEC: return False,state["count"],started
         state["count"]+=1; state["last_ts"]=now
         return state["count"]>=self.ENTRY_CONFIRM_TICKS,state["count"],(started or state["count"]==1)
+
+    def _persistent_exit_failure(self, index: str, side: str, min_bad: int = 4, window: int = 6) -> tuple[bool, dict]:
+        rows=list(self._exit_health_memory.get(f"{index}:{side}",[]))[-window:]
+        if len(rows)<window: return False,{"bad_count":0,"window":len(rows)}
+        bad_rows=[]
+        for r in rows:
+            bad=(float(r.get("risk",0.0))>float(r.get("support",0.0)) and float(r.get("edge",0.0))<0 and str(r.get("phase")) in {"PULLBACK","REVERSAL","EXHAUSTION"})
+            if bad: bad_rows.append(r)
+        return len(bad_rows)>=min_bad,{"bad_count":len(bad_rows),"window":len(rows),"last_phase":rows[-1].get("phase"),"last_edge":rows[-1].get("edge"),"last_support":rows[-1].get("support"),"last_risk":rows[-1].get("risk")}
 
     def get_state_snapshot(self, index: str, active_position=None) -> dict:
         try:
@@ -200,15 +216,19 @@ class TriWaveV2Brain:
             target_support=tgt.stats.get("dynamic_support_score",0.0)
             target_risk=tgt.stats.get("dynamic_risk_score",0.0)
             target_edge=tgt.stats.get("dynamic_edge",0.0)
+            health_key=f"{index}:{side}"
+            self._exit_health_memory[health_key].append({"ts":now,"side":side,"phase":tgt.phase,"pnl_pct":pnl,"support":target_support,"risk":target_risk,"edge":target_edge,"last5":tgt.stats.get("last_5_delta",0.0),"velocity":tgt.stats.get("velocity",0.0),"exhaustion":tgt.stats.get("exhaustion_score",0.0),"clean":tgt.stats.get("clean_trade_score",0.0)})
+            persistent_failed,fail_diag=self._persistent_exit_failure(index,side,min_bad=4,window=6)
             wave_healthy=(target_support>=target_risk or target_edge>=0)
             reasons=[]
             adverse_wave_failed=(tgt.phase in {"PULLBACK","REVERSAL","EXHAUSTION"} and target_risk>target_support and target_edge<0)
-            if hold>=self.ADVERSE_EXIT_MIN_HOLD_SEC and pnl<=self.ADVERSE_EXIT_PCT and adverse_wave_failed: reasons.append("ADVERSE_MOVE")
+            if hold>=self.ADVERSE_EXIT_MIN_HOLD_SEC and pnl<=self.ADVERSE_EXIT_PCT and adverse_wave_failed and persistent_failed: reasons.append("ADVERSE_MOVE")
             if hold>=self.TIME_LOSS_EXIT_SEC and pnl<=self.TIME_LOSS_EXIT_PCT: reasons.append("TIME_LOSS")
             if hold>=self.DEAD_TRADE_EXIT_SEC and pnl<self.DEAD_TRADE_MIN_PROFIT_PCT: reasons.append("DEAD_TRADE")
-            if hold>=self.SOFT_EXIT_MIN_HOLD_SEC and net_rupees>=self.MIN_NET_PROFIT_EXIT and p.peak_pnl_pct>=self.MIN_PEAK_PNL_FOR_GIVEBACK_PCT and tgt.phase in {"EXHAUSTION","REVERSAL"} and target_risk>target_support and target_edge<0: reasons.append("WAVE_PROFIT_EXHAUSTION")
-            if hold>=self.SOFT_EXIT_MIN_HOLD_SEC and pnl<=-1.0 and tgt.phase in {"EXHAUSTION","REVERSAL","PULLBACK"} and target_risk>target_support and target_edge<0: reasons.append("WAVE_FAILURE_EXIT")
             giveback=p.peak_pnl_pct-pnl
+            meaningful_giveback=giveback>=max(0.50,p.peak_pnl_pct*0.35)
+            if hold>=self.SOFT_EXIT_MIN_HOLD_SEC and net_rupees>=self.MIN_NET_PROFIT_EXIT and p.peak_pnl_pct>=self.MIN_PEAK_PNL_FOR_GIVEBACK_PCT and tgt.phase in {"EXHAUSTION","REVERSAL"} and (persistent_failed or meaningful_giveback): reasons.append("WAVE_PROFIT_EXHAUSTION")
+            if hold>=self.SOFT_EXIT_MIN_HOLD_SEC and pnl<=-1.0 and tgt.phase in {"EXHAUSTION","REVERSAL","PULLBACK"} and persistent_failed: reasons.append("WAVE_FAILURE_EXIT")
             if hold>=self.PROFIT_EXIT_MIN_HOLD_SEC and p.peak_pnl_pct>=self.MIN_PEAK_PNL_FOR_GIVEBACK_PCT and giveback>=p.peak_pnl_pct*self.PROFIT_GIVEBACK_RATIO: reasons.append("PROFIT_GIVEBACK")
             if hold>=self.MAX_HOLD_SEC: reasons.append("MAX_HOLD")
             if wave_healthy:
@@ -237,6 +257,14 @@ class TriWaveV2Brain:
             if required>0 and hold<required:
                 allowed=False; blocked_reason="EXIT_TOO_EARLY"
                 logger.info("TRI_WAVE_V2_EXIT_BLOCKED | reason=EXIT_TOO_EARLY | candidate=%s | hold=%.2f | required=%.2f | pnl_pct=%.2f | peak_pnl_pct=%.2f",candidate,hold,required,pnl,p.peak_pnl_pct)
+            if not persistent_failed and adverse_wave_failed and pnl>self.FAST_ADVERSE_PCT:
+                blocked_candidates=[]
+                if hold>=self.ADVERSE_EXIT_MIN_HOLD_SEC and pnl<=self.ADVERSE_EXIT_PCT: blocked_candidates.append("ADVERSE_MOVE")
+                if hold>=self.SOFT_EXIT_MIN_HOLD_SEC and pnl<=-1.0 and tgt.phase in {"EXHAUSTION","REVERSAL","PULLBACK"}: blocked_candidates.append("WAVE_FAILURE_EXIT")
+                if hold>=self.SOFT_EXIT_MIN_HOLD_SEC and net_rupees>=self.MIN_NET_PROFIT_EXIT and p.peak_pnl_pct>=self.MIN_PEAK_PNL_FOR_GIVEBACK_PCT and tgt.phase in {"EXHAUSTION","REVERSAL"} and not meaningful_giveback: blocked_candidates.append("WAVE_PROFIT_EXHAUSTION")
+                if blocked_candidates and now-self._last_wait_log.get(f"exit_wait:{index}:{side}",0.0)>=2:
+                    self._last_wait_log[f"exit_wait:{index}:{side}"]=now
+                    logger.info("TRI_WAVE_V2_EXIT_FAILURE_WAIT | index=%s | side=%s | candidate=%s | hold=%.2f | pnl_pct=%.2f | bad_count=%s | window=%s | support=%.2f | risk=%.2f | edge=%.2f | phase=%s",index,side,blocked_candidates[0],hold,pnl,fail_diag.get("bad_count",0),fail_diag.get("window",0),target_support,target_risk,target_edge,tgt.phase)
             if (now-self._last_visual[index]>=3) or reasons:
                 logger.info("TRI_WAVE_V2_EXIT_WATCH | index=%s | side=%s | hold=%.2f | pnl_pct=%.2f | peak_pnl_pct=%.2f | gross_points=%.2f | gross_rupees=%.2f | net_rupees=%.2f | target_phase=%s | target_last5=%.2f | target_exh=%.2f | target_clean=%.2f | target_support=%.2f | target_risk=%.2f | target_edge=%.2f | wave_healthy=%s | candidate=%s | allowed=%s | blocked_reason=%s | confirm=%s",index,side,hold,pnl,p.peak_pnl_pct,gross_points,gross_rupees,net_rupees,tgt.phase,tgt.stats.get("last_5_delta",0.0),tgt.stats.get("exhaustion_score",0.0),tgt.stats.get("clean_trade_score",0.0),target_support,target_risk,target_edge,wave_healthy,candidate,allowed,blocked_reason,self._exit_conf.get(f"{index}:{side}:{candidate}",0))
                 self._last_visual[index]=now
