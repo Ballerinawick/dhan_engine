@@ -59,6 +59,11 @@ class OptionChainSelector:
         self.timeout_sec = timeout_sec
 
         self._last_call_ts = 0.0
+        self._last_chain_cache = {}
+        self._last_chain_cache_ts = {}
+        self._last_fetch_ok = {}
+        self._last_fetch_error = {}
+        self._last_fetch_retries = {}
 
         self._session = requests.Session()
         self._session.headers.update({
@@ -92,7 +97,7 @@ class OptionChainSelector:
     # --------------------------------------------------
     # 🔴 FIXED FUNCTION (BANKNIFTY BUG WAS HERE)
     # --------------------------------------------------
-    def fetch_chain(self, index: str) -> dict:
+    def fetch_chain(self, index: str) -> dict | None:
         self._rate_limit()
         expiry = self.im.get_nearest_option_expiry(index, prefer_weekly=True)
         expiry_str = expiry.strftime("%Y-%m-%d")
@@ -113,9 +118,47 @@ class OptionChainSelector:
                 f"INDEX_SID:{underlying_scrip} | SEG:{seg} | EXP:{expiry_str}"
             )
 
-        r = self._session.post(self.BASE_URL, json=payload, timeout=self.timeout_sec)
-        r.raise_for_status()
-        return r.json()["data"]
+        for attempt in range(1, 4):
+            try:
+                r = self._session.post(self.BASE_URL, json=payload, timeout=10)
+                r.raise_for_status()
+                body = r.json()
+                data = body.get("data")
+                if not data or "oc" not in data:
+                    raise ValueError(f"Invalid option chain response keys={list(body.keys())}")
+
+                self._last_chain_cache[index] = data
+                self._last_chain_cache_ts[index] = time.time()
+                self._last_fetch_ok[index] = True
+                self._last_fetch_error[index] = None
+                self._last_fetch_retries[index] = attempt - 1
+
+                if self.debug:
+                    print(f"OPTION_CHAIN_FETCH_OK | {index} | attempt={attempt} | expiry={expiry_str}")
+                return data
+            except Exception as exc:
+                self._last_fetch_ok[index] = False
+                self._last_fetch_error[index] = str(exc)
+                self._last_fetch_retries[index] = attempt
+                print(f"OPTION_CHAIN_FETCH_RETRY | index={index} | attempt={attempt} | error={exc}")
+                if attempt < 3:
+                    time.sleep([1, 2, 4][attempt - 1])
+
+        cached = self._last_chain_cache.get(index)
+        print(f"OPTION_CHAIN_FETCH_FAILED_USING_CACHE | index={index} | cache_available={cached is not None}")
+        if cached is not None:
+            return cached
+        return None
+
+    def get_health(self, index: str) -> dict:
+        cache_ts = float(self._last_chain_cache_ts.get(index, 0.0) or 0.0)
+        return {
+            "last_fetch_ok": bool(self._last_fetch_ok.get(index, False)),
+            "last_fetch_error": self._last_fetch_error.get(index),
+            "last_fetch_retries": int(self._last_fetch_retries.get(index, 0) or 0),
+            "cache_available": index in self._last_chain_cache,
+            "cache_age": time.time() - cache_ts if cache_ts else None,
+        }
 
     # --------------------------------------------------
     # Scoring with explanation (unchanged)
@@ -163,6 +206,12 @@ class OptionChainSelector:
     # --------------------------------------------------
     def select_best(self, index: str, underlying_ltp_override: float | None = None) -> Dict[str, Dict]:
         data = self.fetch_chain(index)
+        if not data:
+            print(f"OPTION_CHAIN_NO_DATA | {index} | select_best skipped safely")
+            return None
+        if "oc" not in data or not data["oc"]:
+            print(f"OPTION_CHAIN_EMPTY_OC | {index} | select_best skipped safely")
+            return None
         oc = data["oc"]
         if underlying_ltp_override is not None and float(underlying_ltp_override or 0.0) > 0.0:
             underlying_ltp = float(underlying_ltp_override)
