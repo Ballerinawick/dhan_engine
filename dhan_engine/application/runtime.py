@@ -331,6 +331,18 @@ class TradingRuntimeCoordinator:
                 subscriptions.append((pe_id, f"{index}_PE"))
 
             if pair.ce_id and pair.pe_id:
+                source = str(
+                    (selection.get("CE", {}) or {}).get("selection_source")
+                    or (selection.get("PE", {}) or {}).get("selection_source")
+                    or "OPTION_CHAIN"
+                )
+                logger.info(
+                    "TRI_WAVE_INITIAL_SELECTION_SOURCE | index=%s | source=%s | ce_id=%s | pe_id=%s",
+                    index,
+                    source,
+                    pair.ce_id,
+                    pair.pe_id,
+                )
                 logger.info("PAIR_REGISTERED | %s | CE=%s | PE=%s", index, pair.ce_id, pair.pe_id)
 
             if subscriptions:

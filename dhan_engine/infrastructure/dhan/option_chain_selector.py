@@ -1,6 +1,7 @@
 import time
 import requests
 from typing import Dict, Tuple
+from requests import HTTPError
 
 
 PREMIUM_FILTER = {
@@ -136,6 +137,29 @@ class OptionChainSelector:
                 if self.debug:
                     print(f"OPTION_CHAIN_FETCH_OK | {index} | attempt={attempt} | expiry={expiry_str}")
                 return data
+            except HTTPError as exc:
+                status = getattr(exc.response, "status_code", "NA")
+                response_text = (getattr(exc.response, "text", "") or "")[:300]
+                print(
+                    "OPTION_CHAIN_HTTP_ERROR | index=%s | status=%s | url=%s | expiry=%s | underlying_scrip=%s | underlying_seg=%s | response=%s"
+                    % (index, status, self.BASE_URL, expiry_str, underlying_scrip, seg, response_text)
+                )
+                if status == 401:
+                    print(
+                        "OPTION_CHAIN_AUTH_FAILED | index=%s | message=Check Dhan access token / option-chain permission / token expiry"
+                        % index
+                    )
+                elif status == 429:
+                    print(
+                        "OPTION_CHAIN_RATE_LIMITED | index=%s | message=Too many option-chain requests"
+                        % index
+                    )
+                self._last_fetch_ok[index] = False
+                self._last_fetch_error[index] = str(exc)
+                self._last_fetch_retries[index] = attempt
+                print(f"OPTION_CHAIN_FETCH_RETRY | index={index} | attempt={attempt} | error={exc}")
+                if attempt < 3:
+                    time.sleep([1, 2, 4][attempt - 1])
             except Exception as exc:
                 self._last_fetch_ok[index] = False
                 self._last_fetch_error[index] = str(exc)
@@ -149,6 +173,72 @@ class OptionChainSelector:
         if cached is not None:
             return cached
         return None
+
+    def select_best_from_master(self, index: str, underlying_ltp_override: float | None = None) -> Dict[str, Dict] | None:
+        try:
+            expiry = self.im.get_nearest_option_expiry(index, prefer_weekly=True)
+            expiry_str = expiry.strftime("%Y-%m-%d")
+            opts = self.im._get_optidx_df(index)
+            same_expiry = opts[opts["SEM_EXPIRY_DATE"].dt.date == expiry.date()].copy()
+            if same_expiry.empty:
+                raise ValueError(f"No options found for nearest expiry {expiry_str}")
+
+            if underlying_ltp_override is None or float(underlying_ltp_override or 0.0) <= 0.0:
+                raise ValueError("underlying_ltp_override missing/invalid for master fallback")
+            underlying_ltp = float(underlying_ltp_override)
+
+            step = int(self.strike_step_map[index])
+            atm = int(round(underlying_ltp / step) * step)
+
+            ce_df = same_expiry[same_expiry["SEM_OPTION_TYPE"].astype(str).str.upper() == "CE"].copy()
+            pe_df = same_expiry[same_expiry["SEM_OPTION_TYPE"].astype(str).str.upper() == "PE"].copy()
+            if ce_df.empty or pe_df.empty:
+                raise ValueError("Missing CE/PE rows in master for expiry")
+
+            ce_df["__diff"] = (ce_df["SEM_STRIKE_PRICE"] - float(atm)).abs()
+            pe_df["__diff"] = (pe_df["SEM_STRIKE_PRICE"] - float(atm)).abs()
+            ce_row = ce_df.sort_values(["__diff", "SEM_STRIKE_PRICE"]).iloc[0]
+            pe_row = pe_df.sort_values(["__diff", "SEM_STRIKE_PRICE"]).iloc[0]
+
+            ce_secid = int(float(ce_row["SEM_SMST_SECURITY_ID"]))
+            pe_secid = int(float(pe_row["SEM_SMST_SECURITY_ID"]))
+            ce_strike = float(ce_row["SEM_STRIKE_PRICE"])
+            pe_strike = float(pe_row["SEM_STRIKE_PRICE"])
+
+            print(
+                "OPTION_CHAIN_MASTER_FALLBACK_USED | index=%s | expiry=%s | underlying=%.2f | ce=%s | pe=%s"
+                % (index, expiry_str, underlying_ltp, ce_secid, pe_secid)
+            )
+
+            return {
+                "CE": {
+                    "index": index,
+                    "side": "CE",
+                    "strike": ce_strike,
+                    "security_id": ce_secid,
+                    "score": 0.0,
+                    "expiry": expiry_str,
+                    "atm": atm,
+                    "underlying_ltp": underlying_ltp,
+                    "reason": {"final_decision": "master_csv_fallback"},
+                    "selection_source": "MASTER_FALLBACK",
+                },
+                "PE": {
+                    "index": index,
+                    "side": "PE",
+                    "strike": pe_strike,
+                    "security_id": pe_secid,
+                    "score": 0.0,
+                    "expiry": expiry_str,
+                    "atm": atm,
+                    "underlying_ltp": underlying_ltp,
+                    "reason": {"final_decision": "master_csv_fallback"},
+                    "selection_source": "MASTER_FALLBACK",
+                },
+            }
+        except Exception as exc:
+            print(f"OPTION_CHAIN_MASTER_FALLBACK_FAILED | index={index} | error={exc}")
+            return None
 
     def get_health(self, index: str) -> dict:
         cache_ts = float(self._last_chain_cache_ts.get(index, 0.0) or 0.0)
@@ -207,8 +297,8 @@ class OptionChainSelector:
     def select_best(self, index: str, underlying_ltp_override: float | None = None) -> Dict[str, Dict]:
         data = self.fetch_chain(index)
         if not data:
-            print(f"OPTION_CHAIN_NO_DATA | {index} | select_best skipped safely")
-            return None
+            print(f"OPTION_CHAIN_NO_DATA | {index} | trying local master fallback")
+            return self.select_best_from_master(index, underlying_ltp_override=underlying_ltp_override)
         if "oc" not in data or not data["oc"]:
             print(f"OPTION_CHAIN_EMPTY_OC | {index} | select_best skipped safely")
             return None
@@ -541,11 +631,14 @@ class OptionChainSelector:
         if self.mode == 1:
             pick = ce if ce and (not pe or ce["score"] >= pe["score"]) else pe
             if pick:
+                pick["selection_source"] = "OPTION_CHAIN"
                 out["BEST"] = pick
         else:
             if ce:
+                ce["selection_source"] = "OPTION_CHAIN"
                 out["CE"] = ce
             if pe:
+                pe["selection_source"] = "OPTION_CHAIN"
                 out["PE"] = pe
 
         if self.debug:
