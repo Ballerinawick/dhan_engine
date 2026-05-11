@@ -126,6 +126,9 @@ class TradingRuntimeCoordinator:
         self.latest_full_features_by_secid: Dict[int, dict] = {}
         self.latest_full_raw_by_secid: Dict[int, dict] = {}
         self.latest_depth_features_by_secid: Dict[int, dict] = {}
+        self.option_last_tick_ts_by_secid = {}
+        self._last_pair_stale_log_ts = defaultdict(float)
+        self._last_option_chain_health_log_ts = defaultdict(float)
 
         self.premium_flow = {
             "CE": {"ltp": 0.0, "prev": 0.0, "velocity": 0.0},
@@ -303,9 +306,13 @@ class TradingRuntimeCoordinator:
     def _select_and_subscribe_option_pairs(self) -> None:
         for index in self.settings.indexes:
             underlying_ltp = self.pairs[index].underlying_ltp
-            selection = self.selector.select_best(index, underlying_ltp_override=underlying_ltp)
+            try:
+                selection = self.selector.select_best(index, underlying_ltp_override=underlying_ltp)
+            except Exception as error:
+                logger.error("TRI_WAVE_INITIAL_SELECTION_FAILED | index=%s | error=%s", index, error)
+                continue
             if not selection:
-                logger.warning("Option selection returned no contracts | index=%s", index)
+                logger.warning("TRI_WAVE_INITIAL_SELECTION_NO_CONTRACT | index=%s | underlying=%.2f", index, float(underlying_ltp or 0.0))
                 continue
 
             subscriptions = []
@@ -412,9 +419,19 @@ class TradingRuntimeCoordinator:
             logger.info("RESELECT_SKIPPED_ACTIVE_POSITION | index=%s", index)
             return
 
-        selection = self.selector.select_best(index, underlying_ltp_override=pair.underlying_ltp)
+        try:
+            selection = self.selector.select_best(index, underlying_ltp_override=pair.underlying_ltp)
+        except Exception as error:
+            logger.warning(
+                "TRI_WAVE_RESELECT_FAILED_KEEPING_OLD_PAIR | index=%s | old_ce=%s | old_pe=%s | error=%s",
+                index, pair.ce_id, pair.pe_id, error
+            )
+            return
         if not selection:
-            logger.warning("RESELECT_NO_SELECTION | index=%s", index)
+            logger.warning(
+                "TRI_WAVE_RESELECT_NO_SELECTION_KEEPING_OLD_PAIR | index=%s | old_ce=%s | old_pe=%s | underlying=%.2f",
+                index, pair.ce_id, pair.pe_id, float(pair.underlying_ltp or 0.0)
+            )
             return
 
         old_ce = pair.ce_id
@@ -818,6 +835,8 @@ class TradingRuntimeCoordinator:
     def _process_option_update(self, index: str, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
         if not self.market_open():
             return
+        self.option_last_tick_ts_by_secid[int(secid)] = time.time()
+        self._log_pair_stale_if_needed(index, pair)
 
         side = "CE" if "CE" in tag else "PE" if "PE" in tag else None
         if side:
@@ -909,7 +928,50 @@ class TradingRuntimeCoordinator:
                     return
             self._update_market_snapshot(pair, raw, secid, tag)
 
-        self._process_exit_engines(pair, secid, tag, raw)
+    def _log_pair_stale_if_needed(self, index: str, pair: PairRuntimeState) -> None:
+        now = time.time()
+        if now - self._last_pair_stale_log_ts[index] < 60:
+            return
+
+        ce_age = None
+        pe_age = None
+        if pair.ce_id:
+            ts = self.option_last_tick_ts_by_secid.get(pair.ce_id)
+            ce_age = now - ts if ts else None
+        if pair.pe_id:
+            ts = self.option_last_tick_ts_by_secid.get(pair.pe_id)
+            pe_age = now - ts if ts else None
+
+        if (ce_age is not None and ce_age > 60) or (pe_age is not None and pe_age > 60):
+            self._last_pair_stale_log_ts[index] = now
+            logger.warning(
+                "TRI_WAVE_PAIR_STALE | index=%s | ce_age=%s | pe_age=%s | ce_id=%s | pe_id=%s",
+                index, ce_age, pe_age, pair.ce_id, pair.pe_id
+            )
+
+    def _log_option_chain_health_if_needed(self, index: str, pair: PairRuntimeState) -> None:
+        now = time.time()
+        if now - self._last_option_chain_health_log_ts[index] < 300:
+            return
+        self._last_option_chain_health_log_ts[index] = now
+
+        health = {}
+        try:
+            if hasattr(self.selector, "get_health"):
+                health = self.selector.get_health(index)
+        except Exception as exc:
+            health = {"error": str(exc)}
+
+        logger.info(
+            "TRI_WAVE_OPTION_CHAIN_HEALTH | index=%s | cache_age=%s | last_fetch_ok=%s | retries=%s | current_ce=%s | current_pe=%s | last_error=%s",
+            index,
+            health.get("cache_age"),
+            health.get("last_fetch_ok"),
+            health.get("last_fetch_retries"),
+            pair.ce_id,
+            pair.pe_id,
+            health.get("last_fetch_error") or health.get("error"),
+        )
 
     def _update_market_snapshot(self, pair: PairRuntimeState, raw: dict, secid: int, tag: str) -> None:
         if getattr(self, "TRI_WAVE_ONLY_MODE", False) or getattr(self, "TRI_WAVE_V2_ONLY_MODE", False):
@@ -1473,6 +1535,10 @@ class TradingRuntimeCoordinator:
                     self.premium_flow["PE"]["velocity"],
                     self.premium_flow["dominant"],
                 )
+                for index, pair in self.pairs.items():
+                    if pair.ce_id or pair.pe_id:
+                        self._log_pair_stale_if_needed(index, pair)
+                        self._log_option_chain_health_if_needed(index, pair)
 
             time.sleep(1.0)
 
