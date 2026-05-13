@@ -42,6 +42,27 @@ class TriWaveLiveAnalyzer:
             logger.exception("TRI_WAVE_LIVE_ANALYSIS_READ_ERROR | file=%s", filename)
         return rows
 
+    def _load_all_jsonl(self, filename: str) -> list[dict]:
+        path = os.path.join(self.recorder.session_dir, filename)
+        if not os.path.exists(path):
+            return []
+        rows = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(row, dict):
+                        rows.append(row)
+        except Exception:
+            logger.exception("TRI_WAVE_LIVE_ANALYSIS_READ_ERROR | file=%s", filename)
+        return rows
+
     @staticmethod
     def _to_float(value, default=None):
         try:
@@ -65,13 +86,13 @@ class TriWaveLiveAnalyzer:
         tr = row.get("trade") if isinstance(row, dict) and isinstance(row.get("trade"), dict) else row
         if not isinstance(tr, dict):
             return None
-        side = str(tr.get("side") or "").upper()
+        side = str(tr.get("side") or tr.get("Side") or "").upper()
         if not side:
-            tag = str(tr.get("tag", "")).upper()
+            tag = str(tr.get("tag") or tr.get("Tag") or tr.get("symbol") or tr.get("Symbol") or "").upper()
             side = "CE" if "CE" in tag else "PE" if "PE" in tag else ""
 
-        entry_ts = self._to_float(tr.get("entry_ts")) or self._to_float(tr.get("EntryTs"))
-        exit_ts = self._to_float(tr.get("exit_ts")) or self._to_float(tr.get("ExitTs"))
+        entry_ts = self._to_float(tr.get("entry_ts")) or self._to_float(tr.get("EntryTs")) or self._to_float(tr.get("entry_timestamp"))
+        exit_ts = self._to_float(tr.get("exit_ts")) or self._to_float(tr.get("ExitTs")) or self._to_float(tr.get("exit_timestamp"))
         entry_time = tr.get("entry_time") or tr.get("EntryTime")
         exit_time = tr.get("exit_time") or tr.get("ExitTime")
         if entry_ts is None:
@@ -79,9 +100,43 @@ class TriWaveLiveAnalyzer:
         if exit_ts is None:
             exit_ts = self._hms_to_ts_today(exit_time)
 
-        entry = self._to_float(tr.get("entry", tr.get("entry_price")), 0.0)
-        exitp = self._to_float(tr.get("exit", tr.get("exit_price")), 0.0)
-        net_pnl = self._to_float(tr.get("net_pnl"), 0.0)
+        entry = self._to_float(tr.get("entry"), None)
+        if entry is None:
+            entry = self._to_float(tr.get("Entry"), None)
+        if entry is None:
+            entry = self._to_float(tr.get("entry_price"), None)
+        if entry is None:
+            entry = self._to_float(tr.get("EntryPrice"), 0.0)
+
+        exitp = self._to_float(tr.get("exit"), None)
+        if exitp is None:
+            exitp = self._to_float(tr.get("Exit"), None)
+        if exitp is None:
+            exitp = self._to_float(tr.get("exit_price"), None)
+        if exitp is None:
+            exitp = self._to_float(tr.get("ExitPrice"), 0.0)
+
+        net_pnl = self._to_float(tr.get("net_pnl"), None)
+        if net_pnl is None:
+            net_pnl = self._to_float(tr.get("NetPnL"), None)
+        if net_pnl is None:
+            net_pnl = self._to_float(tr.get("net"), None)
+        if net_pnl is None:
+            net_pnl = self._to_float(tr.get("Net"), 0.0)
+
+        gross_pnl = self._to_float(tr.get("gross_pnl"), None)
+        if gross_pnl is None:
+            gross_pnl = self._to_float(tr.get("GrossPnL"), 0.0)
+        hold_sec = self._to_float(tr.get("hold_sec"), None)
+        if hold_sec is None:
+            hold_sec = self._to_float(tr.get("HoldSec"), 0.0)
+        reason = (
+            tr.get("entry_reason")
+            or tr.get("EntryReason")
+            or tr.get("exit_reason")
+            or tr.get("ExitReason")
+            or ""
+        )
         return {
             "side": side,
             "entry_ts": entry_ts,
@@ -91,12 +146,15 @@ class TriWaveLiveAnalyzer:
             "entry": entry,
             "exit": exitp,
             "net_pnl": net_pnl,
+            "gross_pnl": gross_pnl,
+            "hold_sec": hold_sec,
+            "reason": reason,
         }
 
     def _window(self, rows, start_ts, end_ts):
         return [r for r in rows if start_ts <= (r.get("ts") or 0) <= end_ts]
 
-    def _detect_turns(self, ticks: list[dict], stream: str) -> list[dict]:
+    def _detect_turns_raw(self, ticks: list[dict], stream: str) -> list[dict]:
         turns = []
         n = len(ticks)
         if n < 5:
@@ -148,11 +206,40 @@ class TriWaveLiveAnalyzer:
                     })
         return turns
 
+    def _filter_turns(self, turns: list[dict]) -> list[dict]:
+        if not turns:
+            return []
+        min_gap_sec = 20
+        alt_gap_sec = 10
+        filtered = []
+        for turn in sorted(turns, key=lambda x: x["ts"]):
+            move_after_points = (turn["price"] * turn["move_after_pct"]) / 100.0
+            min_points = max(0.75, turn["price"] * 0.003)
+            if turn.get("move_after_pct", 0.0) < self.TURN_MIN_MOVE_PCT or abs(move_after_points) < min_points:
+                continue
+            if filtered:
+                prev = filtered[-1]
+                gap = turn["ts"] - prev["ts"]
+                if turn["turn_type"] == prev["turn_type"] and gap < min_gap_sec:
+                    if turn.get("strength", 0.0) > prev.get("strength", 0.0):
+                        filtered[-1] = turn
+                    continue
+                if turn["turn_type"] != prev["turn_type"] and gap < alt_gap_sec:
+                    if turn.get("strength", 0.0) > prev.get("strength", 0.0):
+                        filtered[-1] = turn
+                    continue
+            filtered.append(turn)
+        return filtered
+
+    def _detect_turns(self, ticks: list[dict], stream: str):
+        raw_turns = self._detect_turns_raw(ticks, stream)
+        return raw_turns, self._filter_turns(raw_turns)
+
     @staticmethod
-    def _nearest_turn(turns, target_ts, turn_type):
+    def _nearest_turn(turns, target_ts, turn_type, max_delta_sec=60):
         if target_ts is None:
             return None
-        candidates = [t for t in turns if t["turn_type"] == turn_type and abs(t["ts"] - target_ts) <= 60]
+        candidates = [t for t in turns if t["turn_type"] == turn_type and abs(t["ts"] - target_ts) <= max_delta_sec]
         if not candidates:
             return None
         return min(candidates, key=lambda t: abs(t["ts"] - target_ts))
@@ -217,7 +304,7 @@ class TriWaveLiveAnalyzer:
             ticks_rows = self._safe_load_recent("ticks.jsonl", lookback_start)
             self._safe_load_recent("states.jsonl", lookback_start)
             self._safe_load_recent("signals.jsonl", lookback_start)
-            trades_rows = self._safe_load_recent("trades.jsonl", lookback_start)
+            raw_trade_rows = self._load_all_jsonl("trades.jsonl")
 
             ticks_by_stream = {"FUT": [], "CE": [], "PE": []}
             for row in ticks_rows:
@@ -239,16 +326,42 @@ class TriWaveLiveAnalyzer:
             for k in ticks_by_stream:
                 ticks_by_stream[k].sort(key=lambda x: x["ts"])
 
-            turns_by_stream = {k: self._detect_turns(v, k) for k, v in ticks_by_stream.items()}
+            turns_raw_by_stream = {}
+            turns_by_stream = {}
+            for k, v in ticks_by_stream.items():
+                raw_turns, filtered_turns = self._detect_turns(v, k)
+                turns_raw_by_stream[k] = raw_turns
+                turns_by_stream[k] = filtered_turns
             entry_quality_counts = Counter()
             exit_quality_counts = Counter()
             trade_reviews = []
             matched_entries = 0
             matched_exits = 0
 
-            norm_trades = [self._normalize_trade(r) for r in trades_rows]
+            norm_trades = [self._normalize_trade(r) for r in raw_trade_rows]
             norm_trades = [t for t in norm_trades if isinstance(t, dict) and t.get("side") in {"CE", "PE"}]
-            closed_trades = [t for t in norm_trades if t.get("entry_ts") and t.get("exit_ts")]
+            closed_trades = [
+                t for t in norm_trades
+                if t.get("entry_ts")
+                and t.get("exit_ts")
+                and t["exit_ts"] >= lookback_start
+            ]
+
+            logger.info(
+                "TRI_WAVE_TURN_ANALYZER_DEBUG | raw_trades=%s | normalized_trades=%s | recent_trades=%s | ce_ticks=%s | pe_ticks=%s | fut_ticks=%s | ce_turns_raw=%s | ce_turns_filtered=%s | pe_turns_raw=%s | pe_turns_filtered=%s | fut_turns_raw=%s | fut_turns_filtered=%s",
+                len(raw_trade_rows),
+                len(norm_trades),
+                len(closed_trades),
+                len(ticks_by_stream["CE"]),
+                len(ticks_by_stream["PE"]),
+                len(ticks_by_stream["FUT"]),
+                len(turns_raw_by_stream["CE"]),
+                len(turns_by_stream["CE"]),
+                len(turns_raw_by_stream["PE"]),
+                len(turns_by_stream["PE"]),
+                len(turns_raw_by_stream["FUT"]),
+                len(turns_by_stream["FUT"]),
+            )
 
             for tr in closed_trades:
                 side = tr["side"]
@@ -257,8 +370,8 @@ class TriWaveLiveAnalyzer:
                 stream_ticks = ticks_by_stream.get(side, [])
                 side_turns = turns_by_stream.get(side, [])
 
-                entry_turn = self._nearest_turn(side_turns, entry_ts, "LOW")
-                exit_turn = self._nearest_turn(side_turns, exit_ts, "HIGH")
+                entry_turn = self._nearest_turn(side_turns, entry_ts, "LOW", max_delta_sec=90)
+                exit_turn = self._nearest_turn(side_turns, exit_ts, "HIGH", max_delta_sec=90)
 
                 if entry_turn:
                     matched_entries += 1
@@ -369,12 +482,16 @@ class TriWaveLiveAnalyzer:
             with open(os.path.join(self.recorder.session_dir, "latest_live_turn_summary.json"), "w", encoding="utf-8") as f:
                 json.dump(turn_row, f, ensure_ascii=False)
 
-            if len(trade_reviews) == 0:
+            if (len(ticks_by_stream["CE"]) < 10 and len(ticks_by_stream["PE"]) < 10) or (len(closed_trades) == 0 and len(ticks_rows) == 0):
                 comment = "insufficient_data"
+            elif len(closed_trades) > 0 and matched_entries == 0 and matched_exits == 0:
+                comment = "no_turn_match"
             elif missed_entry_turns >= 3:
                 comment = "many_missed_turns"
             elif entry_quality_counts.get("LATE_ENTRY", 0) > entry_quality_counts.get("TIMELY_ENTRY", 0):
                 comment = "entries_late"
+            elif entry_quality_counts.get("TIMELY_ENTRY", 0) >= entry_quality_counts.get("LATE_ENTRY", 0):
+                comment = "entries_timely"
             elif exit_quality_counts.get("EARLY_EXIT", 0) > exit_quality_counts.get("TIMELY_EXIT", 0):
                 comment = "exits_early"
             elif exit_reason_counts.get("RISK", 0) > 0:
