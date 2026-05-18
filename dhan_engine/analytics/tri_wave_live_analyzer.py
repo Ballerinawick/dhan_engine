@@ -82,19 +82,49 @@ class TriWaveLiveAnalyzer:
         except ValueError:
             return None
 
-    def _normalize_trade(self, row):
+        def _normalize_trade(self, row):
         tr = row.get("trade") if isinstance(row, dict) and isinstance(row.get("trade"), dict) else row
         if not isinstance(tr, dict):
             return None
-        side = str(tr.get("side") or tr.get("Side") or "").upper()
-        if not side:
-            tag = str(tr.get("tag") or tr.get("Tag") or tr.get("symbol") or tr.get("Symbol") or "").upper()
-            side = "CE" if "CE" in tag else "PE" if "PE" in tag else ""
 
-        entry_ts = self._to_float(tr.get("entry_ts")) or self._to_float(tr.get("EntryTs")) or self._to_float(tr.get("entry_timestamp"))
-        exit_ts = self._to_float(tr.get("exit_ts")) or self._to_float(tr.get("ExitTs")) or self._to_float(tr.get("exit_timestamp"))
+        trade_side = str(tr.get("side") or tr.get("Side") or "").upper()
+
+        tag_text = " ".join(str(tr.get(k, "") or "") for k in [
+            "tag", "Tag", "symbol", "Symbol", "instrument", "Instrument",
+            "name", "Name", "contract", "Contract", "trading_symbol", "TradingSymbol"
+        ]).upper()
+
+        reason_text = " ".join(str(tr.get(k, "") or "") for k in [
+            "entry_reason", "EntryReason", "exit_reason", "ExitReason", "reason", "Reason"
+        ]).upper()
+
+        text = f"{tag_text} {reason_text}"
+
+        if "NIFTY_CE" in text or "_CE" in text or " CE" in text or "CE_WAVE" in text or "BUY_CE" in text:
+            side = "CE"
+        elif "NIFTY_PE" in text or "_PE" in text or " PE" in text or "PE_WAVE" in text or "BUY_PE" in text:
+            side = "PE"
+        elif trade_side in {"CE", "PE"}:
+            side = trade_side
+        else:
+            side = ""
+
+        entry_ts = (
+            self._to_float(tr.get("entry_ts"))
+            or self._to_float(tr.get("EntryTs"))
+            or self._to_float(tr.get("entry_timestamp"))
+            or self._to_float(tr.get("EntryTimestamp"))
+        )
+        exit_ts = (
+            self._to_float(tr.get("exit_ts"))
+            or self._to_float(tr.get("ExitTs"))
+            or self._to_float(tr.get("exit_timestamp"))
+            or self._to_float(tr.get("ExitTimestamp"))
+        )
+
         entry_time = tr.get("entry_time") or tr.get("EntryTime")
         exit_time = tr.get("exit_time") or tr.get("ExitTime")
+
         if entry_ts is None:
             entry_ts = self._hms_to_ts_today(entry_time)
         if exit_ts is None:
@@ -127,18 +157,18 @@ class TriWaveLiveAnalyzer:
         gross_pnl = self._to_float(tr.get("gross_pnl"), None)
         if gross_pnl is None:
             gross_pnl = self._to_float(tr.get("GrossPnL"), 0.0)
+
         hold_sec = self._to_float(tr.get("hold_sec"), None)
         if hold_sec is None:
             hold_sec = self._to_float(tr.get("HoldSec"), 0.0)
-        reason = (
-            tr.get("entry_reason")
-            or tr.get("EntryReason")
-            or tr.get("exit_reason")
-            or tr.get("ExitReason")
-            or ""
-        )
+
+        entry_reason = tr.get("entry_reason") or tr.get("EntryReason")
+        exit_reason = tr.get("exit_reason") or tr.get("ExitReason")
+        reason = entry_reason or exit_reason or tr.get("reason") or tr.get("Reason") or ""
+
         return {
             "side": side,
+            "trade_side": trade_side,
             "entry_ts": entry_ts,
             "exit_ts": exit_ts,
             "entry_time": entry_time,
@@ -148,7 +178,10 @@ class TriWaveLiveAnalyzer:
             "net_pnl": net_pnl,
             "gross_pnl": gross_pnl,
             "hold_sec": hold_sec,
+            "entry_reason": entry_reason,
+            "exit_reason": exit_reason,
             "reason": reason,
+            "tag": tr.get("tag") or tr.get("Tag") or tr.get("symbol") or tr.get("Symbol"),
         }
 
     def _window(self, rows, start_ts, end_ts):
@@ -251,19 +284,31 @@ class TriWaveLiveAnalyzer:
         self._last_run_ts = now
         window_start = now - self.interval_sec
 
-        recent_trades = self._safe_load_recent("trades.jsonl", window_start)
-        trades = [r.get("trade", {}) for r in recent_trades]
-        pnls = [float((t or {}).get("net_pnl", 0.0) or 0.0) for t in trades]
-        holds = [float((t or {}).get("hold_sec", 0.0) or 0.0) for t in trades if (t or {}).get("hold_sec") is not None]
-        wins = sum(1 for p in pnls if p > 0)
+                raw_trade_rows_all = self._load_all_jsonl("trades.jsonl")
+        norm_trades_all = [self._normalize_trade(r) for r in raw_trade_rows_all]
+        norm_trades_all = [
+            t for t in norm_trades_all
+            if isinstance(t, dict)
+            and t.get("side") in {"CE", "PE"}
+            and t.get("exit_ts")
+        ]
 
+        trades = [
+            t for t in norm_trades_all
+            if float(t.get("exit_ts") or 0.0) >= window_start
+        ]
+
+        pnls = [float(t.get("net_pnl", 0.0) or 0.0) for t in trades]
+        holds = [float(t.get("hold_sec", 0.0) or 0.0) for t in trades if t.get("hold_sec") is not None]
+        wins = sum(1 for p in pnls if p > 0)
         active_positions = len(getattr(paper_trader, "positions", {}) or {}) if paper_trader else None
         fees_paid = float(getattr(paper_trader, "fees_paid", 0.0) or 0.0) if paper_trader else 0.0
+        
         exit_reason_counts = {}
         for t in trades:
-            reason = str((t or {}).get("exit_reason", "UNKNOWN") or "UNKNOWN")
+            reason = str(t.get("exit_reason") or t.get("reason") or "UNKNOWN")
             exit_reason_counts[reason] = exit_reason_counts.get(reason, 0) + 1
-
+            
         total_recent_signals = len(self._safe_load_recent("signals.jsonl", window_start))
         churn_ratio = (len(trades) / total_recent_signals) if total_recent_signals > 0 else 0.0
         net = sum(pnls)
