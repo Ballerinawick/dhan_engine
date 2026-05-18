@@ -82,7 +82,7 @@ class TriWaveLiveAnalyzer:
         except ValueError:
             return None
 
-        def _normalize_trade(self, row):
+    def _normalize_trade(self, row):
         tr = row.get("trade") if isinstance(row, dict) and isinstance(row.get("trade"), dict) else row
         if not isinstance(tr, dict):
             return None
