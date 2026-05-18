@@ -1,6 +1,7 @@
 import time
 from collections import defaultdict
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 
 class PaperTradeManager:
@@ -21,7 +22,8 @@ class PaperTradeManager:
         "BANKNIFTY": 30,
         "FINNIFTY": 60,
     }
-
+    
+    IST = ZoneInfo("Asia/Kolkata")
     # ---------------- REALISTIC FEE MODEL ----------------
     ROUND_TRIP_FEE = 60.0   # ₹60 per completed trade (BUY + SELL)
 
@@ -55,7 +57,7 @@ class PaperTradeManager:
         self.recent_trade_pnls = []
 
         # Daily counters
-        self.current_day = datetime.now().date()
+        self.current_day = datetime.now(self.IST).date()
         self.opened_today = 0
         self.closed_today = 0
         self.last_trade_summary = None
@@ -75,7 +77,7 @@ class PaperTradeManager:
         return f"{m}m{s:02d}s"
 
     def _maybe_reset_daily_counts(self, now_ts: float) -> None:
-        today = datetime.fromtimestamp(now_ts).date()
+        today = datetime.fromtimestamp(now_ts, self.IST).date()
         if today != self.current_day:
             self.current_day = today
             self.opened_today = 0
@@ -144,6 +146,7 @@ class PaperTradeManager:
         self.opened_today += 1
 
         entry_record = {
+            "secid": int(secid),
             "tag": tag,
             "side": side,
             "lots": lots,
@@ -212,7 +215,11 @@ class PaperTradeManager:
         now_ts = time.time()
         hold_sec = now_ts - pos["entry_ts"]
         self.total_hold_seconds += hold_sec
+        entry_time_ist = datetime.fromtimestamp(pos["entry_ts"], self.IST).strftime("%H:%M:%S")
+        exit_time_ist = datetime.fromtimestamp(now_ts, self.IST).strftime("%H:%M:%S")
+
         self.last_trade_summary = {
+            "secid": int(secid),
             "tag": pos["tag"],
             "side": pos["side"],
             "lots": pos["lots"],
@@ -225,8 +232,10 @@ class PaperTradeManager:
             "hold_sec": float(hold_sec),
             "entry_reason": pos.get("entry_reason"),
             "exit_reason": reason,
-            "entry_time": datetime.fromtimestamp(pos["entry_ts"]).strftime("%H:%M:%S"),
-            "exit_time": datetime.fromtimestamp(now_ts).strftime("%H:%M:%S"),
+            "entry_ts": float(pos["entry_ts"]),
+            "exit_ts": float(now_ts),
+            "entry_time": entry_time_ist,
+            "exit_time": exit_time_ist,
         }
 
         self.exits_total += 1
