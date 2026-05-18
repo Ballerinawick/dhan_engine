@@ -284,7 +284,7 @@ class TriWaveLiveAnalyzer:
         self._last_run_ts = now
         window_start = now - self.interval_sec
 
-                raw_trade_rows_all = self._load_all_jsonl("trades.jsonl")
+        raw_trade_rows_all = self._load_all_jsonl("trades.jsonl")
         norm_trades_all = [self._normalize_trade(r) for r in raw_trade_rows_all]
         norm_trades_all = [
             t for t in norm_trades_all
