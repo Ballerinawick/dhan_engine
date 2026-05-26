@@ -1,0 +1,73 @@
+diff --git a/dhan_engine/domain/market/tri_wave_v2_brain.py b/dhan_engine/domain/market/tri_wave_v2_brain.py
+--- a/dhan_engine/domain/market/tri_wave_v2_brain.py
++++ b/dhan_engine/domain/market/tri_wave_v2_brain.py
+@@
+-from __future__ import annotations
+-import logging, time
++from __future__ import annotations
++import logging, os, time
+ from collections import defaultdict, deque
+ from dataclasses import dataclass, field
++from datetime import datetime
+ from typing import Deque, Dict, Optional
++from zoneinfo import ZoneInfo
+ logger = logging.getLogger(__name__)
+@@
+ class TriWaveV2Brain:
+     MIN_BREATHING_HOLD_SEC=180;SOFT_EXIT_MIN_HOLD_SEC=200;NORMAL_EXIT_MIN_HOLD_SEC=240;PROFIT_EXIT_MIN_HOLD_SEC=180
+     FAST_ADVERSE_PCT=-4.0;FAST_ADVERSE_MIN_HOLD_SEC=180;ADVERSE_EXIT_PCT=-2.0;ADVERSE_EXIT_MIN_HOLD_SEC=180
+     LOT_SIZE=65;ROUND_TRIP_FEE=60.0;MIN_NET_PROFIT_EXIT=100.0;MIN_GROSS_POINTS_FOR_PROFIT_EXIT=2.50
+@@
+     PROFIT_ARM_PCT=1.20;PROFIT_GIVEBACK_RATIO=0.50;MIN_PEAK_PNL_FOR_GIVEBACK_PCT=1.20;MAX_HOLD_SEC=600
+     ENTRY_CONFIRM_TICKS=3;ENTRY_CONFIRM_MAX_WINDOW_SEC=8;ENTRY_CONFIRM_MIN_INTERVAL_SEC=0.8;ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC=0.0
++    MARKET_TZ=ZoneInfo("Asia/Kolkata")
++    DAY_AWARE_ENABLED=os.getenv("TRIWAVE_V2_DAY_AWARE_ENABLED","1").strip().lower() not in {"0","false","no","off"}
++    # Safety-only profiles. This does not change entry logic or existing normal
++    # exits. It only adds a hard loss guard that becomes faster near expiry.
++    EXPIRY_DAY_PROFILES={
++        2: {"cycle_day":1,"label":"WED_D1","hard_hold_sec":60,"hard_loss_points":6.0,"hard_loss_pct":-7.0,"max_loss_rupees":390.0},
++        3: {"cycle_day":2,"label":"THU_D2","hard_hold_sec":45,"hard_loss_points":5.0,"hard_loss_pct":-6.0,"max_loss_rupees":325.0},
++        4: {"cycle_day":3,"label":"FRI_D3","hard_hold_sec":30,"hard_loss_points":4.0,"hard_loss_pct":-5.0,"max_loss_rupees":260.0},
++        0: {"cycle_day":4,"label":"MON_D4","hard_hold_sec":20,"hard_loss_points":3.5,"hard_loss_pct":-4.0,"max_loss_rupees":225.0},
++        1: {"cycle_day":5,"label":"TUE_D5","hard_hold_sec":10,"hard_loss_points":3.0,"hard_loss_pct":-3.5,"max_loss_rupees":195.0},
++    }
+@@
+     def __init__(self):
+         self.streams=defaultdict(lambda:{k:TriWaveStreamState(stream=k) for k in ("FUT","CE","PE")}); self.pos=defaultdict(TriWavePositionState); self._exit_conf=defaultdict(int); self._last_wait_log=defaultdict(float); self._last_visual=defaultdict(float); self._entry_confirm=defaultdict(lambda:{"side":None,"count":0,"first_ts":0.0,"last_ts":0.0,"last_reason":None}); self._exit_health_memory=defaultdict(lambda:deque(maxlen=12))
++
++    def _expiry_day_profile(self, now: Optional[float] = None) -> dict:
++        dt=datetime.fromtimestamp(now or time.time(), self.MARKET_TZ)
++        profile=dict(self.EXPIRY_DAY_PROFILES.get(dt.weekday(), self.EXPIRY_DAY_PROFILES[2]))
++        profile["weekday"]=dt.weekday()
++        return profile
++
++    def _day_hard_adverse_reason(self, *, now: float, hold: float, pnl_pct: float, gross_points: float, gross_rupees: float) -> tuple[Optional[str], dict]:
++        profile=self._expiry_day_profile(now)
++        if not self.DAY_AWARE_ENABLED:
++            return None,profile
++        if hold<profile["hard_hold_sec"]:
++            return None,profile
++        if gross_points>=0:
++            return None,profile
++        hit_points=gross_points<=-float(profile["hard_loss_points"])
++        hit_pct=pnl_pct<=float(profile["hard_loss_pct"])
++        hit_rupees=gross_rupees<=-float(profile["max_loss_rupees"])
++        if hit_points or hit_pct or hit_rupees:
++            return f"DAY_HARD_ADVERSE:{profile['label']}",profile
++        return None,profile
+@@
+     def evaluate(self,index,active_position=None):
+         fut,ce,pe=[self.streams[index][x] for x in ("FUT","CE","PE")]; now=time.time()
+         if not ce.stats or not pe.stats or not fut.stats: return TriWaveV2Signal()
+         if active_position:
+             side=active_position.get("side"); tgt=ce if side=="CE" else pe; p=self.pos[index]; entry=active_position.get("entry",p.entry_price or tgt.last_ltp); pnl=((tgt.last_ltp-entry)/max(entry,1e-9))*100.0; hold=now-float(active_position.get("entry_ts",p.entry_ts or now)); p.best_price=max(p.best_price,tgt.last_ltp); p.peak_pnl_pct=max(p.peak_pnl_pct,pnl)
+             gross_points=tgt.last_ltp-entry; gross_rupees=gross_points*self.LOT_SIZE; net_rupees=gross_rupees-self.ROUND_TRIP_FEE
+             profit_enough=(net_rupees>=self.MIN_NET_PROFIT_EXIT or gross_points>=self.MIN_GROSS_POINTS_FOR_PROFIT_EXIT)
++            day_hard_reason,day_profile=self._day_hard_adverse_reason(now=now,hold=hold,pnl_pct=pnl,gross_points=gross_points,gross_rupees=gross_rupees)
++            if day_hard_reason:
++                logger.info("TRI_WAVE_V2_DAY_HARD_ADVERSE | index=%s | side=%s | day=%s | hold=%.2f | entry=%.2f | price=%.2f | pnl_pct=%.2f | gross_points=%.2f | gross_rupees=%.2f | hard_hold=%.2f | hard_points=%.2f | hard_pct=%.2f | max_loss_rupees=%.2f",index,side,day_profile["label"],hold,entry,tgt.last_ltp,pnl,gross_points,gross_rupees,day_profile["hard_hold_sec"],day_profile["hard_loss_points"],day_profile["hard_loss_pct"],day_profile["max_loss_rupees"])
++                return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason=f"TRI_WAVE_V2_EXIT:{day_hard_reason}",confidence=0.98,diagnostics={"expiry_day_profile":day_profile})
+             fast_adverse_allowed=hold>=self.FAST_ADVERSE_MIN_HOLD_SEC and pnl<=self.FAST_ADVERSE_PCT and tgt.last_ltp<entry
+             if hold<self.MIN_BREATHING_HOLD_SEC:
+                 target_support=tgt.stats.get("dynamic_support_score",0.0); target_risk=tgt.stats.get("dynamic_risk_score",0.0); target_edge=tgt.stats.get("dynamic_edge",0.0)
+                 wave_healthy=(target_support>=target_risk or target_edge>=0)
