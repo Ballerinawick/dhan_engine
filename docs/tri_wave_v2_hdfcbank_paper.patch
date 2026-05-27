@@ -1,0 +1,505 @@
+From 9525b2d905670e66c00a48ff03cff0e3f0973223 Mon Sep 17 00:00:00 2001
+From: Johnwickdev <imanuelsha@email.com>
+Date: Tue, 26 May 2026 12:40:15 +0530
+Subject: [PATCH 1/3] Add day-aware hard adverse guard for Tri Wave V2
+
+---
+ .../domain/market/tri_wave_v2_brain.py        | 38 ++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/dhan_engine/domain/market/tri_wave_v2_brain.py b/dhan_engine/domain/market/tri_wave_v2_brain.py
+index be468af..0e48337 100644
+--- a/dhan_engine/domain/market/tri_wave_v2_brain.py
++++ b/dhan_engine/domain/market/tri_wave_v2_brain.py
+@@ -1,8 +1,10 @@
+ from __future__ import annotations
+-import logging, time
++import logging, os, time
+ from collections import defaultdict, deque
+ from dataclasses import dataclass, field
++from datetime import datetime
+ from typing import Deque, Dict, Optional
++from zoneinfo import ZoneInfo
+ logger = logging.getLogger(__name__)
+ 
+ @dataclass
+@@ -22,9 +24,39 @@ class TriWaveV2Brain:
+     TIME_LOSS_EXIT_SEC=240;TIME_LOSS_EXIT_PCT=-1.0;DEAD_TRADE_EXIT_SEC=300;DEAD_TRADE_MIN_PROFIT_PCT=0.20
+     PROFIT_ARM_PCT=1.20;PROFIT_GIVEBACK_RATIO=0.50;MIN_PEAK_PNL_FOR_GIVEBACK_PCT=1.20;MAX_HOLD_SEC=600
+     ENTRY_CONFIRM_TICKS=3;ENTRY_CONFIRM_MAX_WINDOW_SEC=8;ENTRY_CONFIRM_MIN_INTERVAL_SEC=0.8;ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC=0.0
++    MARKET_TZ=ZoneInfo("Asia/Kolkata")
++    DAY_AWARE_ENABLED=os.getenv("TRIWAVE_V2_DAY_AWARE_ENABLED","1").strip().lower() not in {"0","false","no","off"}
++    # Safety-only expiry profiles. These do not change entries or normal exits;
++    # they only prevent late-cycle premium collapses from waiting for 180 seconds.
++    EXPIRY_DAY_PROFILES={
++        2: {"cycle_day":1,"label":"WED_D1","hard_hold_sec":60,"hard_loss_points":6.0,"hard_loss_pct":-7.0,"max_loss_rupees":390.0},
++        3: {"cycle_day":2,"label":"THU_D2","hard_hold_sec":45,"hard_loss_points":5.0,"hard_loss_pct":-6.0,"max_loss_rupees":325.0},
++        4: {"cycle_day":3,"label":"FRI_D3","hard_hold_sec":30,"hard_loss_points":4.0,"hard_loss_pct":-5.0,"max_loss_rupees":260.0},
++        0: {"cycle_day":4,"label":"MON_D4","hard_hold_sec":20,"hard_loss_points":3.5,"hard_loss_pct":-4.0,"max_loss_rupees":225.0},
++        1: {"cycle_day":5,"label":"TUE_D5","hard_hold_sec":10,"hard_loss_points":3.0,"hard_loss_pct":-3.5,"max_loss_rupees":195.0},
++    }
+     def __init__(self):
+         self.streams=defaultdict(lambda:{k:TriWaveStreamState(stream=k) for k in ("FUT","CE","PE")}); self.pos=defaultdict(TriWavePositionState); self._exit_conf=defaultdict(int); self._last_wait_log=defaultdict(float); self._last_visual=defaultdict(float); self._entry_confirm=defaultdict(lambda:{"side":None,"count":0,"first_ts":0.0,"last_ts":0.0,"last_reason":None}); self._exit_health_memory=defaultdict(lambda:deque(maxlen=12))
+ 
++    def _expiry_day_profile(self, now: Optional[float] = None) -> dict:
++        dt=datetime.fromtimestamp(now or time.time(), self.MARKET_TZ)
++        profile=dict(self.EXPIRY_DAY_PROFILES.get(dt.weekday(), self.EXPIRY_DAY_PROFILES[2]))
++        profile["weekday"]=dt.weekday()
++        return profile
++
++    def _day_hard_adverse_reason(self, *, now: float, hold: float, pnl_pct: float, gross_points: float, gross_rupees: float) -> tuple[Optional[str], dict]:
++        profile=self._expiry_day_profile(now)
++        if not self.DAY_AWARE_ENABLED:
++            return None,profile
++        if hold<profile["hard_hold_sec"] or gross_points>=0:
++            return None,profile
++        hit_points=gross_points<=-float(profile["hard_loss_points"])
++        hit_pct=pnl_pct<=float(profile["hard_loss_pct"])
++        hit_rupees=gross_rupees<=-float(profile["max_loss_rupees"])
++        if hit_points or hit_pct or hit_rupees:
++            return f"DAY_HARD_ADVERSE:{profile['label']}",profile
++        return None,profile
++
+     def _field_values(self,s,field,window=30):
+         rows=list(s.feature_ticks); vals=[float(r.get(field,0.0) or 0.0) for r in rows[-window:]]; return vals
+     def _field_slope(self,s,field,window=5):
+@@ -202,6 +234,10 @@ class TriWaveV2Brain:
+             side=active_position.get("side"); tgt=ce if side=="CE" else pe; p=self.pos[index]; entry=active_position.get("entry",p.entry_price or tgt.last_ltp); pnl=((tgt.last_ltp-entry)/max(entry,1e-9))*100.0; hold=now-float(active_position.get("entry_ts",p.entry_ts or now)); p.best_price=max(p.best_price,tgt.last_ltp); p.peak_pnl_pct=max(p.peak_pnl_pct,pnl)
+             gross_points=tgt.last_ltp-entry; gross_rupees=gross_points*self.LOT_SIZE; net_rupees=gross_rupees-self.ROUND_TRIP_FEE
+             profit_enough=(net_rupees>=self.MIN_NET_PROFIT_EXIT or gross_points>=self.MIN_GROSS_POINTS_FOR_PROFIT_EXIT)
++            day_hard_reason,day_profile=self._day_hard_adverse_reason(now=now,hold=hold,pnl_pct=pnl,gross_points=gross_points,gross_rupees=gross_rupees)
++            if day_hard_reason:
++                logger.info("TRI_WAVE_V2_DAY_HARD_ADVERSE | index=%s | side=%s | day=%s | hold=%.2f | entry=%.2f | price=%.2f | pnl_pct=%.2f | gross_points=%.2f | gross_rupees=%.2f | hard_hold=%.2f | hard_points=%.2f | hard_pct=%.2f | max_loss_rupees=%.2f",index,side,day_profile["label"],hold,entry,tgt.last_ltp,pnl,gross_points,gross_rupees,day_profile["hard_hold_sec"],day_profile["hard_loss_points"],day_profile["hard_loss_pct"],day_profile["max_loss_rupees"])
++                return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason=f"TRI_WAVE_V2_EXIT:{day_hard_reason}",confidence=0.98,diagnostics={"expiry_day_profile":day_profile})
+             fast_adverse_allowed=hold>=self.FAST_ADVERSE_MIN_HOLD_SEC and pnl<=self.FAST_ADVERSE_PCT and tgt.last_ltp<entry
+             if hold<self.MIN_BREATHING_HOLD_SEC:
+                 target_support=tgt.stats.get("dynamic_support_score",0.0); target_risk=tgt.stats.get("dynamic_risk_score",0.0); target_edge=tgt.stats.get("dynamic_edge",0.0)
+-- 
+2.50.0.windows.2
+
+
+From 9c653acfe60fba0102f977e7cc5a49d9f5f25dd0 Mon Sep 17 00:00:00 2001
+From: Johnwickdev <imanuelsha@email.com>
+Date: Wed, 27 May 2026 12:38:17 +0530
+Subject: [PATCH 2/3] Remove PE tie bias in Tri Wave V2 side selection
+
+---
+ .../domain/market/tri_wave_v2_brain.py        | 32 ++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/dhan_engine/domain/market/tri_wave_v2_brain.py b/dhan_engine/domain/market/tri_wave_v2_brain.py
+index 0e48337..5893b4f 100644
+--- a/dhan_engine/domain/market/tri_wave_v2_brain.py
++++ b/dhan_engine/domain/market/tri_wave_v2_brain.py
+@@ -161,6 +161,34 @@ class TriWaveV2Brain:
+         logger.info("TRI_WAVE_V2_ENTRY_CANDIDATE_OK | index=%s | side=%s | phase=%s | support=%.2f | risk=%.2f | edge=%.2f | fut_phase=%s | fut_last5=%.2f | fut_velocity=%.2f | opposite_edge=%.2f",index,"PE",pe.phase,pe.stats.get("dynamic_support_score",0.0),pe.stats.get("dynamic_risk_score",0.0),pe.stats.get("dynamic_edge",0.0),fut.phase,fut.stats.get("last_5_delta",0.0),fut.stats.get("velocity",0.0),ce.stats.get("dynamic_edge",0.0))
+         return True,"PE_OK"
+ 
++    def _entry_side_score(self,s):
++        return (
++            float(s.stats.get("dynamic_edge",0.0) or 0.0),
++            float(s.stats.get("dynamic_support_score",0.0) or 0.0),
++            -float(s.stats.get("dynamic_risk_score",0.0) or 0.0),
++            float(s.stats.get("last_5_delta",0.0) or 0.0),
++            float(s.stats.get("velocity",0.0) or 0.0),
++            -float(s.stats.get("position_in_range",0.0) or 0.0),
++        )
++
++    def _choose_entry_side(self,index,fut,ce,pe):
++        ce_score=self._entry_side_score(ce)
++        pe_score=self._entry_side_score(pe)
++        fut_last5=float(fut.stats.get("last_5_delta",0.0) or 0.0)
++        fut_velocity=float(fut.stats.get("velocity",0.0) or 0.0)
++        if ce_score>pe_score:
++            selected="CE"; selection_reason="CE_SCORE_STRONGER"
++        elif pe_score>ce_score:
++            selected="PE"; selection_reason="PE_SCORE_STRONGER"
++        elif fut.phase in {"RECOVERY","EXPANSION"} or fut_last5>0 or fut_velocity>0:
++            selected="CE"; selection_reason="TIE_FUT_SUPPORTS_CE"
++        elif fut.phase in {"PULLBACK","REVERSAL","EXHAUSTION"} or fut_last5<0 or fut_velocity<0:
++            selected="PE"; selection_reason="TIE_FUT_SUPPORTS_PE"
++        else:
++            selected=None; selection_reason="AMBIGUOUS_TIE_SKIP"
++        logger.info("TRI_WAVE_V2_SIDE_SELECTION | index=%s | selected=%s | reason=%s | ce_score=%s | pe_score=%s | fut_phase=%s | fut_last5=%.2f | fut_velocity=%.2f | ce_pos=%.2f | pe_pos=%.2f",index,selected,selection_reason,ce_score,pe_score,fut.phase,fut_last5,fut_velocity,ce.stats.get("position_in_range",0.0),pe.stats.get("position_in_range",0.0))
++        return selected,selection_reason
++
+ 
+     def _confirm_entry(self,index:str,side:str,reason:str,now:float)->tuple[bool,int,bool]:
+         state=self._entry_confirm[index]
+@@ -345,7 +373,9 @@ class TriWaveV2Brain:
+                 logger.info("TRI_WAVE_V2_ENTRY_CONFIRM_WAIT | index=%s | side=PE | count=%s | required=%s | reason=%s | phase=%s | pos=%.2f | rec=%.2f | clean=%.2f | flow=%.2f | ofi=%.2f",index,count,self.ENTRY_CONFIRM_TICKS,pe_reason,pe.phase,pe.stats["position_in_range"],pe.stats["recovery_score"],pe.stats["clean_trade_score"],pe.stats["flow"],pe.stats["ofi"])
+                 return TriWaveV2Signal()
+             return TriWaveV2Signal(action="BUY_PE",side="PE",reason="TRI_WAVE_V2_ENTRY:PE_WAVE_RECOVERY",confidence=0.8)
+-        best="CE" if (ce.stats.get("dynamic_edge",0.0),ce.stats.get("dynamic_support_score",0.0),-ce.stats.get("dynamic_risk_score",0.0))>(pe.stats.get("dynamic_edge",0.0),pe.stats.get("dynamic_support_score",0.0),-pe.stats.get("dynamic_risk_score",0.0)) else "PE"
++        best,selection_reason=self._choose_entry_side(index,fut,ce,pe)
++        if not best:
++            return TriWaveV2Signal(reason=f"TRI_WAVE_V2_ENTRY:AMBIGUOUS_SIDE:{selection_reason}",confidence=0.0)
+         reason=ce_reason if best=="CE" else pe_reason
+         confirmed,count,started=self._confirm_entry(index,best,reason,now)
+         target=ce if best=="CE" else pe
+-- 
+2.50.0.windows.2
+
+
+From 76f99804395420b210a69bba08b4faf8b759b327 Mon Sep 17 00:00:00 2001
+From: Johnwickdev <imanuelsha@email.com>
+Date: Wed, 27 May 2026 13:15:13 +0530
+Subject: [PATCH 3/3] Add HDFCBANK paper trading support
+
+---
+ dhan_engine/application/runtime.py            |  7 +-
+ dhan_engine/config/settings.py                |  1 +
+ .../domain/market/tri_wave_v2_brain.py        | 25 ++++++--
+ .../infrastructure/dhan/instrument_master.py  | 64 ++++++++++++++++---
+ .../dhan/option_chain_selector.py             | 10 +--
+ .../simulations/paper_trade_manager.py        | 23 +++++--
+ 6 files changed, 103 insertions(+), 27 deletions(-)
+
+diff --git a/dhan_engine/application/runtime.py b/dhan_engine/application/runtime.py
+index 87893af..6c76cb1 100644
+--- a/dhan_engine/application/runtime.py
++++ b/dhan_engine/application/runtime.py
+@@ -143,6 +143,7 @@ class TradingRuntimeCoordinator:
+             "NIFTY": 40,
+             "BANKNIFTY": 100,
+             "FINNIFTY": 40,
++            "HDFCBANK": 8,
+         }
+         self.flow_reversal_state: Dict[int, dict] = {}
+         self._tick_exit_guard: Dict[int, dict] = {}
+@@ -579,6 +580,7 @@ class TradingRuntimeCoordinator:
+                 "tag": f"{pair.index}_CE",
+                 "entry": float(p.get("entry", 0) or 0),
+                 "entry_ts": float(p.get("entry_ts", time.time())),
++                "qty": int(p.get("qty", 0) or 0),
+                 "ltp": float(p.get("ltp", p.get("entry", 0)) or 0),
+                 "pnl_pct": ((float(p.get("ltp", p.get("entry", 0)) or 0) - float(p.get("entry", 0) or 0)) / max(float(p.get("entry", 0) or 0), 1e-9)) * 100.0,
+             }
+@@ -590,6 +592,7 @@ class TradingRuntimeCoordinator:
+                 "tag": f"{pair.index}_PE",
+                 "entry": float(p.get("entry", 0) or 0),
+                 "entry_ts": float(p.get("entry_ts", time.time())),
++                "qty": int(p.get("qty", 0) or 0),
+                 "ltp": float(p.get("ltp", p.get("entry", 0)) or 0),
+                 "pnl_pct": ((float(p.get("ltp", p.get("entry", 0)) or 0) - float(p.get("entry", 0) or 0)) / max(float(p.get("entry", 0) or 0), 1e-9)) * 100.0,
+             }
+@@ -703,7 +706,7 @@ class TradingRuntimeCoordinator:
+             old_ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
+             if old_secid and old_secid in self.paper_trader.positions and not self._attempt_exit_once(pair, old_secid, old_tag, float(old_ltp), f"TRI_WAVE_FLIP_EXIT:{signal.reason}"):
+                 return False
+-            if self.paper_trader.has_open_position() or not pair.ce_id:
++            if self.paper_trader.has_open_position(pair.index) or not pair.ce_id:
+                 return False
+             new_ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
+             accepted = self.paper_trader.on_entry(pair.ce_id, f"{pair.index}_CE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}", metadata=tri_meta)
+@@ -717,7 +720,7 @@ class TradingRuntimeCoordinator:
+             old_ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
+             if old_secid and old_secid in self.paper_trader.positions and not self._attempt_exit_once(pair, old_secid, old_tag, float(old_ltp), f"TRI_WAVE_FLIP_EXIT:{signal.reason}"):
+                 return False
+-            if self.paper_trader.has_open_position() or not pair.pe_id:
++            if self.paper_trader.has_open_position(pair.index) or not pair.pe_id:
+                 return False
+             new_ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
+             accepted = self.paper_trader.on_entry(pair.pe_id, f"{pair.index}_PE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}", metadata=tri_meta)
+diff --git a/dhan_engine/config/settings.py b/dhan_engine/config/settings.py
+index 5a1a2f5..110bc75 100644
+--- a/dhan_engine/config/settings.py
++++ b/dhan_engine/config/settings.py
+@@ -26,6 +26,7 @@ class RuntimeSettings:
+             "NIFTY": 50,
+             "BANKNIFTY": 100,
+             "FINNIFTY": 50,
++            "HDFCBANK": 20,
+         }
+     )
+     option_exchange_segment: str = "NSE_FNO"
+diff --git a/dhan_engine/domain/market/tri_wave_v2_brain.py b/dhan_engine/domain/market/tri_wave_v2_brain.py
+index 5893b4f..25e9197 100644
+--- a/dhan_engine/domain/market/tri_wave_v2_brain.py
++++ b/dhan_engine/domain/market/tri_wave_v2_brain.py
+@@ -35,17 +35,29 @@ class TriWaveV2Brain:
+         0: {"cycle_day":4,"label":"MON_D4","hard_hold_sec":20,"hard_loss_points":3.5,"hard_loss_pct":-4.0,"max_loss_rupees":225.0},
+         1: {"cycle_day":5,"label":"TUE_D5","hard_hold_sec":10,"hard_loss_points":3.0,"hard_loss_pct":-3.5,"max_loss_rupees":195.0},
+     }
++    SYMBOL_EXPIRY_DAY_PROFILES={
++        "HDFCBANK":{
++            2: {"cycle_day":1,"label":"HDFCBANK_WED_D1","hard_hold_sec":60,"hard_loss_points":2.5,"hard_loss_pct":-5.0,"max_loss_rupees":1375.0},
++            3: {"cycle_day":2,"label":"HDFCBANK_THU_D2","hard_hold_sec":45,"hard_loss_points":2.2,"hard_loss_pct":-4.5,"max_loss_rupees":1210.0},
++            4: {"cycle_day":3,"label":"HDFCBANK_FRI_D3","hard_hold_sec":30,"hard_loss_points":1.8,"hard_loss_pct":-4.0,"max_loss_rupees":990.0},
++            0: {"cycle_day":4,"label":"HDFCBANK_MON_D4","hard_hold_sec":20,"hard_loss_points":1.5,"hard_loss_pct":-3.5,"max_loss_rupees":825.0},
++            1: {"cycle_day":5,"label":"HDFCBANK_TUE_D5","hard_hold_sec":10,"hard_loss_points":1.2,"hard_loss_pct":-3.0,"max_loss_rupees":660.0},
++        },
++    }
+     def __init__(self):
+         self.streams=defaultdict(lambda:{k:TriWaveStreamState(stream=k) for k in ("FUT","CE","PE")}); self.pos=defaultdict(TriWavePositionState); self._exit_conf=defaultdict(int); self._last_wait_log=defaultdict(float); self._last_visual=defaultdict(float); self._entry_confirm=defaultdict(lambda:{"side":None,"count":0,"first_ts":0.0,"last_ts":0.0,"last_reason":None}); self._exit_health_memory=defaultdict(lambda:deque(maxlen=12))
+ 
+-    def _expiry_day_profile(self, now: Optional[float] = None) -> dict:
++    def _expiry_day_profile(self, index: str, now: Optional[float] = None) -> dict:
+         dt=datetime.fromtimestamp(now or time.time(), self.MARKET_TZ)
+-        profile=dict(self.EXPIRY_DAY_PROFILES.get(dt.weekday(), self.EXPIRY_DAY_PROFILES[2]))
++        symbol=str(index).upper().strip()
++        profiles=self.SYMBOL_EXPIRY_DAY_PROFILES.get(symbol,self.EXPIRY_DAY_PROFILES)
++        profile=dict(profiles.get(dt.weekday(), profiles[2]))
+         profile["weekday"]=dt.weekday()
++        profile["symbol"]=symbol
+         return profile
+ 
+-    def _day_hard_adverse_reason(self, *, now: float, hold: float, pnl_pct: float, gross_points: float, gross_rupees: float) -> tuple[Optional[str], dict]:
+-        profile=self._expiry_day_profile(now)
++    def _day_hard_adverse_reason(self, *, index: str, now: float, hold: float, pnl_pct: float, gross_points: float, gross_rupees: float) -> tuple[Optional[str], dict]:
++        profile=self._expiry_day_profile(index, now)
+         if not self.DAY_AWARE_ENABLED:
+             return None,profile
+         if hold<profile["hard_hold_sec"] or gross_points>=0:
+@@ -260,9 +272,10 @@ class TriWaveV2Brain:
+         if not ce.stats or not pe.stats or not fut.stats: return TriWaveV2Signal()
+         if active_position:
+             side=active_position.get("side"); tgt=ce if side=="CE" else pe; p=self.pos[index]; entry=active_position.get("entry",p.entry_price or tgt.last_ltp); pnl=((tgt.last_ltp-entry)/max(entry,1e-9))*100.0; hold=now-float(active_position.get("entry_ts",p.entry_ts or now)); p.best_price=max(p.best_price,tgt.last_ltp); p.peak_pnl_pct=max(p.peak_pnl_pct,pnl)
+-            gross_points=tgt.last_ltp-entry; gross_rupees=gross_points*self.LOT_SIZE; net_rupees=gross_rupees-self.ROUND_TRIP_FEE
++            qty=int(active_position.get("qty",0) or self.LOT_SIZE)
++            gross_points=tgt.last_ltp-entry; gross_rupees=gross_points*qty; net_rupees=gross_rupees-self.ROUND_TRIP_FEE
+             profit_enough=(net_rupees>=self.MIN_NET_PROFIT_EXIT or gross_points>=self.MIN_GROSS_POINTS_FOR_PROFIT_EXIT)
+-            day_hard_reason,day_profile=self._day_hard_adverse_reason(now=now,hold=hold,pnl_pct=pnl,gross_points=gross_points,gross_rupees=gross_rupees)
++            day_hard_reason,day_profile=self._day_hard_adverse_reason(index=index,now=now,hold=hold,pnl_pct=pnl,gross_points=gross_points,gross_rupees=gross_rupees)
+             if day_hard_reason:
+                 logger.info("TRI_WAVE_V2_DAY_HARD_ADVERSE | index=%s | side=%s | day=%s | hold=%.2f | entry=%.2f | price=%.2f | pnl_pct=%.2f | gross_points=%.2f | gross_rupees=%.2f | hard_hold=%.2f | hard_points=%.2f | hard_pct=%.2f | max_loss_rupees=%.2f",index,side,day_profile["label"],hold,entry,tgt.last_ltp,pnl,gross_points,gross_rupees,day_profile["hard_hold_sec"],day_profile["hard_loss_points"],day_profile["hard_loss_pct"],day_profile["max_loss_rupees"])
+                 return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason=f"TRI_WAVE_V2_EXIT:{day_hard_reason}",confidence=0.98,diagnostics={"expiry_day_profile":day_profile})
+diff --git a/dhan_engine/infrastructure/dhan/instrument_master.py b/dhan_engine/infrastructure/dhan/instrument_master.py
+index a4cbd73..1a2dfd2 100644
+--- a/dhan_engine/infrastructure/dhan/instrument_master.py
++++ b/dhan_engine/infrastructure/dhan/instrument_master.py
+@@ -56,6 +56,11 @@ class InstrumentMaster:
+         self._opt_cache = {}
+         self._fut_cache = {}
+         self._index_cache = {}
++        self._equity_cache = {}
++
++    @staticmethod
++    def _is_index_symbol(symbol: str) -> bool:
++        return str(symbol).upper().strip() in {"NIFTY", "BANKNIFTY", "FINNIFTY"}
+ 
+     # ---------------------------------------------------
+     # Logging
+@@ -85,20 +90,21 @@ class InstrumentMaster:
+         return dt.date().weekday() == 1  # Tuesday
+ 
+     # ---------------------------------------------------
+-    # Internal: OPTIDX filtered dataframe for index
++    # Internal: option dataframe for index or stock
+     # ---------------------------------------------------
+     def _get_optidx_df(self, index: str):
+         idx = str(index).upper().strip()
+         if idx in self._opt_cache:
+             return self._opt_cache[idx]
+ 
+-        self._log(f"🔎 Filtering OPTIDX for {idx}")
++        instrument_name = "OPTIDX" if self._is_index_symbol(idx) else "OPTSTK"
++        self._log(f"Filtering {instrument_name} for {idx}")
+ 
+         df = self.df
+         opts = df[
+             (df["SEM_EXM_EXCH_ID"] == "NSE")
+             & (df["SEM_SEGMENT"] == "D")
+-            & (df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == "OPTIDX")
++            & (df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == instrument_name)
+             & (df["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.startswith(idx, na=False))
+         ].copy()
+ 
+@@ -106,31 +112,32 @@ class InstrumentMaster:
+             subset=["SEM_EXPIRY_DATE", "SEM_STRIKE_PRICE", "SEM_SMST_SECURITY_ID", "SEM_OPTION_TYPE"]
+         )
+ 
+-        self._log(f"   ➜ Found {len(opts)} OPTIDX rows")
++        self._log(f"   Found {len(opts)} {instrument_name} rows")
+         self._opt_cache[idx] = opts
+         return opts
+ 
+     # ---------------------------------------------------
+-    # Internal: FUTIDX filtered dataframe for index
++    # Internal: future dataframe for index or stock
+     # ---------------------------------------------------
+     def _get_futidx_df(self, index: str):
+         idx = str(index).upper().strip()
+         if idx in self._fut_cache:
+             return self._fut_cache[idx]
+ 
+-        self._log(f"🔎 Filtering FUTIDX for {idx}")
++        instrument_name = "FUTIDX" if self._is_index_symbol(idx) else "FUTSTK"
++        self._log(f"Filtering {instrument_name} for {idx}")
+ 
+         df = self.df
+         fut = df[
+             (df["SEM_EXM_EXCH_ID"] == "NSE")
+             & (df["SEM_SEGMENT"] == "D")
+-            & (df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == "FUTIDX")
++            & (df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == instrument_name)
+             & (df["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.startswith(idx, na=False))
+         ].copy()
+ 
+         fut = fut.dropna(subset=["SEM_EXPIRY_DATE", "SEM_SMST_SECURITY_ID"])
+ 
+-        self._log(f"   ➜ Found {len(fut)} FUTIDX rows")
++        self._log(f"   Found {len(fut)} {instrument_name} rows")
+         self._fut_cache[idx] = fut
+         return fut
+ 
+@@ -183,7 +190,8 @@ class InstrumentMaster:
+         opts2 = opts[opts["SEM_EXPIRY_DATE"] >= now].copy()
+ 
+         if opts2.empty:
+-            raise Exception(f"❌ No OPTIDX expiry >= now for {idx}")
++            instrument_name = "OPTIDX" if self._is_index_symbol(idx) else "OPTSTK"
++            raise Exception(f"❌ No {instrument_name} expiry >= now for {idx}")
+ 
+         expiries = opts2["SEM_EXPIRY_DATE"].dropna().drop_duplicates().sort_values()
+ 
+@@ -196,6 +204,11 @@ class InstrumentMaster:
+             self._log(f"📅 {idx} nearest expiry selected: {chosen.date()}")
+             return chosen
+ 
++        if not self._is_index_symbol(idx):
++            chosen = expiries.iloc[0]
++            self._log(f"{idx} stock option expiry selected: {chosen.date()}")
++            return chosen
++
+         # BANKNIFTY / FINNIFTY -> monthly only (prefer last Tuesday)
+         monthly = [d for d in expiries.tolist() if self._is_last_tuesday(d)]
+         if monthly:
+@@ -298,3 +311,36 @@ class InstrumentMaster:
+             return secid
+ 
+         raise Exception(f"❌ No INDEX security id found for {idx}")
++
++    def get_equity_security_id(self, symbol: str) -> int:
++        sym = str(symbol).upper().strip()
++        if sym in self._equity_cache:
++            return self._equity_cache[sym]
++
++        self._log(f"Finding EQUITY security id for {sym}")
++        df = self.df[
++            (self.df["SEM_EXM_EXCH_ID"] == "NSE")
++            & (self.df["SEM_SEGMENT"].astype(str).str.upper().isin({"E", "C"}))
++            & (self.df["SEM_TRADING_SYMBOL"].astype(str).str.upper() == sym)
++        ].copy()
++
++        if df.empty:
++            df = self.df[
++                (self.df["SEM_EXM_EXCH_ID"] == "NSE")
++                & (self.df["SEM_SEGMENT"].astype(str).str.upper().isin({"E", "C"}))
++                & (self.df["SEM_CUSTOM_SYMBOL"].astype(str).str.upper().str.contains(sym, na=False))
++            ].copy()
++
++        if df.empty:
++            raise Exception(f"No EQUITY security id found for {sym}")
++
++        secid = int(float(df.iloc[0]["SEM_SMST_SECURITY_ID"]))
++        self._equity_cache[sym] = secid
++        self._log(f"EQUITY_SID | {sym} => {secid}")
++        return secid
++
++    def get_option_chain_underlying(self, symbol: str) -> tuple[int, str]:
++        sym = str(symbol).upper().strip()
++        if self._is_index_symbol(sym):
++            return self.get_index_security_id(sym), "IDX_I"
++        return self.get_equity_security_id(sym), "NSE_EQ"
+diff --git a/dhan_engine/infrastructure/dhan/option_chain_selector.py b/dhan_engine/infrastructure/dhan/option_chain_selector.py
+index c513add..6882340 100644
+--- a/dhan_engine/infrastructure/dhan/option_chain_selector.py
++++ b/dhan_engine/infrastructure/dhan/option_chain_selector.py
+@@ -8,18 +8,21 @@ PREMIUM_FILTER = {
+     "NIFTY": (10, 40),
+     "BANKNIFTY": (200, 450),
+     "FINNIFTY": (80, 250),
++    "HDFCBANK": (8, 90),
+ }
+ 
+ DELTA_FILTER = {
+     "NIFTY": (0.35, 0.65),
+     "BANKNIFTY": (0.30, 0.60),
+     "FINNIFTY": (0.30, 0.60),
++    "HDFCBANK": (0.25, 0.65),
+ }
+ 
+ SPREAD_MAX_PCT = {
+     "NIFTY": 0.012,
+     "BANKNIFTY": 0.010,
+     "FINNIFTY": 0.012,
++    "HDFCBANK": 0.025,
+ }
+ 
+ 
+@@ -103,9 +106,8 @@ class OptionChainSelector:
+         expiry = self.im.get_nearest_option_expiry(index, prefer_weekly=True)
+         expiry_str = expiry.strftime("%Y-%m-%d")
+ 
+-        # ✅ FIX: Always use INDEX (spot) security id
+-        underlying_scrip = self.im.get_index_security_id(index)
+-        seg = "IDX_I"
++        # Use index spot for indices and equity spot for stock options.
++        underlying_scrip, seg = self.im.get_option_chain_underlying(index)
+ 
+         payload = {
+             "UnderlyingScrip": int(underlying_scrip),
+@@ -116,7 +118,7 @@ class OptionChainSelector:
+         if self.debug:
+             print(
+                 f"⛓️ OPTIONCHAIN REQ | {index} | "
+-                f"INDEX_SID:{underlying_scrip} | SEG:{seg} | EXP:{expiry_str}"
++                f"UNDERLYING_SID:{underlying_scrip} | SEG:{seg} | EXP:{expiry_str}"
+             )
+ 
+         for attempt in range(1, 4):
+diff --git a/dhan_engine/simulations/paper_trade_manager.py b/dhan_engine/simulations/paper_trade_manager.py
+index 8c6540b..283ad9b 100644
+--- a/dhan_engine/simulations/paper_trade_manager.py
++++ b/dhan_engine/simulations/paper_trade_manager.py
+@@ -21,6 +21,7 @@ class PaperTradeManager:
+         "NIFTY": 65,
+         "BANKNIFTY": 30,
+         "FINNIFTY": 60,
++        "HDFCBANK": 550,
+     }
+     
+     IST = ZoneInfo("Asia/Kolkata")
+@@ -83,8 +84,14 @@ class PaperTradeManager:
+             self.opened_today = 0
+             self.closed_today = 0
+ 
+-    def has_open_position(self):
+-        return len(self.positions) > 0
++    def has_open_position(self, index: str | None = None):
++        if index is None:
++            return len(self.positions) > 0
++        idx = str(index).upper().strip()
++        return any(self._extract_index(str(pos.get("tag", ""))) == idx for pos in self.positions.values())
++
++    def open_position_tags(self):
++        return [str(pos.get("tag", "")) for pos in self.positions.values()]
+ 
+     def debug_position_snapshot(self):
+         print("PAPER_TRADER_STATE →", {
+@@ -98,14 +105,18 @@ class PaperTradeManager:
+     # ENTRY
+     # --------------------------------------------------
+     def on_entry(self, secid, tag, side, ltp, lots=1, reason="ENTRY", metadata: dict | None = None):
+-        # 🚫 BLOCK ANY NEW ENTRY IF ONE EXISTS
+-        if self.has_open_position():
++        index = self._extract_index(tag)
++        if not index:
++            self.debug_position_snapshot()
++            return False
++
++        # Allow one active paper position per symbol, so NIFTY and HDFCBANK can run together.
++        if self.has_open_position(index):
+             print(
+-                f"⛔ ENTRY_BLOCKED_SINGLE_POSITION | Attempt:{tag} | Reason:Existing position active"
++                f"ENTRY_BLOCKED_INDEX_POSITION | Attempt:{tag} | Index:{index} | Existing:{self.open_position_tags()}"
+             )
+             self.debug_position_snapshot()
+             return False
+-
+         # if self.has_open_position():
+         #     existing = next(iter(self.positions.values()))
+         #     if existing["tag"] != tag:
+-- 
+2.50.0.windows.2
