@@ -6,8 +6,12 @@ from typing import Dict, Tuple
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
+from dhan_engine.config.hdfcbank_live_profile import install_hdfcbank_live_profile
+
 
 load_dotenv()
+
+DEFAULT_INDEXES: Tuple[str, ...] = ("NIFTY", "HDFCBANK")
 
 
 @dataclass(frozen=True)
@@ -20,12 +24,13 @@ class BrokerCredentials:
 class RuntimeSettings:
     credentials: BrokerCredentials
     csv_file: str = "api-scrip-master.csv"
-    indexes: Tuple[str, ...] = ("NIFTY",)
+    indexes: Tuple[str, ...] = DEFAULT_INDEXES
     strike_step: Dict[str, int] = field(
         default_factory=lambda: {
             "NIFTY": 50,
             "BANKNIFTY": 100,
             "FINNIFTY": 50,
+            "HDFCBANK": 20,
         }
     )
     option_exchange_segment: str = "NSE_FNO"
@@ -57,12 +62,14 @@ def _csv_file() -> str:
 
 
 def _indexes() -> Tuple[str, ...]:
-    raw = os.getenv("INDEXES", "NIFTY")
+    raw = os.getenv("INDEXES", ",".join(DEFAULT_INDEXES))
     indexes = tuple(part.strip().upper() for part in raw.split(",") if part.strip())
-    return indexes or ("NIFTY",)
+    return indexes or DEFAULT_INDEXES
 
 
 def load_settings() -> RuntimeSettings:
+    install_hdfcbank_live_profile()
+
     access_token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
     client_id = os.getenv("DHAN_CLIENT_ID", "").strip()
     if not access_token or not client_id:
