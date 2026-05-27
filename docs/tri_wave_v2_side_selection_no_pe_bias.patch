@@ -1,0 +1,45 @@
+diff --git a/dhan_engine/domain/market/tri_wave_v2_brain.py b/dhan_engine/domain/market/tri_wave_v2_brain.py
+--- a/dhan_engine/domain/market/tri_wave_v2_brain.py
++++ b/dhan_engine/domain/market/tri_wave_v2_brain.py
+@@
+         logger.info("TRI_WAVE_V2_ENTRY_CANDIDATE_OK | index=%s | side=%s | phase=%s | support=%.2f | risk=%.2f | edge=%.2f | fut_phase=%s | fut_last5=%.2f | fut_velocity=%.2f | opposite_edge=%.2f",index,"PE",pe.phase,pe.stats.get("dynamic_support_score",0.0),pe.stats.get("dynamic_risk_score",0.0),pe.stats.get("dynamic_edge",0.0),fut.phase,fut.stats.get("last_5_delta",0.0),fut.stats.get("velocity",0.0),ce.stats.get("dynamic_edge",0.0))
+         return True,"PE_OK"
+ 
++    def _entry_side_score(self,s):
++        return (
++            float(s.stats.get("dynamic_edge",0.0) or 0.0),
++            float(s.stats.get("dynamic_support_score",0.0) or 0.0),
++            -float(s.stats.get("dynamic_risk_score",0.0) or 0.0),
++            float(s.stats.get("last_5_delta",0.0) or 0.0),
++            float(s.stats.get("velocity",0.0) or 0.0),
++            -float(s.stats.get("position_in_range",0.0) or 0.0),
++        )
++
++    def _choose_entry_side(self,index,fut,ce,pe):
++        ce_score=self._entry_side_score(ce)
++        pe_score=self._entry_side_score(pe)
++        fut_last5=float(fut.stats.get("last_5_delta",0.0) or 0.0)
++        fut_velocity=float(fut.stats.get("velocity",0.0) or 0.0)
++        if ce_score>pe_score:
++            selected="CE"; selection_reason="CE_SCORE_STRONGER"
++        elif pe_score>ce_score:
++            selected="PE"; selection_reason="PE_SCORE_STRONGER"
++        elif fut.phase in {"RECOVERY","EXPANSION"} or fut_last5>0 or fut_velocity>0:
++            selected="CE"; selection_reason="TIE_FUT_SUPPORTS_CE"
++        elif fut.phase in {"PULLBACK","REVERSAL","EXHAUSTION"} or fut_last5<0 or fut_velocity<0:
++            selected="PE"; selection_reason="TIE_FUT_SUPPORTS_PE"
++        else:
++            selected=None; selection_reason="AMBIGUOUS_TIE_SKIP"
++        logger.info("TRI_WAVE_V2_SIDE_SELECTION | index=%s | selected=%s | reason=%s | ce_score=%s | pe_score=%s | fut_phase=%s | fut_last5=%.2f | fut_velocity=%.2f | ce_pos=%.2f | pe_pos=%.2f",index,selected,selection_reason,ce_score,pe_score,fut.phase,fut_last5,fut_velocity,ce.stats.get("position_in_range",0.0),pe.stats.get("position_in_range",0.0))
++        return selected,selection_reason
++
+ 
+     def _confirm_entry(self,index:str,side:str,reason:str,now:float)->tuple[bool,int,bool]:
+         state=self._entry_confirm[index]
+@@
+-        best="CE" if (ce.stats.get("dynamic_edge",0.0),ce.stats.get("dynamic_support_score",0.0),-ce.stats.get("dynamic_risk_score",0.0))>(pe.stats.get("dynamic_edge",0.0),pe.stats.get("dynamic_support_score",0.0),-pe.stats.get("dynamic_risk_score",0.0)) else "PE"
++        best,selection_reason=self._choose_entry_side(index,fut,ce,pe)
++        if not best:
++            return TriWaveV2Signal(reason=f"TRI_WAVE_V2_ENTRY:AMBIGUOUS_SIDE:{selection_reason}",confidence=0.0)
+         reason=ce_reason if best=="CE" else pe_reason
+         confirmed,count,started=self._confirm_entry(index,best,reason,now)
