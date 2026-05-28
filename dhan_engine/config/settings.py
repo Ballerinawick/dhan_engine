@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
 from dhan_engine.config.hdfcbank_live_profile import install_hdfcbank_live_profile
+from dhan_engine.config.optionchain_premium_fallback import install_optionchain_premium_fallback
 from dhan_engine.config.ws_safety_profile import install_ws_safety_profile
 
 
@@ -71,6 +72,7 @@ def _indexes() -> Tuple[str, ...]:
 def load_settings() -> RuntimeSettings:
     install_hdfcbank_live_profile()
     install_ws_safety_profile()
+    install_optionchain_premium_fallback()
 
     access_token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
     client_id = os.getenv("DHAN_CLIENT_ID", "").strip()
