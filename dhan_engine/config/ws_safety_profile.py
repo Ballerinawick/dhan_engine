@@ -31,6 +31,12 @@ def install_ws_safety_profile() -> None:
         self.full_quote_ltp_fresh_sec = float(os.getenv("FULL_QUOTE_LTP_FRESH_SEC", "15") or 15)
         self.trade_price_fresh_sec = float(os.getenv("TRADE_PRICE_FRESH_SEC", "20") or 20)
         self.future_startup_rest_fallback_sec = float(os.getenv("FUTURE_STARTUP_REST_FALLBACK_SEC", "8") or 8)
+        self.future_startup_option_chain_fallback_sec = float(
+            os.getenv("FUTURE_STARTUP_OPTION_CHAIN_FALLBACK_SEC", "12") or 12
+        )
+        self.future_startup_fallback_retry_sec = float(os.getenv("FUTURE_STARTUP_FALLBACK_RETRY_SEC", "15") or 15)
+        self._last_startup_rest_fallback_ts = 0.0
+        self._last_startup_chain_fallback_ts = 0.0
         self.future_ltp_rest = DhanLtpRestEngine(
             access_token=settings.credentials.access_token,
             client_id=settings.credentials.client_id,
@@ -105,6 +111,11 @@ def install_ws_safety_profile() -> None:
             logger.exception("FUTURE_REST_STARTUP_LTP_FAILED | secids=%s", missing)
             return
 
+        if not prices:
+            logger.warning("FUTURE_REST_STARTUP_LTP_EMPTY | secids=%s | segment=%s", missing, self.settings.future_exchange_segment)
+            return
+
+        used = set()
         for secid, ltp in prices.items():
             if not ltp or float(ltp) <= 0:
                 continue
@@ -120,11 +131,50 @@ def install_ws_safety_profile() -> None:
                     "feature_source": "REST_LTP_STARTUP_FALLBACK",
                 }
             )
+            used.add(index)
             logger.warning(
                 "FUTURE_REST_STARTUP_LTP_USED | index=%s | secid=%s | ltp=%.2f | reason=ws_first_tick_missing",
                 index,
                 int(secid),
                 float(ltp),
+            )
+
+        missing_after = [index for index in self.settings.indexes if not self.pairs[index].underlying_ltp]
+        if missing_after:
+            logger.warning("FUTURE_REST_STARTUP_LTP_MISSING | indexes=%s | used=%s", ",".join(missing_after), ",".join(sorted(used)))
+
+    def seed_missing_underlyings_from_option_chain(self) -> None:
+        missing_indexes = [index for index in self.settings.indexes if not self.pairs[index].underlying_ltp]
+        if not missing_indexes:
+            return
+
+        for index in missing_indexes:
+            try:
+                data = self.selector.fetch_chain(index) or {}
+                ltp = float(data.get("last_price", 0.0) or 0.0)
+            except Exception:
+                logger.exception("OPTIONCHAIN_STARTUP_LTP_FAILED | index=%s", index)
+                continue
+
+            if ltp <= 0:
+                logger.warning("OPTIONCHAIN_STARTUP_LTP_EMPTY | index=%s", index)
+                continue
+
+            secid = int(self.future_secids.get(index, 0) or 0)
+            self.pairs[index].update_underlying_quote(
+                {
+                    "ltp": ltp,
+                    "secid": secid,
+                    "tag": f"{index}_FUT",
+                    "ts": time.time(),
+                    "feature_source": "OPTIONCHAIN_STARTUP_FALLBACK",
+                }
+            )
+            logger.warning(
+                "OPTIONCHAIN_STARTUP_LTP_USED | index=%s | secid=%s | ltp=%.2f | reason=future_ws_and_rest_missing",
+                index,
+                secid,
+                ltp,
             )
 
     def retry_future_ws_startup(self) -> None:
@@ -155,14 +205,33 @@ def install_ws_safety_profile() -> None:
             self._future_ready.wait(timeout=self.settings.startup_wait_sec)
             if self._all_underlyings_ready():
                 break
-            if time.time() - wait_started >= float(getattr(self, "future_startup_rest_fallback_sec", 8.0)):
-                seed_missing_underlyings_from_rest(self)
-                if self._all_underlyings_ready():
-                    logger.warning(
-                        "FUTURE_WS_STARTUP_REST_FALLBACK_READY | indexes=%s",
-                        ",".join(index for index in self.settings.indexes if self.pairs[index].underlying_ltp),
-                    )
-                    break
+
+            now = time.time()
+            elapsed = now - wait_started
+            fallback_retry_sec = float(getattr(self, "future_startup_fallback_retry_sec", 15.0))
+
+            if elapsed >= float(getattr(self, "future_startup_rest_fallback_sec", 8.0)):
+                if now - float(getattr(self, "_last_startup_rest_fallback_ts", 0.0)) >= fallback_retry_sec:
+                    self._last_startup_rest_fallback_ts = now
+                    seed_missing_underlyings_from_rest(self)
+                    if self._all_underlyings_ready():
+                        logger.warning(
+                            "FUTURE_WS_STARTUP_REST_FALLBACK_READY | indexes=%s",
+                            ",".join(index for index in self.settings.indexes if self.pairs[index].underlying_ltp),
+                        )
+                        break
+
+            if elapsed >= float(getattr(self, "future_startup_option_chain_fallback_sec", 12.0)):
+                if now - float(getattr(self, "_last_startup_chain_fallback_ts", 0.0)) >= fallback_retry_sec:
+                    self._last_startup_chain_fallback_ts = now
+                    seed_missing_underlyings_from_option_chain(self)
+                    if self._all_underlyings_ready():
+                        logger.warning(
+                            "FUTURE_WS_STARTUP_OPTIONCHAIN_FALLBACK_READY | indexes=%s",
+                            ",".join(index for index in self.settings.indexes if self.pairs[index].underlying_ltp),
+                        )
+                        break
+
             logger.info("FUTURE_WS_STARTUP_RETRY")
             retry_future_ws_startup(self)
         logger.info("Future websocket LTP stream ready")
@@ -312,6 +381,7 @@ def install_ws_safety_profile() -> None:
     TradingRuntimeCoordinator.__init__ = runtime_init
     TradingRuntimeCoordinator._wait_for_underlyings = wait_for_underlyings
     TradingRuntimeCoordinator._seed_missing_underlyings_from_rest = seed_missing_underlyings_from_rest
+    TradingRuntimeCoordinator._seed_missing_underlyings_from_option_chain = seed_missing_underlyings_from_option_chain
     TradingRuntimeCoordinator._retry_future_ws_startup = retry_future_ws_startup
     TradingRuntimeCoordinator._on_option_full_quote = on_option_full_quote
     TradingRuntimeCoordinator._is_full_ltp_fresh = is_full_ltp_fresh
