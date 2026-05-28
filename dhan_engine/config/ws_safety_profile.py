@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import Optional
 
@@ -18,6 +19,7 @@ def install_ws_safety_profile() -> None:
         return
 
     original_runtime_init = TradingRuntimeCoordinator.__init__
+    original_select_and_subscribe = TradingRuntimeCoordinator._select_and_subscribe_option_pairs
     original_execute_tri_wave_signal = TradingRuntimeCoordinator._execute_tri_wave_signal
     original_ws_init = DhanLiveMarketFeedWS.__init__
     original_ws_on_error = DhanLiveMarketFeedWS._on_error
@@ -35,9 +37,20 @@ def install_ws_safety_profile() -> None:
             os.getenv("FUTURE_STARTUP_OPTION_CHAIN_FALLBACK_SEC", "12") or 12
         )
         self.future_startup_fallback_retry_sec = float(os.getenv("FUTURE_STARTUP_FALLBACK_RETRY_SEC", "15") or 15)
+        self.option_rest_fallback_enabled = os.getenv("OPTION_REST_LTP_FALLBACK", "1").strip() != "0"
+        self.option_rest_fallback_after_sec = float(os.getenv("OPTION_REST_FALLBACK_AFTER_SEC", "20") or 20)
+        self.option_rest_poll_sec = max(float(os.getenv("OPTION_REST_POLL_SEC", "1.25") or 1.25), 1.05)
         self._last_startup_rest_fallback_ts = 0.0
         self._last_startup_chain_fallback_ts = 0.0
+        self._option_rest_fallback_stop = threading.Event()
+        self._option_rest_fallback_thread = None
         self.future_ltp_rest = DhanLtpRestEngine(
+            access_token=settings.credentials.access_token,
+            client_id=settings.credentials.client_id,
+            timeout_sec=5.0,
+            debug=False,
+        )
+        self.option_ltp_rest = DhanLtpRestEngine(
             access_token=settings.credentials.access_token,
             client_id=settings.credentials.client_id,
             timeout_sec=5.0,
@@ -64,6 +77,116 @@ def install_ws_safety_profile() -> None:
         ts = float(payload.get("ts", 0.0) or 0.0)
         return time.time() - ts if ts else None
 
+    def selected_option_tags(self) -> dict[int, tuple[str, str]]:
+        selected = {}
+        for index, pair in self.pairs.items():
+            if pair.ce_id:
+                selected[int(pair.ce_id)] = (index, "CE")
+            if pair.pe_id:
+                selected[int(pair.pe_id)] = (index, "PE")
+        return selected
+
+    def stale_selected_option_secids(self) -> dict[int, tuple[str, str]]:
+        now = time.time()
+        stale_after = float(getattr(self, "option_rest_fallback_after_sec", 20.0))
+        stale = {}
+        for secid, meta in selected_option_tags(self).items():
+            tick_ts = float(getattr(self, "option_last_tick_ts_by_secid", {}).get(secid, 0.0) or 0.0)
+            full_ts = float(getattr(self, "option_full_ltp_ts_by_secid", {}).get(secid, 0.0) or 0.0)
+            latest_ts = max(tick_ts, full_ts)
+            if not latest_ts or now - latest_ts >= stale_after:
+                stale[secid] = meta
+        return stale
+
+    def build_rest_option_tick(self, secid: int, index: str, side: str, ltp: float) -> dict:
+        now = time.time()
+        return {
+            "ltp": float(ltp),
+            "secid": int(secid),
+            "tag": f"{index}_{side}",
+            "ts": now,
+            "feature_source": "REST_OPTION_LTP_FALLBACK",
+            "bid_price": float(ltp),
+            "ask_price": float(ltp),
+            "spread": 0.0,
+            "spread_pct": 0.0,
+            "recovery_score": 0.0,
+            "clean_trade_score": 0.0,
+            "exhaustion_score": 0.0,
+            "flow": 0.0,
+            "ofi": 0.0,
+            "depth_imbalance_5": 0.0,
+            "market_queue_imbalance": 0.0,
+        }
+
+    def apply_rest_option_prices(self, prices: dict[int, float], requested: dict[int, tuple[str, str]]) -> None:
+        if not prices:
+            logger.warning("OPTION_REST_LTP_EMPTY | secids=%s", sorted(requested))
+            return
+
+        for secid, ltp in prices.items():
+            secid_int = int(secid)
+            if secid_int not in requested or not ltp or float(ltp) <= 0:
+                continue
+            index, side = requested[secid_int]
+            pair = self.pairs.get(index)
+            if pair is None:
+                continue
+            raw = build_rest_option_tick(self, secid_int, index, side, float(ltp))
+            with self._lock:
+                if side == "CE":
+                    pair.ce_ltp = float(ltp)
+                    pair.ce_depth = raw
+                elif side == "PE":
+                    pair.pe_ltp = float(ltp)
+                    pair.pe_depth = raw
+                self.option_full_ltp_ts_by_secid[secid_int] = time.time()
+                self.latest_depth_features_by_secid[secid_int] = dict(raw)
+                if self.TRI_WAVE_V2_ONLY_MODE:
+                    self.tri_wave_recorder.record_tick(index=index, stream=side, secid=secid_int, ltp=float(ltp), features=dict(raw))
+                self._process_option_update(index, pair, secid_int, f"{index}_{side}", raw)
+            logger.info(
+                "OPTION_REST_LTP_FALLBACK_TICK | index=%s | side=%s | secid=%s | ltp=%.2f",
+                index,
+                side,
+                secid_int,
+                float(ltp),
+            )
+
+    def option_rest_fallback_loop(self) -> None:
+        logger.warning(
+            "OPTION_REST_LTP_FALLBACK_ACTIVE | stale_after=%.1f | poll_sec=%.2f",
+            float(getattr(self, "option_rest_fallback_after_sec", 20.0)),
+            float(getattr(self, "option_rest_poll_sec", 1.25)),
+        )
+        while not self._option_rest_fallback_stop.is_set():
+            try:
+                if self.market_open():
+                    requested = stale_selected_option_secids(self)
+                    if requested:
+                        prices = self.option_ltp_rest.fetch_ltp_map({self.settings.option_exchange_segment: sorted(requested)}) or {}
+                        apply_rest_option_prices(self, prices, requested)
+            except Exception:
+                logger.exception("OPTION_REST_LTP_FALLBACK_ERROR")
+            time.sleep(float(getattr(self, "option_rest_poll_sec", 1.25)))
+
+    def start_option_rest_fallback(self) -> None:
+        if not getattr(self, "option_rest_fallback_enabled", True):
+            logger.info("OPTION_REST_LTP_FALLBACK_DISABLED")
+            return
+        thread = getattr(self, "_option_rest_fallback_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        self._option_rest_fallback_stop.clear()
+        thread = threading.Thread(target=option_rest_fallback_loop, args=(self,), name="OptionRestLtpFallback", daemon=True)
+        self._option_rest_fallback_thread = thread
+        thread.start()
+
+    def select_and_subscribe_option_pairs(self) -> None:
+        result = original_select_and_subscribe(self)
+        start_option_rest_fallback(self)
+        return result
+
     def fresh_leg_ltp(self, pair, side: str, fallback_ltp: float = 0.0) -> tuple[float, str, bool]:
         side = str(side).upper()
         secid = pair.ce_id if side == "CE" else pair.pe_id if side == "PE" else None
@@ -77,7 +200,7 @@ def install_ws_safety_profile() -> None:
         if depth_payload and depth_payload.get("ltp"):
             ts = float(depth_payload.get("ts", 0.0) or 0.0)
             is_fresh = bool(ts and (now - ts) <= float(getattr(self, "trade_price_fresh_sec", 20.0)))
-            return float(depth_payload["ltp"]), "DEPTH", is_fresh
+            return float(depth_payload["ltp"]), str(depth_payload.get("feature_source", "DEPTH")), is_fresh
 
         return float(fallback_ltp or 0.0), "FALLBACK", False
 
@@ -379,9 +502,11 @@ def install_ws_safety_profile() -> None:
         return original_ws_on_message(self, ws, message)
 
     TradingRuntimeCoordinator.__init__ = runtime_init
+    TradingRuntimeCoordinator._select_and_subscribe_option_pairs = select_and_subscribe_option_pairs
     TradingRuntimeCoordinator._wait_for_underlyings = wait_for_underlyings
     TradingRuntimeCoordinator._seed_missing_underlyings_from_rest = seed_missing_underlyings_from_rest
     TradingRuntimeCoordinator._seed_missing_underlyings_from_option_chain = seed_missing_underlyings_from_option_chain
+    TradingRuntimeCoordinator._start_option_rest_fallback = start_option_rest_fallback
     TradingRuntimeCoordinator._retry_future_ws_startup = retry_future_ws_startup
     TradingRuntimeCoordinator._on_option_full_quote = on_option_full_quote
     TradingRuntimeCoordinator._is_full_ltp_fresh = is_full_ltp_fresh
