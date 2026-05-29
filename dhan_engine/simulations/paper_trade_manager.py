@@ -1,3 +1,4 @@
+import os
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -43,6 +44,7 @@ class PaperTradeManager:
 
         self.last_log_ts = 0.0
         self.log_interval = log_interval_sec
+        self.stale_position_exit_sec = float(os.getenv("STALE_POSITION_EXIT_SEC", "90") or 90)
 
         # Metrics
         self.entries_total = 0
@@ -155,6 +157,7 @@ class PaperTradeManager:
             "entry": float(ltp),
             "ltp": float(ltp),
             "entry_ts": now_ts,
+            "last_tick_ts": now_ts,
             "entry_reason": reason,
         }
         metadata = dict(metadata or {})
@@ -279,7 +282,18 @@ class PaperTradeManager:
 
         now_ts = time.time()
 
-        for secid, pos in self.positions.items():
+        for secid, pos in list(self.positions.items()):
+            last_tick_ts = float(pos.get("last_tick_ts") or pos.get("entry_ts") or now_ts)
+            stale_age = now_ts - last_tick_ts
+            if self.stale_position_exit_sec > 0 and stale_age >= self.stale_position_exit_sec:
+                ltp = float(pos.get("ltp", pos.get("entry", 0.0)) or 0.0)
+                print(
+                    f"⚠️ STALE_POSITION_EXIT | {pos['tag']} | "
+                    f"secid:{secid} | stale_for:{stale_age:.1f}s | ltp:{ltp:.2f}"
+                )
+                self.on_exit(secid, ltp, reason="TRI_WAVE_V2_EXIT:STALE_MARKET_DATA")
+                continue
+
             entry = float(pos["entry"])
             ltp = float(pos.get("ltp", entry))
             qty = int(pos["qty"])
@@ -305,6 +319,7 @@ class PaperTradeManager:
     def on_tick(self, secid, ltp):
         if secid in self.positions:
             self.positions[secid]["ltp"] = float(ltp)
+            self.positions[secid]["last_tick_ts"] = time.time()
 
         # OPTIONAL DEBUG LOG
         if self.enable_parsed_logs:
