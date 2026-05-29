@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 import time
 from requests import HTTPError
 
 
 def install_hdfcbank_live_profile() -> None:
-    """Enable HDFCBANK FUTSTK/OPTSTK without changing the NIFTY index path."""
+    """Enable stock-option profiles without changing the existing index path."""
     from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
     from dhan_engine.infrastructure.dhan import option_chain_selector as selector_module
     from dhan_engine.simulations.paper_trade_manager import PaperTradeManager
@@ -13,10 +14,25 @@ def install_hdfcbank_live_profile() -> None:
     if getattr(InstrumentMaster, "_hdfcbank_live_profile_installed", False):
         return
 
-    selector_module.PREMIUM_FILTER.setdefault("HDFCBANK", (8, 90))
-    selector_module.DELTA_FILTER.setdefault("HDFCBANK", (0.25, 0.65))
-    selector_module.SPREAD_MAX_PCT.setdefault("HDFCBANK", 0.025)
-    PaperTradeManager.LOT_SIZES.setdefault("HDFCBANK", 550)
+    stock_profiles = {
+        "HDFCBANK": {
+            "premium_filter": (8, 90),
+            "delta_filter": (0.25, 0.65),
+            "spread_max_pct": 0.025,
+            "lot_size": int(os.getenv("HDFCBANK_LOT_SIZE", "550") or 550),
+        },
+        "RELIANCE": {
+            "premium_filter": (8, 120),
+            "delta_filter": (0.25, 0.65),
+            "spread_max_pct": 0.025,
+            "lot_size": int(os.getenv("RELIANCE_LOT_SIZE", "500") or 500),
+        },
+    }
+    for symbol, profile in stock_profiles.items():
+        selector_module.PREMIUM_FILTER.setdefault(symbol, profile["premium_filter"])
+        selector_module.DELTA_FILTER.setdefault(symbol, profile["delta_filter"])
+        selector_module.SPREAD_MAX_PCT.setdefault(symbol, profile["spread_max_pct"])
+        PaperTradeManager.LOT_SIZES.setdefault(symbol, profile["lot_size"])
 
     original_init = InstrumentMaster.__init__
     original_get_nearest_option_expiry = InstrumentMaster.get_nearest_option_expiry

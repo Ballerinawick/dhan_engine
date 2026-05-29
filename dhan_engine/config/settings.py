@@ -11,7 +11,7 @@ from dhan_engine.config.hdfcbank_live_profile import install_hdfcbank_live_profi
 
 load_dotenv()
 
-DEFAULT_INDEXES: Tuple[str, ...] = ("NIFTY", "HDFCBANK")
+DEFAULT_INDEXES: Tuple[str, ...] = ("NIFTY", "BANKNIFTY", "HDFCBANK", "RELIANCE")
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,7 @@ class RuntimeSettings:
             "BANKNIFTY": 100,
             "FINNIFTY": 50,
             "HDFCBANK": 20,
+            "RELIANCE": 20,
         }
     )
     option_exchange_segment: str = "NSE_FNO"
