@@ -61,6 +61,7 @@ class DhanLiveMarketFeedWS:
         self._lock = threading.Lock()
         self._previous_features: Dict[int, dict] = {}
         self._last_feature_log_ts: Dict[int, float] = {}
+        self._last_message_ts = 0.0
         self._feed_parser = (
             DhanFeed(
                 client_id=self.client_id,
@@ -164,11 +165,16 @@ class DhanLiveMarketFeedWS:
 
     def _on_error(self, ws, error) -> None:
         print(f"FULLQUOTE_WS_ERROR | error={error}")
+        self._connected.clear()
+        try:
+            ws.close()
+        except Exception:
+            pass
 
     def _on_close(self, ws, code, message) -> None:
         self._connected.clear()
-        if self.debug:
-            print(f"WS_FULLQUOTE_CLOSED | code={code} | message={message}")
+        last_age = time.time() - self._last_message_ts if self._last_message_ts else -1.0
+        print(f"WS_FULLQUOTE_CLOSED | code={code} | message={message} | last_message_age={last_age:.2f}")
 
     def process_data(self, data: bytes):
         if self._feed_parser is None:
@@ -177,6 +183,7 @@ class DhanLiveMarketFeedWS:
 
     def _on_message(self, ws, message) -> None:
         try:
+            self._last_message_ts = time.time()
             if not isinstance(message, (bytes, bytearray)):
                 print("⚠️ NON-BINARY MESSAGE")
                 return
