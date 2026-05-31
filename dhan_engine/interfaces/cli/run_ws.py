@@ -2,6 +2,7 @@ import logging
 
 from dhan_engine.application.runtime import build_runtime
 from dhan_engine.config.settings import load_settings
+from dhan_engine.interfaces.web.session_viewer_server import start_session_viewer_server
 
 
 def configure_logging() -> None:
@@ -13,6 +14,7 @@ def configure_logging() -> None:
 
 def main() -> None:
     configure_logging()
+    start_session_viewer_server()
     settings = load_settings()
     runtime = build_runtime(settings)
     runtime.run()
@@ -20,4 +22,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
