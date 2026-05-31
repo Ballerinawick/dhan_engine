@@ -30,5 +30,6 @@ packages = [
   "dhan_engine.infrastructure.dhan",
   "dhan_engine.interfaces",
   "dhan_engine.interfaces.cli",
+  "dhan_engine.interfaces.web",
   "dhan_engine.simulations",
 ]
