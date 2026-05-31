@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TriWave Trade Viewer</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="app">
+    <aside class="sidebar">
+      <header class="brand">
+        <div>
+          <h1>TriWave Viewer</h1>
+          <p>Replay premium ticks, entries, exits, and wave features.</p>
+        </div>
+      </header>
+
+      <section class="panel">
+        <label class="file-control">
+          <span>ticks.jsonl</span>
+          <input id="ticksFile" type="file" accept=".jsonl,.log,.txt">
+        </label>
+        <label class="file-control">
+          <span>trades.jsonl</span>
+          <input id="tradesFile" type="file" accept=".jsonl,.log,.txt">
+        </label>
+        <label class="file-control">
+          <span>signals.jsonl</span>
+          <input id="signalsFile" type="file" accept=".jsonl,.log,.txt">
+        </label>
+      </section>
+
+      <section class="panel control-grid">
+        <label>
+          Cloud Session
+          <select id="sessionSelect"></select>
+        </label>
+        <label>
+          Symbol
+          <select id="seriesSelect"></select>
+        </label>
+        <label>
+          Timeframe
+          <select id="timeframeSelect">
+            <option value="5">5s</option>
+            <option value="15">15s</option>
+            <option value="30">30s</option>
+            <option value="60">1m</option>
+            <option value="180">3m</option>
+          </select>
+        </label>
+        <label>
+          Wave
+          <select id="featureSelect"></select>
+        </label>
+      </section>
+
+      <section class="panel stats" id="statsPanel"></section>
+      <section class="panel trades">
+        <h2>Trades</h2>
+        <div id="tradeList" class="trade-list"></div>
+      </section>
+    </aside>
+
+    <section class="workspace">
+      <div class="toolbar">
+        <div id="statusText">Load session files</div>
+        <div class="legend">
+          <span><i class="up"></i>Up</span>
+          <span><i class="down"></i>Down</span>
+          <span><i class="entry"></i>Entry</span>
+          <span><i class="exit"></i>Exit</span>
+        </div>
+      </div>
+
+      <div class="chart-stack">
+        <canvas id="priceCanvas"></canvas>
+        <canvas id="volumeCanvas"></canvas>
+        <canvas id="waveCanvas"></canvas>
+      </div>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>
