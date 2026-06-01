@@ -4,9 +4,16 @@ const state = {
   signals: [],
   sessions: [],
   seriesKey: "",
-  featureKey: "",
   timeframeSec: 5,
   selectedTrade: null,
+  selectedFeatures: new Set(),
+  viewStart: 0,
+  viewEnd: 1,
+  autoFollow: true,
+  eventSource: null,
+  liveCount: 0,
+  lastLiveTs: 0,
+  dragging: null,
 };
 
 const els = {
@@ -14,12 +21,19 @@ const els = {
   tradesFile: document.getElementById("tradesFile"),
   signalsFile: document.getElementById("signalsFile"),
   sessionSelect: document.getElementById("sessionSelect"),
-  seriesSelect: document.getElementById("seriesSelect"),
   timeframeSelect: document.getElementById("timeframeSelect"),
-  featureSelect: document.getElementById("featureSelect"),
+  showVolume: document.getElementById("showVolume"),
+  showWave: document.getElementById("showWave"),
+  showTrades: document.getElementById("showTrades"),
+  autoFollow: document.getElementById("autoFollow"),
+  featureList: document.getElementById("featureList"),
   statsPanel: document.getElementById("statsPanel"),
   tradeList: document.getElementById("tradeList"),
   statusText: document.getElementById("statusText"),
+  inspectText: document.getElementById("inspectText"),
+  liveBadge: document.getElementById("liveBadge"),
+  instrumentTabs: document.getElementById("instrumentTabs"),
+  chartStack: document.getElementById("chartStack"),
   priceCanvas: document.getElementById("priceCanvas"),
   volumeCanvas: document.getElementById("volumeCanvas"),
   waveCanvas: document.getElementById("waveCanvas"),
@@ -30,6 +44,7 @@ const NUMERIC_SKIP = new Set([
   "bid_price", "ask_price", "bid_qty", "ask_qty", "raw", "depth"
 ]);
 
+const WAVE_COLORS = ["--wave-a", "--wave-b", "--wave-c", "--entry", "--exit"];
 const viewerToken = new URLSearchParams(window.location.search).get("token") || "";
 
 function readJsonlFile(file, callback) {
@@ -68,7 +83,6 @@ async function loadCloudSessions() {
 }
 
 function renderSessionSelect() {
-  if (!els.sessionSelect) return;
   els.sessionSelect.innerHTML = state.sessions.length
     ? state.sessions.map((session, index) => `<option value="${index}">${escapeHtml(session.date)} / ${escapeHtml(session.expiry)}</option>`).join("")
     : `<option value="">Local files</option>`;
@@ -76,17 +90,54 @@ function renderSessionSelect() {
 
 async function loadCloudSession(session) {
   if (!session) return;
+  closeLiveStream();
+  setLive(false);
   els.statusText.textContent = `Loading ${session.date} / ${session.expiry}`;
-  const query = new URLSearchParams({ date: session.date, expiry: session.expiry, limit: "75000" });
+  const query = new URLSearchParams({ date: session.date, expiry: session.expiry, limit: "100000" });
   const response = await fetch(apiUrl(`/api/session?${query}`), { cache: "no-store" });
   if (!response.ok) throw new Error(`Session load failed: ${response.status}`);
   const payload = await response.json();
-  state.ticks = (payload.ticks || []).map(normalizeTick).filter((tick) => tick.ts && tick.ltp && tick.index && tick.stream);
+  state.ticks = dedupeTicks((payload.ticks || []).map(normalizeTick));
   state.trades = (payload.trades || []).map(normalizeTrade);
   state.signals = payload.signals || [];
   state.seriesKey = "";
   state.selectedTrade = null;
+  state.liveCount = 0;
+  resetView(true);
   render();
+  startLiveStream(session);
+}
+
+function startLiveStream(session) {
+  if (!window.EventSource || !session) return;
+  const query = new URLSearchParams({ date: session.date, expiry: session.expiry });
+  const source = new EventSource(apiUrl(`/api/live/stream?${query}`));
+  state.eventSource = source;
+  source.addEventListener("open", () => setLive(true));
+  source.addEventListener("tick", (event) => {
+    const tick = normalizeTick(JSON.parse(event.data));
+    if (!tick.ts || !tick.ltp || !tick.index || !tick.stream) return;
+    appendTick(tick);
+  });
+  source.addEventListener("trade", (event) => {
+    state.trades.push(normalizeTrade(JSON.parse(event.data), state.trades.length));
+    render();
+  });
+  source.addEventListener("signal", (event) => {
+    state.signals.push(JSON.parse(event.data));
+  });
+  source.onerror = () => setLive(false);
+}
+
+function closeLiveStream() {
+  if (state.eventSource) state.eventSource.close();
+  state.eventSource = null;
+}
+
+function setLive(active) {
+  els.liveBadge.textContent = active ? "Live" : "Offline";
+  els.liveBadge.classList.toggle("on", active);
+  els.liveBadge.classList.toggle("off", !active);
 }
 
 function apiUrl(path) {
@@ -103,19 +154,10 @@ function normalizeTick(row) {
   const index = String(row.index || features.index || "").toUpperCase();
   const stream = String(row.stream || features.stream || "").toUpperCase();
   const secid = Number(row.secid || features.secid || raw.security_id || raw.SecurityId || 0);
-  return {
-    ...row,
-    features,
-    ts,
-    ltp,
-    index,
-    stream,
-    secid,
-    key: `${index}_${stream}_${secid}`,
-  };
+  return { ...row, features, ts, ltp, index, stream, secid, key: `${index}_${stream}_${secid}` };
 }
 
-function normalizeTrade(row, idx) {
+function normalizeTrade(row, idx = 0) {
   const t = row.trade || row;
   const tag = String(t.tag || "");
   const parts = tag.split("_");
@@ -137,6 +179,39 @@ function normalizeTrade(row, idx) {
   };
 }
 
+function dedupeTicks(ticks) {
+  const seen = new Set();
+  return ticks.filter((tick) => {
+    if (!tick.ts || !tick.ltp || !tick.index || !tick.stream) return false;
+    const key = `${tick.key}:${tick.ts}:${tick.ltp}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function appendTick(tick) {
+  state.ticks.push(tick);
+  if (state.ticks.length > 160000) state.ticks.splice(0, state.ticks.length - 160000);
+  state.liveCount += 1;
+  state.lastLiveTs = Date.now();
+  if (!state.seriesKey) state.seriesKey = tick.key;
+  if (state.autoFollow) {
+    const candles = buildCandles(getSeriesTicks(), state.timeframeSec);
+    followView(candles.length);
+  }
+  renderThrottled();
+}
+
+let renderTimer = 0;
+function renderThrottled() {
+  if (renderTimer) return;
+  renderTimer = requestAnimationFrame(() => {
+    renderTimer = 0;
+    render();
+  });
+}
+
 function getSeriesTicks() {
   return state.ticks.filter((tick) => tick.key === state.seriesKey).sort((a, b) => a.ts - b.ts);
 }
@@ -153,22 +228,10 @@ function getSeriesTrades() {
 function buildCandles(ticks, timeframeSec) {
   const buckets = new Map();
   ticks.forEach((tick) => {
-    if (!tick.ts || !tick.ltp) return;
     const bucketTs = Math.floor(tick.ts / timeframeSec) * timeframeSec;
     let candle = buckets.get(bucketTs);
     if (!candle) {
-      candle = {
-        ts: bucketTs,
-        open: tick.ltp,
-        high: tick.ltp,
-        low: tick.ltp,
-        close: tick.ltp,
-        volume: 0,
-        buyQty: 0,
-        sellQty: 0,
-        samples: 0,
-        wave: [],
-      };
+      candle = { ts: bucketTs, open: tick.ltp, high: tick.ltp, low: tick.ltp, close: tick.ltp, volume: 0, buyQty: 0, sellQty: 0, samples: 0, waves: {} };
       buckets.set(bucketTs, candle);
     }
     candle.high = Math.max(candle.high, tick.ltp);
@@ -179,13 +242,21 @@ function buildCandles(ticks, timeframeSec) {
     candle.volume += Number(f.volume || f.volume_change_tick || f.LTQ || f.ltq || 0);
     candle.buyQty += Number(f.total_buy_quantity || sumArray(f.bid_qty) || 0);
     candle.sellQty += Number(f.total_sell_quantity || sumArray(f.ask_qty) || 0);
-    const waveValue = Number(f[state.featureKey]);
-    if (Number.isFinite(waveValue)) candle.wave.push(waveValue);
+    state.selectedFeatures.forEach((key) => {
+      const waveValue = Number(f[key]);
+      if (Number.isFinite(waveValue)) {
+        candle.waves[key] = candle.waves[key] || [];
+        candle.waves[key].push(waveValue);
+      }
+    });
   });
-  return Array.from(buckets.values()).sort((a, b) => a.ts - b.ts).map((c) => ({
-    ...c,
-    waveValue: c.wave.length ? c.wave.reduce((a, b) => a + b, 0) / c.wave.length : null,
-  }));
+  return Array.from(buckets.values()).sort((a, b) => a.ts - b.ts).map((c) => {
+    const waveValues = {};
+    Object.entries(c.waves).forEach(([key, values]) => {
+      waveValues[key] = values.reduce((a, b) => a + b, 0) / values.length;
+    });
+    return { ...c, waveValues };
+  });
 }
 
 function sumArray(value) {
@@ -203,16 +274,39 @@ function numericFeatureKeys(ticks) {
   return Array.from(keys).sort();
 }
 
-function refreshSelectors() {
+function refreshTabs() {
   const keys = Array.from(new Set(state.ticks.map((tick) => tick.key))).sort();
-  els.seriesSelect.innerHTML = keys.map((key) => `<option value="${escapeHtml(key)}">${escapeHtml(key)}</option>`).join("");
   if (!keys.includes(state.seriesKey)) state.seriesKey = keys[0] || "";
-  els.seriesSelect.value = state.seriesKey;
+  els.instrumentTabs.innerHTML = keys.map((key) => `<button class="${key === state.seriesKey ? "active" : ""}" data-key="${escapeHtml(key)}">${escapeHtml(labelForSeries(key))}</button>`).join("");
+  els.instrumentTabs.querySelectorAll("button").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.seriesKey = button.dataset.key;
+      state.selectedTrade = null;
+      resetView(true);
+      render();
+    });
+  });
+}
 
+function refreshFeatures() {
   const features = numericFeatureKeys(getSeriesTicks());
-  els.featureSelect.innerHTML = features.map((key) => `<option value="${escapeHtml(key)}">${escapeHtml(key)}</option>`).join("");
-  if (!features.includes(state.featureKey)) state.featureKey = features[0] || "";
-  els.featureSelect.value = state.featureKey;
+  if (!state.selectedFeatures.size && features.length) {
+    ["recovery_score", "clean_trade_score", "exhaustion_score"].forEach((key) => {
+      if (features.includes(key)) state.selectedFeatures.add(key);
+    });
+    if (!state.selectedFeatures.size) state.selectedFeatures.add(features[0]);
+  }
+  state.selectedFeatures = new Set([...state.selectedFeatures].filter((key) => features.includes(key)));
+  els.featureList.innerHTML = features.map((key) => `
+    <label><input type="checkbox" value="${escapeHtml(key)}" ${state.selectedFeatures.has(key) ? "checked" : ""}>${escapeHtml(key)}</label>
+  `).join("") || `<span class="inspect-text">No numeric fields</span>`;
+  els.featureList.querySelectorAll("input").forEach((input) => {
+    input.addEventListener("change", () => {
+      if (input.checked) state.selectedFeatures.add(input.value);
+      else state.selectedFeatures.delete(input.value);
+      render();
+    });
+  });
 }
 
 function refreshTrades() {
@@ -230,49 +324,109 @@ function refreshTrades() {
   els.tradeList.querySelectorAll(".trade-item").forEach((button) => {
     button.addEventListener("click", () => {
       state.selectedTrade = trades[Number(button.dataset.idx)] || null;
+      zoomToTrade(state.selectedTrade);
       render();
     });
   });
 }
 
 function renderStats(candles, trades) {
+  const ticks = getSeriesTicks();
   const wins = trades.filter((t) => t.net_pnl > 0).length;
   const net = trades.reduce((sum, t) => sum + t.net_pnl, 0);
-  const hold = trades.length ? trades.reduce((sum, t) => sum + Math.max(0, t.exit_ts - t.entry_ts), 0) / trades.length : 0;
+  const last = ticks[ticks.length - 1];
   els.statsPanel.innerHTML = [
-    ["Ticks", getSeriesTicks().length],
+    ["LTP", last ? last.ltp.toFixed(2) : "-"],
+    ["Ticks", ticks.length],
     ["Candles", candles.length],
     ["Trades", trades.length],
     ["Win Rate", trades.length ? `${((wins / trades.length) * 100).toFixed(1)}%` : "0.0%"],
     ["Net PnL", formatMoney(net)],
-    ["Avg Hold", `${hold.toFixed(0)}s`],
   ].map(([label, value]) => `<div class="stat"><span>${label}</span><strong>${value}</strong></div>`).join("");
 }
 
+function visibleCandles(candles) {
+  if (!candles.length) return [];
+  clampView(candles.length);
+  return candles.slice(Math.floor(state.viewStart), Math.ceil(state.viewEnd));
+}
+
+function resetView(follow = false) {
+  const candles = buildCandles(getSeriesTicks(), state.timeframeSec);
+  if (follow) followView(candles.length);
+  else {
+    state.viewStart = 0;
+    state.viewEnd = Math.max(1, candles.length);
+  }
+}
+
+function followView(count) {
+  const width = Math.min(Math.max(80, state.viewEnd - state.viewStart || 220), 420);
+  state.viewEnd = Math.max(1, count);
+  state.viewStart = Math.max(0, state.viewEnd - width);
+}
+
+function clampView(count) {
+  const minWidth = 12;
+  const maxWidth = Math.max(minWidth, count || 1);
+  let width = Math.max(minWidth, state.viewEnd - state.viewStart);
+  width = Math.min(width, maxWidth);
+  if (state.viewStart < 0) {
+    state.viewStart = 0;
+    state.viewEnd = width;
+  }
+  if (state.viewEnd > maxWidth) {
+    state.viewEnd = maxWidth;
+    state.viewStart = Math.max(0, state.viewEnd - width);
+  }
+}
+
+function zoomToTrade(trade) {
+  if (!trade) return;
+  const candles = buildCandles(getSeriesTicks(), state.timeframeSec);
+  const start = candles.findIndex((c) => c.ts >= trade.entry_ts);
+  const end = candles.findIndex((c) => c.ts >= trade.exit_ts);
+  if (start >= 0) {
+    state.autoFollow = false;
+    els.autoFollow.checked = false;
+    state.viewStart = Math.max(0, start - 8);
+    state.viewEnd = Math.min(candles.length, (end >= 0 ? end : start) + 12);
+  }
+}
+
 function render() {
-  refreshSelectors();
+  refreshTabs();
+  refreshFeatures();
   const ticks = getSeriesTicks();
   const candles = buildCandles(ticks, state.timeframeSec);
+  const visible = visibleCandles(candles);
   const trades = getSeriesTrades();
   refreshTrades();
   renderStats(candles, trades);
-  els.statusText.textContent = ticks.length ? `${state.seriesKey} | ${ticks.length} ticks | ${state.timeframeSec}s candles` : "Load session files";
-  drawPriceChart(els.priceCanvas, candles, trades);
-  drawVolumeChart(els.volumeCanvas, candles);
-  drawWaveChart(els.waveCanvas, candles, state.featureKey);
+  syncPanelVisibility();
+  const liveAge = state.lastLiveTs ? `${Math.round((Date.now() - state.lastLiveTs) / 1000)}s ago` : "-";
+  els.statusText.textContent = ticks.length ? `${labelForSeries(state.seriesKey)} | ${ticks.length} ticks | live ${liveAge}` : "Load session files";
+  els.inspectText.textContent = `${Math.floor(state.viewStart) + 1}-${Math.ceil(state.viewEnd)} of ${candles.length} candles | Wheel zoom, drag pan, double click reset`;
+  drawPriceChart(els.priceCanvas, visible, candles, trades);
+  drawVolumeChart(els.volumeCanvas, visible);
+  drawWaveChart(els.waveCanvas, visible);
 }
 
-function drawPriceChart(canvas, candles, trades) {
+function syncPanelVisibility() {
+  els.chartStack.classList.toggle("hide-volume", !els.showVolume.checked);
+  els.chartStack.classList.toggle("hide-wave", !els.showWave.checked);
+}
+
+function drawPriceChart(canvas, candles, allCandles, trades) {
   const ctx = prepareCanvas(canvas);
   const box = chartBox(canvas);
   drawGrid(ctx, box);
-  if (!candles.length) return drawEmpty(ctx, canvas, "No tick series selected");
+  if (!candles.length) return drawEmpty(ctx, canvas, "No instrument selected");
   const min = Math.min(...candles.map((c) => c.low));
   const max = Math.max(...candles.map((c) => c.high));
   const y = scaler(max, min, box.y, box.y + box.h);
   const x = indexScaler(candles.length, box.x, box.x + box.w);
-  const body = Math.max(3, Math.min(12, box.w / Math.max(candles.length, 1) * .62));
-
+  const body = Math.max(3, Math.min(14, box.w / Math.max(candles.length, 1) * .62));
   candles.forEach((c, i) => {
     const up = c.close >= c.open;
     ctx.strokeStyle = up ? css("--up") : css("--down");
@@ -286,9 +440,9 @@ function drawPriceChart(canvas, candles, trades) {
     const bot = y(Math.min(c.open, c.close));
     ctx.fillRect(cx - body / 2, top, body, Math.max(1, bot - top));
   });
-
-  drawTradeMarkers(ctx, box, candles, trades, y);
+  if (els.showTrades.checked) drawTradeMarkers(ctx, box, candles, trades, y);
   drawAxis(ctx, box, min, max);
+  drawTimeAxis(ctx, box, candles);
 }
 
 function drawVolumeChart(canvas, candles) {
@@ -298,7 +452,7 @@ function drawVolumeChart(canvas, candles) {
   if (!candles.length) return drawEmpty(ctx, canvas, "No volume data");
   const max = Math.max(1, ...candles.map((c) => Math.max(c.volume, c.buyQty, c.sellQty)));
   const x = indexScaler(candles.length, box.x, box.x + box.w);
-  const barW = Math.max(2, Math.min(10, box.w / Math.max(candles.length, 1) * .55));
+  const barW = Math.max(2, Math.min(10, box.w / Math.max(candles.length, 1) * .5));
   candles.forEach((c, i) => {
     const cx = x(i);
     drawBar(ctx, cx - barW, box, c.buyQty, max, css("--up"), barW);
@@ -308,27 +462,33 @@ function drawVolumeChart(canvas, candles) {
   drawLabel(ctx, box, "Volume / Bid Qty / Ask Qty");
 }
 
-function drawWaveChart(canvas, candles, featureKey) {
+function drawWaveChart(canvas, candles) {
   const ctx = prepareCanvas(canvas);
   const box = chartBox(canvas);
   drawGrid(ctx, box);
-  const points = candles.map((c, i) => ({ i, value: c.waveValue })).filter((p) => p.value !== null);
-  if (!points.length) return drawEmpty(ctx, canvas, featureKey ? `No numeric wave: ${featureKey}` : "No wave selected");
-  const min = Math.min(...points.map((p) => p.value));
-  const max = Math.max(...points.map((p) => p.value));
+  const series = [...state.selectedFeatures].map((key) => ({
+    key,
+    points: candles.map((c, i) => ({ i, value: c.waveValues[key] })).filter((p) => Number.isFinite(p.value)),
+  })).filter((s) => s.points.length);
+  if (!series.length) return drawEmpty(ctx, canvas, "Select wave fields");
+  const values = series.flatMap((s) => s.points.map((p) => p.value));
+  const min = Math.min(...values);
+  const max = Math.max(...values);
   const y = scaler(max, min, box.y, box.y + box.h);
   const x = indexScaler(candles.length, box.x, box.x + box.w);
-  ctx.strokeStyle = css("--wave");
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  points.forEach((p, idx) => {
-    const px = x(p.i);
-    const py = y(p.value);
-    if (idx === 0) ctx.moveTo(px, py);
-    else ctx.lineTo(px, py);
+  series.forEach((s, idx) => {
+    ctx.strokeStyle = css(WAVE_COLORS[idx % WAVE_COLORS.length]);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    s.points.forEach((p, pIdx) => {
+      const px = x(p.i);
+      const py = y(p.value);
+      if (pIdx === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+    drawLabel(ctx, { ...box, y: box.y + idx * 17 }, s.key, ctx.strokeStyle);
   });
-  ctx.stroke();
-  drawLabel(ctx, box, featureKey);
   drawAxis(ctx, box, min, max);
 }
 
@@ -337,12 +497,13 @@ function drawTradeMarkers(ctx, box, candles, trades, y) {
   const last = candles[candles.length - 1]?.ts || first + 1;
   const tx = (ts) => box.x + ((ts - first) / Math.max(1, last - first)) * box.w;
   trades.forEach((trade) => {
-    if (trade.entry_ts) marker(ctx, tx(trade.entry_ts), y(trade.entry), css("--entry"), "E");
-    if (trade.exit_ts) marker(ctx, tx(trade.exit_ts), y(trade.exit), css("--exit"), "X");
+    if (trade.exit_ts && (trade.exit_ts < first || trade.entry_ts > last)) return;
     if (state.selectedTrade === trade && trade.entry_ts && trade.exit_ts) {
       ctx.fillStyle = "rgba(255, 210, 63, .08)";
       ctx.fillRect(tx(trade.entry_ts), box.y, Math.max(1, tx(trade.exit_ts) - tx(trade.entry_ts)), box.h);
     }
+    if (trade.entry_ts >= first && trade.entry_ts <= last) marker(ctx, tx(trade.entry_ts), y(trade.entry), css("--entry"), "E");
+    if (trade.exit_ts >= first && trade.exit_ts <= last) marker(ctx, tx(trade.exit_ts), y(trade.exit), css("--exit"), "X");
   });
 }
 
@@ -371,7 +532,7 @@ function prepareCanvas(canvas) {
 
 function chartBox(canvas) {
   const rect = canvas.getBoundingClientRect();
-  return { x: 58, y: 18, w: Math.max(80, rect.width - 88), h: Math.max(50, rect.height - 42) };
+  return { x: 64, y: 18, w: Math.max(90, rect.width - 100), h: Math.max(50, rect.height - 48) };
 }
 
 function drawGrid(ctx, box) {
@@ -398,14 +559,26 @@ function drawAxis(ctx, box, min, max) {
   }
 }
 
+function drawTimeAxis(ctx, box, candles) {
+  ctx.fillStyle = "#7e8ca3";
+  ctx.font = "11px Segoe UI";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  for (let i = 0; i <= 4; i++) {
+    const idx = Math.min(candles.length - 1, Math.floor((candles.length - 1) * (i / 4)));
+    const x = box.x + (box.w / 4) * i;
+    ctx.fillText(formatTime(candles[idx]?.ts), x, box.y + box.h + 8);
+  }
+}
+
 function drawBar(ctx, x, box, value, max, color, width) {
   const h = (Number(value || 0) / max) * box.h;
   ctx.fillStyle = color;
   ctx.fillRect(x, box.y + box.h - h, width, h);
 }
 
-function drawLabel(ctx, box, text) {
-  ctx.fillStyle = "#9aa5b5";
+function drawLabel(ctx, box, text, color = "#9aa5b5") {
+  ctx.fillStyle = color;
   ctx.font = "12px Segoe UI";
   ctx.textAlign = "left";
   ctx.textBaseline = "top";
@@ -431,6 +604,51 @@ function indexScaler(count, left, right) {
   return (idx) => left + (idx / spread) * (right - left);
 }
 
+function installChartControls(canvas) {
+  canvas.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const candles = buildCandles(getSeriesTicks(), state.timeframeSec);
+    if (!candles.length) return;
+    state.autoFollow = false;
+    els.autoFollow.checked = false;
+    const rect = canvas.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left - 64) / Math.max(1, rect.width - 100)));
+    const focus = state.viewStart + (state.viewEnd - state.viewStart) * ratio;
+    const factor = event.deltaY > 0 ? 1.18 : 0.84;
+    const width = Math.max(12, Math.min(candles.length, (state.viewEnd - state.viewStart) * factor));
+    state.viewStart = focus - width * ratio;
+    state.viewEnd = state.viewStart + width;
+    clampView(candles.length);
+    render();
+  }, { passive: false });
+
+  canvas.addEventListener("mousedown", (event) => {
+    state.autoFollow = false;
+    els.autoFollow.checked = false;
+    state.dragging = { x: event.clientX, start: state.viewStart, end: state.viewEnd };
+  });
+  window.addEventListener("mousemove", (event) => {
+    if (!state.dragging) return;
+    const candles = buildCandles(getSeriesTicks(), state.timeframeSec);
+    const rect = canvas.getBoundingClientRect();
+    const deltaPx = event.clientX - state.dragging.x;
+    const deltaCandles = -(deltaPx / Math.max(1, rect.width - 100)) * (state.dragging.end - state.dragging.start);
+    state.viewStart = state.dragging.start + deltaCandles;
+    state.viewEnd = state.dragging.end + deltaCandles;
+    clampView(candles.length);
+    render();
+  });
+  window.addEventListener("mouseup", () => {
+    state.dragging = null;
+  });
+  canvas.addEventListener("dblclick", () => {
+    state.autoFollow = true;
+    els.autoFollow.checked = true;
+    resetView(true);
+    render();
+  });
+}
+
 function shortReason(reason) {
   return String(reason || "").replace("TRI_WAVE_V2_ENTRY:", "").replace("TRI_WAVE_V2_EXIT:", "");
 }
@@ -438,6 +656,15 @@ function shortReason(reason) {
 function formatMoney(value) {
   const num = Number(value || 0);
   return `${num >= 0 ? "+" : ""}${num.toFixed(2)}`;
+}
+
+function formatTime(ts) {
+  if (!ts) return "";
+  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function labelForSeries(key) {
+  return String(key || "").replace(/_(\d+)$/, "");
 }
 
 function escapeHtml(value) {
@@ -451,8 +678,10 @@ function css(name) {
 }
 
 els.ticksFile.addEventListener("change", (event) => readJsonlFile(event.target.files[0], (rows) => {
-  state.ticks = rows.map(normalizeTick).filter((tick) => tick.ts && tick.ltp && tick.index && tick.stream);
+  closeLiveStream();
+  state.ticks = dedupeTicks(rows.map(normalizeTick));
   state.seriesKey = "";
+  resetView(true);
   render();
 }));
 
@@ -472,22 +701,20 @@ els.sessionSelect.addEventListener("change", async () => {
   if (Number.isFinite(idx) && state.sessions[idx]) await loadCloudSession(state.sessions[idx]);
 });
 
-els.seriesSelect.addEventListener("change", () => {
-  state.seriesKey = els.seriesSelect.value;
-  state.selectedTrade = null;
-  render();
-});
-
 els.timeframeSelect.addEventListener("change", () => {
   state.timeframeSec = Number(els.timeframeSelect.value || 5);
+  resetView(state.autoFollow);
   render();
 });
 
-els.featureSelect.addEventListener("change", () => {
-  state.featureKey = els.featureSelect.value;
+[els.showVolume, els.showWave, els.showTrades].forEach((input) => input.addEventListener("change", render));
+els.autoFollow.addEventListener("change", () => {
+  state.autoFollow = els.autoFollow.checked;
+  if (state.autoFollow) resetView(true);
   render();
 });
 
+[els.priceCanvas, els.volumeCanvas, els.waveCanvas].forEach(installChartControls);
 window.addEventListener("resize", render);
 render();
 loadCloudSessions();
