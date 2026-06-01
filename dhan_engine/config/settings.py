@@ -11,7 +11,17 @@ from dhan_engine.config.hdfcbank_live_profile import install_hdfcbank_live_profi
 
 load_dotenv()
 
-DEFAULT_INDEXES: Tuple[str, ...] = ("NIFTY", "BANKNIFTY", "HDFCBANK", "RELIANCE")
+DEFAULT_INDEXES: Tuple[str, ...] = (
+    "NIFTY",
+    "FINNIFTY",
+    "HDFCBANK",
+    "RELIANCE",
+    "ICICIBANK",
+    "SBIN",
+    "AXISBANK",
+    "INFY",
+    "TCS",
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +42,11 @@ class RuntimeSettings:
             "FINNIFTY": 50,
             "HDFCBANK": 20,
             "RELIANCE": 20,
+            "ICICIBANK": 20,
+            "SBIN": 10,
+            "AXISBANK": 20,
+            "INFY": 40,
+            "TCS": 100,
         }
     )
     option_exchange_segment: str = "NSE_FNO"
@@ -42,7 +57,7 @@ class RuntimeSettings:
     heartbeat_sec: float = 30.0
     selector_mode: int = 2
     selector_steps_each_side: int = 10
-    capital: float = 100000.0
+    capital: float = 500000.0
     ltp_poll_sec: float = 1.05
     startup_wait_sec: float = 1.0
     option_premium_stream_enabled: bool = False
