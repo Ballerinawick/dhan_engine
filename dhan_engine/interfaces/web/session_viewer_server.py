@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,6 +44,9 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
             return
 
         query = parse_qs(parsed.query)
+        if parsed.path == "/api/live/stream":
+            self._stream_live_session(query)
+            return
         if parsed.path == "/api/sessions":
             self._json({"sessions": self._list_sessions()})
             return
@@ -110,6 +114,60 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
             "trades": _read_jsonl(session / "trades.jsonl", limit=limit),
             "signals": _read_jsonl(session / "signals.jsonl", limit=limit),
         }
+
+    def _stream_live_session(self, query: dict) -> None:
+        session = self._stream_session(query)
+        if session is None:
+            self._json({"error": "session not found"}, HTTPStatus.NOT_FOUND)
+            return
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        files = {
+            "tick": session / "ticks.jsonl",
+            "trade": session / "trades.jsonl",
+            "signal": session / "signals.jsonl",
+        }
+        offsets = {
+            name: path.stat().st_size if path.exists() else 0
+            for name, path in files.items()
+        }
+        heartbeat_at = time.time()
+        while True:
+            try:
+                sent = False
+                for event_name, path in files.items():
+                    for row, offset in _read_jsonl_since(path, offsets.get(event_name, 0)):
+                        offsets[event_name] = offset
+                        self._sse(event_name, row)
+                        sent = True
+                if time.time() - heartbeat_at >= 15:
+                    heartbeat_at = time.time()
+                    self._sse("heartbeat", {"ts": time.time()})
+                    sent = True
+                if sent:
+                    self.wfile.flush()
+                time.sleep(1.0)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception:
+                logger.warning("TRIWAVE_VIEWER_STREAM_FAILED | session=%s", session, exc_info=True)
+                return
+
+    def _sse(self, event_name: str, payload: dict) -> None:
+        body = f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        self.wfile.write(body.encode("utf-8"))
+
+    def _stream_session(self, query: dict) -> Path | None:
+        date = (query.get("date") or [""])[0]
+        expiry = (query.get("expiry") or [""])[0]
+        if date and expiry:
+            return self._resolve_session(date, expiry)
+        return self._latest_session()
 
     def _list_sessions(self) -> list[dict]:
         root = _session_root()
@@ -182,4 +240,28 @@ def _read_jsonl(path: Path, limit: int) -> list[dict]:
                     rows = rows[-limit:]
     except Exception:
         logger.warning("TRIWAVE_VIEWER_READ_FAILED | path=%s", path, exc_info=True)
+    return rows
+
+
+def _read_jsonl_since(path: Path, offset: int) -> list[tuple[dict, int]]:
+    if not path.exists():
+        return []
+    rows = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            handle.seek(max(0, int(offset or 0)))
+            while True:
+                line = handle.readline()
+                if not line:
+                    break
+                next_offset = handle.tell()
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append((json.loads(line), next_offset))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        logger.warning("TRIWAVE_VIEWER_TAIL_FAILED | path=%s", path, exc_info=True)
     return rows
