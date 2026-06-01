@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -65,9 +64,9 @@ class DhanLiveMarketFeedWS:
         self._tags: Dict[int, str] = {}
         self._reconnect_attempt = 0
         self._lock = threading.Lock()
-        self._callback_queue: "queue.Queue[tuple]" = queue.Queue(
-            maxsize=int(os.getenv("FULLQUOTE_CALLBACK_QUEUE_MAX", "5000") or 5000)
-        )
+        self._callback_condition = threading.Condition()
+        self._pending_callbacks: Dict[int, tuple] = {}
+        self._last_coalesce_log_ts = 0.0
         self._previous_features: Dict[int, dict] = {}
         self._last_feature_log_ts: Dict[int, float] = {}
         self._last_message_ts = 0.0
@@ -297,25 +296,25 @@ class DhanLiveMarketFeedWS:
             traceback.print_exc()
 
     def _enqueue_callback(self, item: tuple) -> None:
-        try:
-            self._callback_queue.put_nowait(item)
-        except queue.Full:
-            try:
-                self._callback_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._callback_queue.put_nowait(item)
-                print("FULLQUOTE_CALLBACK_QUEUE_DROPPED_OLDEST")
-            except queue.Full:
-                print("FULLQUOTE_CALLBACK_QUEUE_DROP")
+        secid = int(item[0])
+        with self._callback_condition:
+            self._pending_callbacks[secid] = item
+            pending_count = len(self._pending_callbacks)
+            self._callback_condition.notify()
+        now = time.time()
+        if pending_count > 25 and now - self._last_coalesce_log_ts >= 10:
+            self._last_coalesce_log_ts = now
+            print(f"FULLQUOTE_CALLBACK_COALESCED | pending={pending_count}")
 
     def _callback_worker(self) -> None:
         while not self._stop.is_set():
-            try:
-                secid, tag, ltp, depth = self._callback_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
+            with self._callback_condition:
+                if not self._pending_callbacks:
+                    self._callback_condition.wait(timeout=1.0)
+                if not self._pending_callbacks:
+                    continue
+                _, item = self._pending_callbacks.popitem()
+            secid, tag, ltp, depth = item
             try:
                 if self.on_full:
                     self.on_full(secid, tag, ltp, depth)
