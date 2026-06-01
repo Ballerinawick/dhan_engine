@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TriWave Trade Viewer</title>
+  <title>TriWave Live Dashboard</title>
   <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
@@ -11,12 +11,46 @@
     <aside class="sidebar">
       <header class="brand">
         <div>
-          <h1>TriWave Viewer</h1>
-          <p>Replay premium ticks, entries, exits, and wave features.</p>
+          <h1>TriWave</h1>
+          <p>History and live premium flow in one chart.</p>
         </div>
+        <span id="liveBadge" class="live-badge off">Offline</span>
       </header>
 
+      <section class="panel control-grid">
+        <label>
+          Session
+          <select id="sessionSelect"></select>
+        </label>
+        <label>
+          Timeframe
+          <select id="timeframeSelect">
+            <option value="5">5s</option>
+            <option value="15">15s</option>
+            <option value="30">30s</option>
+            <option value="60">1m</option>
+            <option value="180">3m</option>
+          </select>
+        </label>
+      </section>
+
       <section class="panel">
+        <h2>Fields</h2>
+        <label class="toggle"><input id="showVolume" type="checkbox" checked> Volume / Bid / Ask</label>
+        <label class="toggle"><input id="showWave" type="checkbox" checked> Wave panel</label>
+        <label class="toggle"><input id="showTrades" type="checkbox" checked> Entry / Exit markers</label>
+        <label class="toggle"><input id="autoFollow" type="checkbox" checked> Follow live</label>
+      </section>
+
+      <section class="panel">
+        <h2>Wave Fields</h2>
+        <div id="featureList" class="feature-list"></div>
+      </section>
+
+      <section class="panel stats" id="statsPanel"></section>
+
+      <section class="panel local-files">
+        <h2>Local Replay</h2>
         <label class="file-control">
           <span>ticks.jsonl</span>
           <input id="ticksFile" type="file" accept=".jsonl,.log,.txt">
@@ -31,32 +65,6 @@
         </label>
       </section>
 
-      <section class="panel control-grid">
-        <label>
-          Cloud Session
-          <select id="sessionSelect"></select>
-        </label>
-        <label>
-          Symbol
-          <select id="seriesSelect"></select>
-        </label>
-        <label>
-          Timeframe
-          <select id="timeframeSelect">
-            <option value="5">5s</option>
-            <option value="15">15s</option>
-            <option value="30">30s</option>
-            <option value="60">1m</option>
-            <option value="180">3m</option>
-          </select>
-        </label>
-        <label>
-          Wave
-          <select id="featureSelect"></select>
-        </label>
-      </section>
-
-      <section class="panel stats" id="statsPanel"></section>
       <section class="panel trades">
         <h2>Trades</h2>
         <div id="tradeList" class="trade-list"></div>
@@ -65,7 +73,10 @@
 
     <section class="workspace">
       <div class="toolbar">
-        <div id="statusText">Load session files</div>
+        <div>
+          <div id="statusText">Loading session</div>
+          <div id="inspectText" class="inspect-text">Wheel zoom, drag pan, double click reset</div>
+        </div>
         <div class="legend">
           <span><i class="up"></i>Up</span>
           <span><i class="down"></i>Down</span>
@@ -74,7 +85,9 @@
         </div>
       </div>
 
-      <div class="chart-stack">
+      <div id="instrumentTabs" class="instrument-tabs"></div>
+
+      <div id="chartStack" class="chart-stack">
         <canvas id="priceCanvas"></canvas>
         <canvas id="volumeCanvas"></canvas>
         <canvas id="waveCanvas"></canvas>
