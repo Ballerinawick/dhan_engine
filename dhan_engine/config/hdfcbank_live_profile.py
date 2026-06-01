@@ -27,6 +27,36 @@ def install_hdfcbank_live_profile() -> None:
             "spread_max_pct": 0.025,
             "lot_size": int(os.getenv("RELIANCE_LOT_SIZE", "500") or 500),
         },
+        "ICICIBANK": {
+            "premium_filter": (5, 120),
+            "delta_filter": (0.25, 0.65),
+            "spread_max_pct": 0.025,
+            "lot_size": int(os.getenv("ICICIBANK_LOT_SIZE", "700") or 700),
+        },
+        "SBIN": {
+            "premium_filter": (4, 90),
+            "delta_filter": (0.25, 0.65),
+            "spread_max_pct": 0.030,
+            "lot_size": int(os.getenv("SBIN_LOT_SIZE", "750") or 750),
+        },
+        "AXISBANK": {
+            "premium_filter": (5, 120),
+            "delta_filter": (0.25, 0.65),
+            "spread_max_pct": 0.030,
+            "lot_size": int(os.getenv("AXISBANK_LOT_SIZE", "625") or 625),
+        },
+        "INFY": {
+            "premium_filter": (8, 160),
+            "delta_filter": (0.25, 0.65),
+            "spread_max_pct": 0.025,
+            "lot_size": int(os.getenv("INFY_LOT_SIZE", "400") or 400),
+        },
+        "TCS": {
+            "premium_filter": (10, 220),
+            "delta_filter": (0.25, 0.65),
+            "spread_max_pct": 0.025,
+            "lot_size": int(os.getenv("TCS_LOT_SIZE", "175") or 175),
+        },
     }
     for symbol, profile in stock_profiles.items():
         selector_module.PREMIUM_FILTER.setdefault(symbol, profile["premium_filter"])
