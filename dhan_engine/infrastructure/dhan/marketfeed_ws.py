@@ -1,12 +1,15 @@
 import json
+import logging
+import os
+import queue
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
-import logging
-from dhan_engine.domain.market.full_data_feature_extractor import derive_full_data_features
 
 import websocket
+
+from dhan_engine.domain.market.full_data_feature_extractor import derive_full_data_features
 
 try:
     from dhanhq.marketfeed import DhanFeed
@@ -33,8 +36,8 @@ class DhanLiveMarketFeedWS:
     """
     Stable market-feed websocket client for full quote subscriptions.
 
-    This client is used for the dedicated future stream so underlying
-    data is live over WS instead of REST polling.
+    The websocket thread must stay light. Dhan closes the connection when
+    ping/pong is not handled quickly, so strategy callbacks run on a worker.
     """
 
     def __init__(
@@ -53,15 +56,24 @@ class DhanLiveMarketFeedWS:
 
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
+        self._worker_thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._connected = threading.Event()
         self._subs: List[Dict[str, str]] = []
+        self._sub_keys = set()
         self._tags: Dict[int, str] = {}
         self._reconnect_attempt = 0
         self._lock = threading.Lock()
+        self._callback_queue: "queue.Queue[tuple]" = queue.Queue(
+            maxsize=int(os.getenv("FULLQUOTE_CALLBACK_QUEUE_MAX", "5000") or 5000)
+        )
         self._previous_features: Dict[int, dict] = {}
         self._last_feature_log_ts: Dict[int, float] = {}
         self._last_message_ts = 0.0
+        self._stale_reconnect_sec = float(os.getenv("FULLQUOTE_STALE_RECONNECT_SEC", "45") or 45)
+        self._ping_interval = float(os.getenv("FULLQUOTE_WS_PING_INTERVAL", "15") or 15)
+        self._ping_timeout = float(os.getenv("FULLQUOTE_WS_PING_TIMEOUT", "8") or 8)
         self._feed_parser = (
             DhanFeed(
                 client_id=self.client_id,
@@ -76,6 +88,8 @@ class DhanLiveMarketFeedWS:
     def connect(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        self._ensure_worker()
+        self._ensure_watchdog()
         self._thread = threading.Thread(target=self._run_loop, name="DhanMarketFeedWS", daemon=True)
         self._thread.start()
 
@@ -89,12 +103,35 @@ class DhanLiveMarketFeedWS:
 
     def subscribe_full(self, instruments: List[Dict[str, str]]) -> None:
         with self._lock:
-            self._subs = instruments[:]
             for item in instruments:
+                key = (str(item["ExchangeSegment"]), str(item["SecurityId"]))
+                if key not in self._sub_keys:
+                    self._subs.append(dict(item))
+                    self._sub_keys.add(key)
                 self._tags[int(item["SecurityId"])] = item.get("tag", item["SecurityId"])
 
         if self._connected.is_set():
             self._send_subscribe()
+
+    def _ensure_worker(self) -> None:
+        if self._worker_thread and self._worker_thread.is_alive():
+            return
+        self._worker_thread = threading.Thread(
+            target=self._callback_worker,
+            name="DhanMarketFeedCallbackWorker",
+            daemon=True,
+        )
+        self._worker_thread.start()
+
+    def _ensure_watchdog(self) -> None:
+        if self._watchdog_thread and self._watchdog_thread.is_alive():
+            return
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="DhanMarketFeedWatchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
 
     def _run_loop(self) -> None:
         while not self._stop.is_set():
@@ -120,7 +157,10 @@ class DhanLiveMarketFeedWS:
             )
 
             try:
-                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+                self._ws.run_forever(
+                    ping_interval=self._ping_interval,
+                    ping_timeout=self._ping_timeout,
+                )
             except Exception as exc:
                 print(f"FULLQUOTE_WS_EXCEPTION | error={exc}")
 
@@ -133,18 +173,24 @@ class DhanLiveMarketFeedWS:
             time.sleep(wait)
 
     def _send_subscribe(self) -> None:
-        if not self._ws or not self._subs:
+        if not self._ws:
+            return
+
+        with self._lock:
+            subscriptions = list(self._subs)
+
+        if not subscriptions:
             return
 
         payload = {
-            "RequestCode": REQ_FULL,  # must stay 21 (FULL quote mode)
-            "InstrumentCount": len(self._subs),
+            "RequestCode": REQ_FULL,
+            "InstrumentCount": len(subscriptions),
             "InstrumentList": [
                 {
                     "ExchangeSegment": item["ExchangeSegment"],
                     "SecurityId": item["SecurityId"],
                 }
-                for item in self._subs
+                for item in subscriptions
             ],
         }
 
@@ -152,7 +198,7 @@ class DhanLiveMarketFeedWS:
             print("WS_FULLQUOTE_SUB", payload)
 
         try:
-            print("📤 WS SUB PAYLOAD:", payload)
+            print("WS_FULLQUOTE_SUBSCRIBE | count=%s" % payload["InstrumentCount"])
             self._ws.send(json.dumps(payload))
         except Exception as exc:
             print(f"FULLQUOTE_WS_SUBSCRIBE_ERROR | error={exc}")
@@ -160,7 +206,7 @@ class DhanLiveMarketFeedWS:
     def _on_open(self, ws) -> None:
         self._connected.set()
         self._reconnect_attempt = 0
-        print("🔥 WS CONNECTED — READY TO SUBSCRIBE")
+        print("WS_FULLQUOTE_CONNECTED")
         self._send_subscribe()
 
     def _on_error(self, ws, error) -> None:
@@ -185,35 +231,51 @@ class DhanLiveMarketFeedWS:
         try:
             self._last_message_ts = time.time()
             if not isinstance(message, (bytes, bytearray)):
-                print("⚠️ NON-BINARY MESSAGE")
+                if self.debug:
+                    print("FULLQUOTE_NON_BINARY_MESSAGE")
                 return
 
             parsed = self.process_data(bytes(message))
 
-            if parsed:
-                print("✅ PARSED DATA:", parsed)
+            if parsed and self.debug:
+                print("FULLQUOTE_PARSED_DATA:", parsed)
 
-                if parsed.get("type") == "Full Data":
-                    secid = int(parsed.get("security_id"))
-                    tag = self._tags.get(secid, str(secid))
-                    previous = self._previous_features.get(secid)
-                    features = derive_full_data_features(parsed, previous)
-                    self._previous_features[secid] = features
-                    ltp = float(features.get("ltp",0.0) or 0.0)
+            if parsed and parsed.get("type") == "Full Data":
+                secid = int(parsed.get("security_id"))
+                tag = self._tags.get(secid, str(secid))
+                previous = self._previous_features.get(secid)
+                features = derive_full_data_features(parsed, previous)
+                self._previous_features[secid] = features
+                ltp = float(features.get("ltp", 0.0) or 0.0)
 
-                    depth = parsed.get("depth") or []
-                    bid_price = [float(item.get("bid_price", 0.0)) for item in depth]
-                    bid_qty = [int(item.get("bid_quantity", 0)) for item in depth]
-                    ask_price = [float(item.get("ask_price", 0.0)) for item in depth]
-                    ask_qty = [int(item.get("ask_quantity", 0)) for item in depth]
+                depth = parsed.get("depth") or []
+                bid_price = [float(item.get("bid_price", 0.0)) for item in depth]
+                bid_qty = [int(item.get("bid_quantity", 0)) for item in depth]
+                ask_price = [float(item.get("ask_price", 0.0)) for item in depth]
+                ask_qty = [int(item.get("ask_quantity", 0)) for item in depth]
 
-                    now=time.time()
-                    if now-self._last_feature_log_ts.get(secid,0)>=3:
-                        self._last_feature_log_ts[secid]=now
-                        logger.info("FULL_DATA_FEATURES | secid=%s | tag=%s | ltp=%.2f | spread_pct=%.4f | depth_imbalance_5=%.2f | top_depth_imbalance=%.2f | market_queue_imbalance=%.2f | volume_change=%s | oi_change=%s | recovery_score=%.2f | exhaustion_score=%.2f | clean_trade_score=%.2f",secid,tag,ltp,features.get("spread_pct",0.0),features.get("depth_imbalance_5",0.0),features.get("top_depth_imbalance",0.0),features.get("market_queue_imbalance",0.0),features.get("volume_change_tick",0),features.get("oi_change_tick",0),features.get("recovery_score",0.0),features.get("exhaustion_score",0.0),features.get("clean_trade_score",0.0))
+                now = time.time()
+                if now - self._last_feature_log_ts.get(secid, 0) >= 3:
+                    self._last_feature_log_ts[secid] = now
+                    logger.info(
+                        "FULL_DATA_FEATURES | secid=%s | tag=%s | ltp=%.2f | spread_pct=%.4f | depth_imbalance_5=%.2f | top_depth_imbalance=%.2f | market_queue_imbalance=%.2f | volume_change=%s | oi_change=%s | recovery_score=%.2f | exhaustion_score=%.2f | clean_trade_score=%.2f",
+                        secid,
+                        tag,
+                        ltp,
+                        features.get("spread_pct", 0.0),
+                        features.get("depth_imbalance_5", 0.0),
+                        features.get("top_depth_imbalance", 0.0),
+                        features.get("market_queue_imbalance", 0.0),
+                        features.get("volume_change_tick", 0),
+                        features.get("oi_change_tick", 0),
+                        features.get("recovery_score", 0.0),
+                        features.get("exhaustion_score", 0.0),
+                        features.get("clean_trade_score", 0.0),
+                    )
 
-                    if self.on_full:
-                        self.on_full(
+                if self.on_full:
+                    self._enqueue_callback(
+                        (
                             secid,
                             tag,
                             ltp,
@@ -227,8 +289,50 @@ class DhanLiveMarketFeedWS:
                                 features=features,
                             ),
                         )
-        except Exception as e:
-            print("❌ WS ERROR:", e)
+                    )
+        except Exception as exc:
+            print("FULLQUOTE_WS_MESSAGE_ERROR:", exc)
             import traceback
 
             traceback.print_exc()
+
+    def _enqueue_callback(self, item: tuple) -> None:
+        try:
+            self._callback_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._callback_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._callback_queue.put_nowait(item)
+                print("FULLQUOTE_CALLBACK_QUEUE_DROPPED_OLDEST")
+            except queue.Full:
+                print("FULLQUOTE_CALLBACK_QUEUE_DROP")
+
+    def _callback_worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                secid, tag, ltp, depth = self._callback_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                if self.on_full:
+                    self.on_full(secid, tag, ltp, depth)
+            except Exception:
+                logger.exception("FULLQUOTE_CALLBACK_ERROR | secid=%s | tag=%s", secid, tag)
+
+    def _watchdog_loop(self) -> None:
+        while not self._stop.is_set():
+            time.sleep(5.0)
+            if not self._connected.is_set() or self._stale_reconnect_sec <= 0:
+                continue
+            last_age = time.time() - self._last_message_ts if self._last_message_ts else 0.0
+            if last_age <= self._stale_reconnect_sec:
+                continue
+            print(f"FULLQUOTE_STALE_RECONNECT | last_message_age={last_age:.2f}")
+            try:
+                if self._ws:
+                    self._ws.close()
+            except Exception:
+                pass
