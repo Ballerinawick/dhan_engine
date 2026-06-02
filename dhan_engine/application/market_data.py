@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -159,3 +160,61 @@ class FutureQuoteStream:
             for secid, tag in subscriptions
         ]
         self._client.subscribe_full(instruments)
+
+
+class ShardedOptionQuoteStream:
+    """Multiple fullquote websocket clients for option premiums.
+
+    Dhan keeps ping/pong handling per websocket. When many profiles are active,
+    spreading CE/PE premium contracts across clients prevents one busy stream
+    from freezing every symbol at once.
+    """
+
+    def __init__(
+        self,
+        *,
+        client_id: str,
+        token: str,
+        exchange_segment: str,
+        on_quote: Callable[[int, str, float, object], None],
+        shard_count: Optional[int] = None,
+        debug: bool = False,
+    ):
+        requested = shard_count
+        if requested is None:
+            requested = int(os.getenv("OPTION_QUOTE_WS_SHARDS", "3") or 3)
+        self.shard_count = max(1, min(int(requested), 4))
+        self.exchange_segment = exchange_segment
+        self._clients = [
+            DhanLiveMarketFeedWS(
+                token=token,
+                client_id=client_id,
+                on_full=on_quote,
+                debug=debug,
+            )
+            for _ in range(self.shard_count)
+        ]
+
+    def start(self) -> None:
+        for client in self._clients:
+            client.connect()
+
+    def subscribe(self, subscriptions: Iterable[Tuple[int, str]]) -> None:
+        by_shard: Dict[int, List[Dict[str, str]]] = {idx: [] for idx in range(self.shard_count)}
+        for secid, tag in subscriptions:
+            shard_idx = self._shard_for_tag(str(tag))
+            by_shard[shard_idx].append(
+                {
+                    "ExchangeSegment": self.exchange_segment,
+                    "SecurityId": str(secid),
+                    "tag": tag,
+                }
+            )
+
+        for shard_idx, instruments in by_shard.items():
+            if instruments:
+                self._clients[shard_idx].subscribe_full(instruments)
+
+    def _shard_for_tag(self, tag: str) -> int:
+        symbol = tag.split("_", 1)[0].upper().strip() or tag
+        return sum(ord(ch) for ch in symbol) % self.shard_count
