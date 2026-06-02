@@ -128,46 +128,10 @@ class OptionDepthStream:
 
 
 class FutureQuoteStream:
-    """Dedicated websocket stream for underlying futures."""
+    """Fullquote stream transport.
 
-    def __init__(
-        self,
-        *,
-        client_id: str,
-        token: str,
-        exchange_segment: str,
-        on_quote: Callable[[int, str, float, object], None],
-        debug: bool = False,
-    ):
-        self.exchange_segment = exchange_segment
-        self._client = DhanLiveMarketFeedWS(
-            token=token,
-            client_id=client_id,
-            on_full=on_quote,
-            debug=debug,
-        )
-
-    def start(self) -> None:
-        self._client.connect()
-
-    def subscribe(self, subscriptions: Iterable[Tuple[int, str]]) -> None:
-        instruments = [
-            {
-                "ExchangeSegment": self.exchange_segment,
-                "SecurityId": str(secid),
-                "tag": tag,
-            }
-            for secid, tag in subscriptions
-        ]
-        self._client.subscribe_full(instruments)
-
-
-class ShardedOptionQuoteStream:
-    """Multiple fullquote websocket clients for option premiums.
-
-    Dhan keeps ping/pong handling per websocket. When many profiles are active,
-    spreading CE/PE premium contracts across clients prevents one busy stream
-    from freezing every symbol at once.
+    FUT subscriptions use one websocket. Option premium subscriptions are
+    sharded by symbol so a busy premium stream cannot stall every profile.
     """
 
     def __init__(
@@ -177,44 +141,72 @@ class ShardedOptionQuoteStream:
         token: str,
         exchange_segment: str,
         on_quote: Callable[[int, str, float, object], None],
-        shard_count: Optional[int] = None,
         debug: bool = False,
     ):
-        requested = shard_count
-        if requested is None:
-            requested = int(os.getenv("OPTION_QUOTE_WS_SHARDS", "3") or 3)
-        self.shard_count = max(1, min(int(requested), 4))
         self.exchange_segment = exchange_segment
-        self._clients = [
-            DhanLiveMarketFeedWS(
-                token=token,
-                client_id=client_id,
-                on_full=on_quote,
-                debug=debug,
-            )
-            for _ in range(self.shard_count)
-        ]
+        self._token = token
+        self._client_id = client_id
+        self._on_quote = on_quote
+        self._debug = debug
+        self._started = False
+        self._client: Optional[DhanLiveMarketFeedWS] = None
+        self._clients: List[DhanLiveMarketFeedWS] = []
+        self._option_shard_count = max(1, min(int(os.getenv("OPTION_QUOTE_WS_SHARDS", "3") or 3), 4))
 
     def start(self) -> None:
+        self._started = True
+        if self._client is not None:
+            self._client.connect()
         for client in self._clients:
             client.connect()
 
     def subscribe(self, subscriptions: Iterable[Tuple[int, str]]) -> None:
-        by_shard: Dict[int, List[Dict[str, str]]] = {idx: [] for idx in range(self.shard_count)}
-        for secid, tag in subscriptions:
-            shard_idx = self._shard_for_tag(str(tag))
-            by_shard[shard_idx].append(
-                {
-                    "ExchangeSegment": self.exchange_segment,
-                    "SecurityId": str(secid),
-                    "tag": tag,
-                }
-            )
+        subscription_list = list(subscriptions)
+        instruments = [
+            {
+                "ExchangeSegment": self.exchange_segment,
+                "SecurityId": str(secid),
+                "tag": tag,
+            }
+            for secid, tag in subscription_list
+        ]
+        if not instruments:
+            return
 
-        for shard_idx, instruments in by_shard.items():
-            if instruments:
-                self._clients[shard_idx].subscribe_full(instruments)
+        is_option_stream = any(not str(tag).upper().endswith("_FUT") for _, tag in subscription_list)
+        if is_option_stream and self._option_shard_count > 1:
+            self._ensure_shards()
+            by_shard: Dict[int, List[Dict[str, str]]] = {idx: [] for idx in range(self._option_shard_count)}
+            for item in instruments:
+                shard_idx = self._shard_for_tag(str(item.get("tag", "")))
+                by_shard[shard_idx].append(item)
+            for shard_idx, shard_instruments in by_shard.items():
+                if shard_instruments:
+                    self._clients[shard_idx].subscribe_full(shard_instruments)
+            return
+
+        self._ensure_single_client()
+        self._client.subscribe_full(instruments)
+
+    def _make_client(self) -> DhanLiveMarketFeedWS:
+        client = DhanLiveMarketFeedWS(
+            token=self._token,
+            client_id=self._client_id,
+            on_full=self._on_quote,
+            debug=self._debug,
+        )
+        if self._started:
+            client.connect()
+        return client
+
+    def _ensure_single_client(self) -> None:
+        if self._client is None:
+            self._client = self._make_client()
+
+    def _ensure_shards(self) -> None:
+        while len(self._clients) < self._option_shard_count:
+            self._clients.append(self._make_client())
 
     def _shard_for_tag(self, tag: str) -> int:
         symbol = tag.split("_", 1)[0].upper().strip() or tag
-        return sum(ord(ch) for ch in symbol) % self.shard_count
+        return sum(ord(ch) for ch in symbol) % self._option_shard_count
