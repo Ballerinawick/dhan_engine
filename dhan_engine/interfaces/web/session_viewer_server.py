@@ -102,7 +102,7 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
 
     def _session_payload(self, session: Path | None, query: dict) -> dict:
         if session is None:
-            return {"session": None, "ticks": [], "trades": [], "signals": []}
+            return {"session": None, "ticks": [], "trades": [], "signals": [], "portfolio": []}
         limit = _positive_int((query.get("limit") or ["50000"])[0], 50000)
         return {
             "session": {
@@ -113,6 +113,7 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
             "ticks": _read_jsonl(session / "ticks.jsonl", limit=limit),
             "trades": _read_jsonl(session / "trades.jsonl", limit=limit),
             "signals": _read_jsonl(session / "signals.jsonl", limit=limit),
+            "portfolio": _read_jsonl(session / "portfolio.jsonl", limit=limit),
         }
 
     def _stream_live_session(self, query: dict) -> None:
@@ -131,6 +132,7 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
             "tick": session / "ticks.jsonl",
             "trade": session / "trades.jsonl",
             "signal": session / "signals.jsonl",
+            "portfolio": session / "portfolio.jsonl",
         }
         offsets = {
             name: path.stat().st_size if path.exists() else 0

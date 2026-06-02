@@ -88,6 +88,30 @@
 
       <div id="instrumentTabs" class="instrument-tabs"></div>
 
+      <section class="dashboard-grid">
+        <div class="dashboard-panel portfolio-panel">
+          <div class="panel-head">
+            <h2>Portfolio</h2>
+            <span id="portfolioUpdated" class="mini-status">Waiting</span>
+          </div>
+          <div id="portfolioCards" class="portfolio-cards"></div>
+        </div>
+        <div class="dashboard-panel positions-panel">
+          <div class="panel-head">
+            <h2>Current Positions</h2>
+            <span id="positionCount" class="mini-status">0 open</span>
+          </div>
+          <div id="openPositionsTable" class="data-table compact-table"></div>
+        </div>
+        <div class="dashboard-panel trade-summary-panel">
+          <div class="panel-head">
+            <h2>Trade Summary</h2>
+            <span id="tradeSummaryStatus" class="mini-status">No trades</span>
+          </div>
+          <div id="tradeSummaryTable" class="data-table compact-table"></div>
+        </div>
+      </section>
+
       <div id="chartStack" class="chart-stack">
         <canvas id="priceCanvas"></canvas>
         <canvas id="volumeCanvas"></canvas>
