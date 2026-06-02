@@ -127,8 +127,16 @@ class TradingRuntimeCoordinator:
         self.latest_full_raw_by_secid: Dict[int, dict] = {}
         self.latest_depth_features_by_secid: Dict[int, dict] = {}
         self.option_last_tick_ts_by_secid = {}
+        self.option_ltp_last_ts_by_secid = {}
+        self.option_ltp_last_value_by_secid = {}
         self._last_pair_stale_log_ts = defaultdict(float)
         self._last_option_chain_health_log_ts = defaultdict(float)
+        self.stale_position_exit_sec = float(os.getenv("STALE_POSITION_EXIT_SEC", "90") or 90)
+        self.stale_position_check_sec = float(os.getenv("STALE_POSITION_CHECK_SEC", "5") or 5)
+        self.entry_fresh_ltp_max_age_sec = float(os.getenv("ENTRY_FRESH_LTP_MAX_AGE_SEC", "20") or 20)
+        self._last_stale_position_check_ts = 0.0
+        self.portfolio_snapshot_interval_sec = float(os.getenv("TRIWAVE_PORTFOLIO_SNAPSHOT_SEC", "5") or 5)
+        self._last_portfolio_snapshot_ts = 0.0
 
         self.premium_flow = {
             "CE": {"ltp": 0.0, "prev": 0.0, "velocity": 0.0},
@@ -511,6 +519,10 @@ class TradingRuntimeCoordinator:
             if pair is None:
                 return
             pair.update_option_ltp(int(secid), float(ltp))
+            if float(ltp or 0.0) > 0:
+                now_ts = time.time()
+                self.option_ltp_last_ts_by_secid[int(secid)] = now_ts
+                self.option_ltp_last_value_by_secid[int(secid)] = float(ltp)
 
             features = dict(getattr(depth, "features", None) or {})
             raw_full = dict(getattr(depth, "raw", None) or {})
@@ -630,6 +642,26 @@ class TradingRuntimeCoordinator:
         else:
             self.momentum_engine.active_trade[secid] = trade
 
+    def _is_option_ltp_fresh(self, index: str, side: str, secid: Optional[int]) -> bool:
+        if not secid or self.entry_fresh_ltp_max_age_sec <= 0:
+            return bool(secid)
+        now = time.time()
+        ltp_ts = float(self.option_ltp_last_ts_by_secid.get(int(secid), 0.0) or 0.0)
+        ltp_value = float(self.option_ltp_last_value_by_secid.get(int(secid), 0.0) or 0.0)
+        age = now - ltp_ts if ltp_ts else None
+        if ltp_ts and age is not None and age <= self.entry_fresh_ltp_max_age_sec and ltp_value > 0:
+            return True
+        logger.warning(
+            "TRI_WAVE_ENTRY_STALE_LTP_BLOCK | index=%s | side=%s | secid=%s | ltp_age=%s | ltp=%.2f | max_age=%.2f",
+            index,
+            side,
+            secid,
+            f"{age:.2f}" if age is not None else "missing",
+            ltp_value,
+            self.entry_fresh_ltp_max_age_sec,
+        )
+        return False
+
     def _execute_tri_wave_signal(self, pair: PairRuntimeState, signal, raw: dict) -> bool:
         action = signal.action
         if action == "NO_TRADE":
@@ -655,7 +687,7 @@ class TradingRuntimeCoordinator:
             secid = pair.ce_id
             tag = f"{pair.index}_CE"
             ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
-            if not secid:
+            if not self._is_option_ltp_fresh(pair.index, "CE", secid):
                 return False
             accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=signal.reason, metadata=tri_meta)
             if accepted:
@@ -673,7 +705,7 @@ class TradingRuntimeCoordinator:
             secid = pair.pe_id
             tag = f"{pair.index}_PE"
             ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
-            if not secid:
+            if not self._is_option_ltp_fresh(pair.index, "PE", secid):
                 return False
             accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=signal.reason, metadata=tri_meta)
             if accepted:
@@ -703,7 +735,7 @@ class TradingRuntimeCoordinator:
             old_ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
             if old_secid and old_secid in self.paper_trader.positions and not self._attempt_exit_once(pair, old_secid, old_tag, float(old_ltp), f"TRI_WAVE_FLIP_EXIT:{signal.reason}"):
                 return False
-            if self.paper_trader.has_open_position() or not pair.ce_id:
+            if self.paper_trader.has_open_position() or not self._is_option_ltp_fresh(pair.index, "CE", pair.ce_id):
                 return False
             new_ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
             accepted = self.paper_trader.on_entry(pair.ce_id, f"{pair.index}_CE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}", metadata=tri_meta)
@@ -717,7 +749,7 @@ class TradingRuntimeCoordinator:
             old_ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
             if old_secid and old_secid in self.paper_trader.positions and not self._attempt_exit_once(pair, old_secid, old_tag, float(old_ltp), f"TRI_WAVE_FLIP_EXIT:{signal.reason}"):
                 return False
-            if self.paper_trader.has_open_position() or not pair.pe_id:
+            if self.paper_trader.has_open_position() or not self._is_option_ltp_fresh(pair.index, "PE", pair.pe_id):
                 return False
             new_ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
             accepted = self.paper_trader.on_entry(pair.pe_id, f"{pair.index}_PE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}", metadata=tri_meta)
@@ -758,18 +790,64 @@ class TradingRuntimeCoordinator:
 
     def _record_tri_wave_portfolio_snapshot(self, index: str) -> None:
         try:
+            now_ts = time.time()
+            positions = []
+            unrealized = 0.0
+            premium_deployed = 0.0
+            for secid, pos in (getattr(self.paper_trader, "positions", {}) or {}).items():
+                entry = float(pos.get("entry", 0.0) or 0.0)
+                ltp = float(pos.get("ltp", entry) or entry)
+                qty = int(pos.get("qty", 0) or 0)
+                side = str(pos.get("side", "LONG"))
+                pnl = (ltp - entry) * qty if side == "LONG" else (entry - ltp) * qty
+                premium_deployed += entry * qty
+                unrealized += pnl
+                entry_ts = float(pos.get("entry_ts", now_ts) or now_ts)
+                positions.append({
+                    "secid": int(secid),
+                    "tag": pos.get("tag"),
+                    "side": side,
+                    "lots": pos.get("lots"),
+                    "qty": qty,
+                    "entry": entry,
+                    "ltp": ltp,
+                    "pnl": pnl,
+                    "pnl_pct": ((ltp - entry) / entry) * 100 if entry > 0 else 0.0,
+                    "entry_ts": entry_ts,
+                    "last_tick_ts": float(pos.get("last_tick_ts", entry_ts) or entry_ts),
+                    "hold_sec": max(now_ts - entry_ts, 0.0),
+                    "entry_reason": pos.get("entry_reason"),
+                    "strategy_owner": pos.get("strategy_owner"),
+                })
+            realized = float(getattr(self.paper_trader, "realized_pnl", 0.0) or 0.0)
             snapshot = {
                 "index": index,
                 "capital": getattr(self.paper_trader, "capital", None),
+                "initial_capital": getattr(self.paper_trader, "initial_capital", None),
+                "cash": getattr(self.paper_trader, "cash", None),
                 "realized_pnl": getattr(self.paper_trader, "realized_pnl", None),
+                "unrealized_pnl": unrealized,
+                "net_pnl": realized + unrealized,
+                "premium_deployed": premium_deployed,
                 "fees_paid": getattr(self.paper_trader, "fees_paid_today", getattr(self.paper_trader, "fees_paid", None)),
+                "total_fees": getattr(self.paper_trader, "total_fees", None),
                 "opened_today": getattr(self.paper_trader, "opened_today", None),
                 "closed_today": getattr(self.paper_trader, "closed_today", None),
                 "open_positions": len(getattr(self.paper_trader, "positions", {}) or {}),
+                "positions": positions,
             }
             self.tri_wave_recorder.record_portfolio(snapshot)
         except Exception:
             logger.exception("TRI_WAVE_RECORDER_PORTFOLIO_ERROR | index=%s", index)
+
+    def _maybe_record_tri_wave_portfolio_snapshot(self, index: str) -> None:
+        now_ts = time.time()
+        if now_ts - self._last_portfolio_snapshot_ts < self.portfolio_snapshot_interval_sec:
+            return
+        if not getattr(self.paper_trader, "positions", None):
+            return
+        self._last_portfolio_snapshot_ts = now_ts
+        self._record_tri_wave_portfolio_snapshot(index)
 
     def _record_tri_wave_exit(self, index: str, reason: str) -> None:
         self.tri_wave_v2_last_exit_ts[index] = time.time()
@@ -873,6 +951,7 @@ class TradingRuntimeCoordinator:
 
         self._track_zero_book(secid, tag, raw)
         self.paper_trader.on_tick(secid, raw["ltp"])
+        self._maybe_record_tri_wave_portfolio_snapshot(pair.index)
 
         if pair.is_ready() and not pair.ready_logged:
             pair.ready_logged = True
@@ -947,19 +1026,70 @@ class TradingRuntimeCoordinator:
 
         ce_age = None
         pe_age = None
+        ce_ltp_age = None
+        pe_ltp_age = None
         if pair.ce_id:
             ts = self.option_last_tick_ts_by_secid.get(pair.ce_id)
             ce_age = now - ts if ts else None
+            ltp_ts = self.option_ltp_last_ts_by_secid.get(pair.ce_id)
+            ce_ltp_age = now - ltp_ts if ltp_ts else None
         if pair.pe_id:
             ts = self.option_last_tick_ts_by_secid.get(pair.pe_id)
             pe_age = now - ts if ts else None
+            ltp_ts = self.option_ltp_last_ts_by_secid.get(pair.pe_id)
+            pe_ltp_age = now - ltp_ts if ltp_ts else None
 
-        if (ce_age is not None and ce_age > 60) or (pe_age is not None and pe_age > 60):
+        if (
+            (ce_age is not None and ce_age > 60)
+            or (pe_age is not None and pe_age > 60)
+            or (ce_ltp_age is not None and ce_ltp_age > 60)
+            or (pe_ltp_age is not None and pe_ltp_age > 60)
+        ):
             self._last_pair_stale_log_ts[index] = now
             logger.warning(
-                "TRI_WAVE_PAIR_STALE | index=%s | ce_age=%s | pe_age=%s | ce_id=%s | pe_id=%s",
-                index, ce_age, pe_age, pair.ce_id, pair.pe_id
+                "TRI_WAVE_PAIR_STALE | index=%s | ce_age=%s | pe_age=%s | ce_ltp_age=%s | pe_ltp_age=%s | ce_id=%s | pe_id=%s",
+                index, ce_age, pe_age, ce_ltp_age, pe_ltp_age, pair.ce_id, pair.pe_id
             )
+
+    def _exit_stale_positions_if_needed(self) -> None:
+        if self.stale_position_exit_sec <= 0:
+            return
+        now = time.time()
+        if now - self._last_stale_position_check_ts < self.stale_position_check_sec:
+            return
+        self._last_stale_position_check_ts = now
+
+        for index, pair in list(self.pairs.items()):
+            for side, secid in (("CE", pair.ce_id), ("PE", pair.pe_id)):
+                if not secid or secid not in self.paper_trader.positions:
+                    continue
+                position = self.paper_trader.positions.get(secid, {})
+                ltp_ts = float(self.option_ltp_last_ts_by_secid.get(int(secid), 0.0) or 0.0)
+                entry_ts = float(position.get("entry_ts", now) or now)
+                age = now - (ltp_ts or entry_ts)
+                if age < self.stale_position_exit_sec:
+                    continue
+                ltp = float(position.get("ltp", position.get("entry", 0.0)) or 0.0)
+                if ltp <= 0:
+                    ltp = pair._best_leg_ltp(
+                        pair.ce_depth if side == "CE" else pair.pe_depth,
+                        pair.ce_ltp if side == "CE" else pair.pe_ltp,
+                        position.get("entry", 0.0),
+                    )
+                logger.warning(
+                    "TRI_WAVE_STALE_POSITION_EXIT | index=%s | side=%s | secid=%s | ltp_age=%.2f | ltp=%.2f",
+                    index,
+                    side,
+                    secid,
+                    age,
+                    float(ltp),
+                )
+                self._tri_wave_direct_exit(
+                    pair,
+                    int(secid),
+                    float(ltp),
+                    "TRI_WAVE_V2_EXIT:STALE_MARKET_DATA",
+                )
 
     def _log_option_chain_health_if_needed(self, index: str, pair: PairRuntimeState) -> None:
         now = time.time()
@@ -1538,6 +1668,7 @@ class TradingRuntimeCoordinator:
                 continue
 
             now = time.time()
+            self._exit_stale_positions_if_needed()
             if now - last_heartbeat >= self.settings.heartbeat_sec:
                 last_heartbeat = now
                 logger.info("%s ENGINE_RUNNING", datetime.now(self.timezone).strftime("%H:%M:%S"))

@@ -56,6 +56,7 @@ class DhanLiveMarketFeedWS:
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
         self._worker_thread: Optional[threading.Thread] = None
+        self._callback_thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._connected = threading.Event()
@@ -66,10 +67,14 @@ class DhanLiveMarketFeedWS:
         self._lock = threading.Lock()
         self._callback_condition = threading.Condition()
         self._pending_callbacks: Dict[int, tuple] = {}
+        self._message_condition = threading.Condition()
+        self._pending_messages: List[bytes] = []
         self._last_coalesce_log_ts = 0.0
+        self._last_message_backlog_log_ts = 0.0
         self._previous_features: Dict[int, dict] = {}
         self._last_feature_log_ts: Dict[int, float] = {}
         self._last_message_ts = 0.0
+        self._max_pending_messages = int(os.getenv("FULLQUOTE_MAX_PENDING_MESSAGES", "500") or 500)
         self._stale_reconnect_sec = float(os.getenv("FULLQUOTE_STALE_RECONNECT_SEC", "45") or 45)
         self._ping_interval = float(os.getenv("FULLQUOTE_WS_PING_INTERVAL", "15") or 15)
         self._ping_timeout = float(os.getenv("FULLQUOTE_WS_PING_TIMEOUT", "8") or 8)
@@ -94,6 +99,10 @@ class DhanLiveMarketFeedWS:
 
     def close(self) -> None:
         self._stop.set()
+        with self._message_condition:
+            self._message_condition.notify_all()
+        with self._callback_condition:
+            self._callback_condition.notify_all()
         try:
             if self._ws:
                 self._ws.close()
@@ -113,14 +122,20 @@ class DhanLiveMarketFeedWS:
             self._send_subscribe()
 
     def _ensure_worker(self) -> None:
-        if self._worker_thread and self._worker_thread.is_alive():
-            return
-        self._worker_thread = threading.Thread(
-            target=self._callback_worker,
-            name="DhanMarketFeedCallbackWorker",
-            daemon=True,
-        )
-        self._worker_thread.start()
+        if not (self._worker_thread and self._worker_thread.is_alive()):
+            self._worker_thread = threading.Thread(
+                target=self._message_worker,
+                name="DhanMarketFeedMessageWorker",
+                daemon=True,
+            )
+            self._worker_thread.start()
+        if not (self._callback_thread and self._callback_thread.is_alive()):
+            self._callback_thread = threading.Thread(
+                target=self._callback_worker,
+                name="DhanMarketFeedCallbackWorker",
+                daemon=True,
+            )
+            self._callback_thread.start()
 
     def _ensure_watchdog(self) -> None:
         if self._watchdog_thread and self._watchdog_thread.is_alive():
@@ -233,7 +248,37 @@ class DhanLiveMarketFeedWS:
                 if self.debug:
                     print("FULLQUOTE_NON_BINARY_MESSAGE")
                 return
+            self._enqueue_message(bytes(message))
+        except Exception as exc:
+            print("FULLQUOTE_WS_MESSAGE_ERROR:", exc)
 
+    def _enqueue_message(self, message: bytes) -> None:
+        with self._message_condition:
+            self._pending_messages.append(message)
+            pending_count = len(self._pending_messages)
+            if pending_count > self._max_pending_messages:
+                overflow = pending_count - self._max_pending_messages
+                del self._pending_messages[:overflow]
+                pending_count = len(self._pending_messages)
+            self._message_condition.notify()
+
+        now = time.time()
+        if pending_count > 100 and now - self._last_message_backlog_log_ts >= 10:
+            self._last_message_backlog_log_ts = now
+            print(f"FULLQUOTE_MESSAGE_BACKLOG | pending={pending_count}")
+
+    def _message_worker(self) -> None:
+        while not self._stop.is_set():
+            with self._message_condition:
+                if not self._pending_messages:
+                    self._message_condition.wait(timeout=1.0)
+                if not self._pending_messages:
+                    continue
+                message = self._pending_messages.pop(0)
+            self._process_message(message)
+
+    def _process_message(self, message: bytes) -> None:
+        try:
             parsed = self.process_data(bytes(message))
 
             if parsed and self.debug:

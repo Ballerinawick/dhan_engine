@@ -2,6 +2,7 @@ const state = {
   ticks: [],
   trades: [],
   signals: [],
+  portfolio: [],
   sessions: [],
   seriesKey: "",
   timeframeSec: 5,
@@ -33,6 +34,12 @@ const els = {
   inspectText: document.getElementById("inspectText"),
   liveBadge: document.getElementById("liveBadge"),
   instrumentTabs: document.getElementById("instrumentTabs"),
+  portfolioCards: document.getElementById("portfolioCards"),
+  portfolioUpdated: document.getElementById("portfolioUpdated"),
+  positionCount: document.getElementById("positionCount"),
+  openPositionsTable: document.getElementById("openPositionsTable"),
+  tradeSummaryStatus: document.getElementById("tradeSummaryStatus"),
+  tradeSummaryTable: document.getElementById("tradeSummaryTable"),
   chartStack: document.getElementById("chartStack"),
   priceCanvas: document.getElementById("priceCanvas"),
   volumeCanvas: document.getElementById("volumeCanvas"),
@@ -100,6 +107,7 @@ async function loadCloudSession(session) {
   state.ticks = dedupeTicks((payload.ticks || []).map(normalizeTick));
   state.trades = (payload.trades || []).map(normalizeTrade);
   state.signals = payload.signals || [];
+  state.portfolio = (payload.portfolio || []).map(normalizePortfolio);
   state.seriesKey = "";
   state.selectedTrade = null;
   state.liveCount = 0;
@@ -122,6 +130,11 @@ function startLiveStream(session) {
   source.addEventListener("trade", (event) => {
     state.trades.push(normalizeTrade(JSON.parse(event.data), state.trades.length));
     render();
+  });
+  source.addEventListener("portfolio", (event) => {
+    state.portfolio.push(normalizePortfolio(JSON.parse(event.data)));
+    if (state.portfolio.length > 12000) state.portfolio.splice(0, state.portfolio.length - 12000);
+    renderThrottled();
   });
   source.addEventListener("signal", (event) => {
     state.signals.push(JSON.parse(event.data));
@@ -176,6 +189,45 @@ function normalizeTrade(row, idx = 0) {
     entry_reason: String(t.entry_reason || ""),
     exit_reason: String(t.exit_reason || ""),
     tag,
+  };
+}
+
+function normalizePortfolio(row) {
+  const portfolio = row.portfolio || row;
+  const positions = Array.isArray(portfolio.positions) ? portfolio.positions : [];
+  const realized = Number(portfolio.realized_pnl ?? 0);
+  const unrealized = Number(portfolio.unrealized_pnl ?? 0);
+  return {
+    ...portfolio,
+    ts: Number(row.ts || portfolio.ts || 0),
+    time: String(row.time || portfolio.time || ""),
+    initial_capital: Number(portfolio.initial_capital ?? portfolio.capital ?? 0),
+    cash: Number(portfolio.cash ?? 0),
+    realized_pnl: realized,
+    unrealized_pnl: unrealized,
+    net_pnl: Number(portfolio.net_pnl ?? (realized + unrealized)),
+    premium_deployed: Number(portfolio.premium_deployed ?? 0),
+    total_fees: Number(portfolio.total_fees ?? portfolio.fees_paid ?? 0),
+    opened_today: Number(portfolio.opened_today ?? 0),
+    closed_today: Number(portfolio.closed_today ?? 0),
+    open_positions: Number(portfolio.open_positions ?? positions.length),
+    positions: positions.map(normalizePosition),
+  };
+}
+
+function normalizePosition(position) {
+  return {
+    ...position,
+    secid: Number(position.secid || 0),
+    tag: String(position.tag || ""),
+    qty: Number(position.qty || 0),
+    entry: Number(position.entry || 0),
+    ltp: Number(position.ltp || 0),
+    pnl: Number(position.pnl || 0),
+    pnl_pct: Number(position.pnl_pct || 0),
+    hold_sec: Number(position.hold_sec || 0),
+    last_tick_ts: Number(position.last_tick_ts || 0),
+    entry_reason: String(position.entry_reason || ""),
   };
 }
 
@@ -330,6 +382,102 @@ function refreshTrades() {
   });
 }
 
+function latestPortfolio() {
+  return state.portfolio[state.portfolio.length - 1] || null;
+}
+
+function latestPositions() {
+  const latest = latestPortfolio();
+  return latest && Array.isArray(latest.positions) ? latest.positions : [];
+}
+
+function renderDashboard() {
+  renderPortfolioCards();
+  renderOpenPositions();
+  renderTradeSummaryTable();
+}
+
+function renderPortfolioCards() {
+  const latest = latestPortfolio();
+  if (!latest) {
+    els.portfolioCards.innerHTML = emptyInline("No portfolio snapshots yet");
+    els.portfolioUpdated.textContent = "Waiting";
+    return;
+  }
+  els.portfolioUpdated.textContent = latest.time ? `Updated ${latest.time}` : "Live";
+  const cards = [
+    ["Open", latest.open_positions],
+    ["Net PnL", formatMoney(latest.net_pnl), latest.net_pnl >= 0 ? "profit" : "loss"],
+    ["Realized", formatMoney(latest.realized_pnl), latest.realized_pnl >= 0 ? "profit" : "loss"],
+    ["Unrealized", formatMoney(latest.unrealized_pnl), latest.unrealized_pnl >= 0 ? "profit" : "loss"],
+    ["Premium", formatMoneyPlain(latest.premium_deployed)],
+    ["Cash", formatMoneyPlain(latest.cash)],
+    ["Fees", formatMoneyPlain(latest.total_fees)],
+    ["Trades", `${latest.opened_today}/${latest.closed_today}`],
+  ];
+  els.portfolioCards.innerHTML = cards.map(([label, value, klass]) => `
+    <div class="portfolio-card">
+      <span>${escapeHtml(label)}</span>
+      <strong class="${klass || ""}">${escapeHtml(value)}</strong>
+    </div>
+  `).join("");
+}
+
+function renderOpenPositions() {
+  const positions = latestPositions();
+  els.positionCount.textContent = `${positions.length} open`;
+  if (!positions.length) {
+    els.openPositionsTable.innerHTML = emptyTable("No open positions");
+    return;
+  }
+  const rows = positions
+    .slice()
+    .sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl))
+    .map((pos) => {
+      const pnlClass = pos.pnl >= 0 ? "profit" : "loss";
+      return `
+        <div class="data-row">
+          <span title="${escapeHtml(pos.tag)}">${escapeHtml(pos.tag)}</span>
+          <span>${pos.entry.toFixed(2)}</span>
+          <span>${pos.ltp.toFixed(2)}</span>
+          <span class="${pnlClass}">${formatMoney(pos.pnl)}</span>
+          <span>${formatDuration(pos.hold_sec)}</span>
+        </div>
+      `;
+    }).join("");
+  els.openPositionsTable.innerHTML = `
+    <div class="data-header"><span>Instrument</span><span>Entry</span><span>LTP</span><span>PnL</span><span>Hold</span></div>
+    ${rows}
+  `;
+}
+
+function renderTradeSummaryTable() {
+  const trades = state.trades.slice().sort((a, b) => (b.exit_ts || b.entry_ts || 0) - (a.exit_ts || a.entry_ts || 0));
+  const total = trades.reduce((sum, trade) => sum + trade.net_pnl, 0);
+  const wins = trades.filter((trade) => trade.net_pnl > 0).length;
+  els.tradeSummaryStatus.textContent = trades.length ? `${trades.length} trades | ${formatMoney(total)} | ${((wins / trades.length) * 100).toFixed(0)}% win` : "No trades";
+  if (!trades.length) {
+    els.tradeSummaryTable.innerHTML = emptyTable("No closed trades yet");
+    return;
+  }
+  const rows = trades.slice(0, 40).map((trade) => {
+    const pnlClass = trade.net_pnl >= 0 ? "profit" : "loss";
+    return `
+      <div class="data-row" title="${escapeHtml(trade.entry_reason)} -> ${escapeHtml(trade.exit_reason)}">
+        <span>${escapeHtml(trade.tag || `${trade.index}_${trade.stream}`)}</span>
+        <span>${trade.entry.toFixed(2)}</span>
+        <span>${trade.exit.toFixed(2)}</span>
+        <span class="${pnlClass}">${formatMoney(trade.net_pnl)}</span>
+        <span>${escapeHtml(shortReason(trade.exit_reason))}</span>
+      </div>
+    `;
+  }).join("");
+  els.tradeSummaryTable.innerHTML = `
+    <div class="data-header"><span>Instrument</span><span>Entry</span><span>Exit</span><span>Net</span><span>Reason</span></div>
+    ${rows}
+  `;
+}
+
 function renderStats(candles, trades) {
   const ticks = getSeriesTicks();
   const wins = trades.filter((t) => t.net_pnl > 0).length;
@@ -403,6 +551,7 @@ function render() {
   const trades = getSeriesTrades();
   refreshTrades();
   renderStats(candles, trades);
+  renderDashboard();
   syncPanelVisibility();
   const liveAge = state.lastLiveTs ? `${Math.round((Date.now() - state.lastLiveTs) / 1000)}s ago` : "-";
   els.statusText.textContent = ticks.length ? `${labelForSeries(state.seriesKey)} | ${ticks.length} ticks | live ${liveAge}` : "Load session files";
@@ -532,7 +681,16 @@ function prepareCanvas(canvas) {
 
 function chartBox(canvas) {
   const rect = canvas.getBoundingClientRect();
-  return { x: 64, y: 18, w: Math.max(90, rect.width - 100), h: Math.max(50, rect.height - 48) };
+  const left = 52;
+  const right = 58;
+  const top = 14;
+  const bottom = 34;
+  return {
+    x: left,
+    y: top,
+    w: Math.max(90, rect.width - left - right),
+    h: Math.max(50, rect.height - top - bottom),
+  };
 }
 
 function drawGrid(ctx, box) {
@@ -545,17 +703,31 @@ function drawGrid(ctx, box) {
     ctx.lineTo(box.x + box.w, y);
     ctx.stroke();
   }
+  for (let i = 0; i <= 4; i++) {
+    const x = box.x + (box.w / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(x, box.y);
+    ctx.lineTo(x, box.y + box.h);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = "rgba(154,165,181,.34)";
+  ctx.beginPath();
+  ctx.moveTo(box.x, box.y);
+  ctx.lineTo(box.x, box.y + box.h);
+  ctx.lineTo(box.x + box.w, box.y + box.h);
+  ctx.lineTo(box.x + box.w, box.y);
+  ctx.stroke();
 }
 
 function drawAxis(ctx, box, min, max) {
   ctx.fillStyle = "#9aa5b5";
   ctx.font = "12px Segoe UI";
-  ctx.textAlign = "right";
+  ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   for (let i = 0; i <= 4; i++) {
     const value = max - ((max - min) / 4) * i;
     const y = box.y + (box.h / 4) * i;
-    ctx.fillText(value.toFixed(2), box.x - 8, y);
+    ctx.fillText(value.toFixed(2), box.x + box.w + 8, y);
   }
 }
 
@@ -612,7 +784,8 @@ function installChartControls(canvas) {
     state.autoFollow = false;
     els.autoFollow.checked = false;
     const rect = canvas.getBoundingClientRect();
-    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left - 64) / Math.max(1, rect.width - 100)));
+    const box = chartBox(canvas);
+    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left - box.x) / Math.max(1, box.w)));
     const focus = state.viewStart + (state.viewEnd - state.viewStart) * ratio;
     const factor = event.deltaY > 0 ? 1.18 : 0.84;
     const width = Math.max(12, Math.min(candles.length, (state.viewEnd - state.viewStart) * factor));
@@ -630,9 +803,9 @@ function installChartControls(canvas) {
   window.addEventListener("mousemove", (event) => {
     if (!state.dragging) return;
     const candles = buildCandles(getSeriesTicks(), state.timeframeSec);
-    const rect = canvas.getBoundingClientRect();
     const deltaPx = event.clientX - state.dragging.x;
-    const deltaCandles = -(deltaPx / Math.max(1, rect.width - 100)) * (state.dragging.end - state.dragging.start);
+    const box = chartBox(canvas);
+    const deltaCandles = -(deltaPx / Math.max(1, box.w)) * (state.dragging.end - state.dragging.start);
     state.viewStart = state.dragging.start + deltaCandles;
     state.viewEnd = state.dragging.end + deltaCandles;
     clampView(candles.length);
@@ -656,6 +829,25 @@ function shortReason(reason) {
 function formatMoney(value) {
   const num = Number(value || 0);
   return `${num >= 0 ? "+" : ""}${num.toFixed(2)}`;
+}
+
+function formatMoneyPlain(value) {
+  return Number(value || 0).toFixed(2);
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Number(seconds || 0));
+  const m = Math.floor(total / 60);
+  const s = Math.floor(total % 60);
+  return `${m}m${String(s).padStart(2, "0")}s`;
+}
+
+function emptyInline(text) {
+  return `<div class="inspect-text">${escapeHtml(text)}</div>`;
+}
+
+function emptyTable(text) {
+  return `<div class="data-row"><span>${escapeHtml(text)}</span><span></span><span></span><span></span><span></span></div>`;
 }
 
 function formatTime(ts) {
