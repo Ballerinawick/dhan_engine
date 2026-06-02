@@ -1,0 +1,51 @@
+.app {
+  grid-template-columns: 300px minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sidebar {
+  padding: 12px;
+}
+
+.feature-list {
+  max-height: 138px;
+}
+
+.trade-list {
+  max-height: 220px;
+}
+
+.workspace {
+  grid-template-rows: 50px 38px minmax(0, 1fr);
+  min-height: 0;
+}
+
+.chart-stack {
+  grid-template-rows: minmax(240px, 1.9fr) minmax(84px, .55fr) minmax(110px, .7fr);
+  max-height: calc(100vh - 88px);
+  overflow: hidden;
+}
+
+.chart-stack.hide-volume {
+  grid-template-rows: minmax(280px, 1.9fr) 0 minmax(110px, .7fr);
+}
+
+.chart-stack.hide-wave {
+  grid-template-rows: minmax(300px, 1.9fr) minmax(84px, .55fr) 0;
+}
+
+@media (max-width: 940px) {
+  .app {
+    overflow: visible;
+  }
+
+  .workspace {
+    min-height: 620px;
+  }
+
+  .chart-stack {
+    max-height: none;
+    grid-template-rows: 340px 110px 130px;
+  }
+}
