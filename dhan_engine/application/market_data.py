@@ -7,7 +7,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from dhan_engine.infrastructure.dhan.async_depth_adapter import DhanAsyncDepthAdapter
 from dhan_engine.infrastructure.dhan.ltp_rest_engine import DhanLtpRestEngine
-from dhan_engine.infrastructure.dhan.marketfeed_ws import DhanLiveMarketFeedWS
+from dhan_engine.infrastructure.dhan.marketfeed_ws_fast import FastDhanLiveMarketFeedWS as DhanLiveMarketFeedWS
 
 
 logger = logging.getLogger(__name__)
