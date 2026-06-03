@@ -134,6 +134,7 @@ class TradingRuntimeCoordinator:
         self.stale_position_exit_sec = float(os.getenv("STALE_POSITION_EXIT_SEC", "90") or 90)
         self.stale_position_check_sec = float(os.getenv("STALE_POSITION_CHECK_SEC", "5") or 5)
         self.entry_fresh_ltp_max_age_sec = float(os.getenv("ENTRY_FRESH_LTP_MAX_AGE_SEC", "20") or 20)
+        self.verbose_tick_logs = str(os.getenv("TRIWAVE_VERBOSE_TICK_LOGS", "0")).strip().lower() in {"1", "true", "yes", "on"}
         self._last_stale_position_check_ts = 0.0
         self.portfolio_snapshot_interval_sec = float(os.getenv("TRIWAVE_PORTFOLIO_SNAPSHOT_SEC", "5") or 5)
         self._last_portfolio_snapshot_ts = 0.0
@@ -386,18 +387,19 @@ class TradingRuntimeCoordinator:
                 self.tri_wave_recorder.record_tick(index=index, stream="FUT", secid=int(secid), ltp=float(ltp), features=dict(features or self.pairs[index].underlying_quote or {}))
 
             if self.TRI_WAVE_V2_ONLY_MODE:
-                if time.time() - getattr(self, "_last_v2_fut_route_log", 0.0) >= 5.0:
-                    self._last_v2_fut_route_log = time.time()
-                    logger.info(
-                        "TRI_WAVE_V2_FULL_FEATURE_ROUTE | stream=FUT | index=%s | secid=%s | ltp=%.2f | feature_keys=%s | recovery=%.2f | clean=%.2f | flow=%.2f | ofi=%.2f | volume_change=%s | oi_change=%s",
-                        index, secid, float(ltp), sorted(features.keys()),
-                        float(features.get("recovery_score", 0.0) or 0.0),
-                        float(features.get("clean_trade_score", 0.0) or 0.0),
-                        float(features.get("flow", 0.0) or 0.0),
-                        float(features.get("ofi", 0.0) or 0.0),
-                        features.get("volume_change_tick"),
-                        features.get("oi_change_tick"),
-                    )
+                if self.verbose_tick_logs:
+                    if time.time() - getattr(self, "_last_v2_fut_route_log", 0.0) >= 5.0:
+                        self._last_v2_fut_route_log = time.time()
+                        logger.info(
+                            "TRI_WAVE_V2_FULL_FEATURE_ROUTE | stream=FUT | index=%s | secid=%s | ltp=%.2f | feature_keys=%s | recovery=%.2f | clean=%.2f | flow=%.2f | ofi=%.2f | volume_change=%s | oi_change=%s",
+                            index, secid, float(ltp), sorted(features.keys()),
+                            float(features.get("recovery_score", 0.0) or 0.0),
+                            float(features.get("clean_trade_score", 0.0) or 0.0),
+                            float(features.get("flow", 0.0) or 0.0),
+                            float(features.get("ofi", 0.0) or 0.0),
+                            features.get("volume_change_tick"),
+                            features.get("oi_change_tick"),
+                        )
                 self.tri_wave_v2_brain.on_future_tick(index=index, secid=int(secid), ltp=float(ltp), features=features or self.pairs[index].underlying_quote)
             else:
                 self.tri_wave_brain.on_future_tick(
@@ -960,7 +962,7 @@ class TradingRuntimeCoordinator:
         if side:
             if self.TRI_WAVE_V2_ONLY_MODE:
                 log_key = f"{index}:{side}"
-                if time.time() - getattr(self, "_last_v2_opt_route_log", {}).get(log_key, 0.0) >= 5.0:
+                if self.verbose_tick_logs and time.time() - getattr(self, "_last_v2_opt_route_log", {}).get(log_key, 0.0) >= 5.0:
                     self._last_v2_opt_route_log = getattr(self, "_last_v2_opt_route_log", {})
                     self._last_v2_opt_route_log[log_key] = time.time()
                     logger.info(
@@ -1003,10 +1005,11 @@ class TradingRuntimeCoordinator:
                             "TRI_WAVE_ONLY_EXECUTED | index=%s | action=%s | reason=%s",
                             pair.index, tri_signal.action, tri_signal.reason
                         )
-                logger.info(
-                    "LEGACY_SYSTEM_SKIPPED_BY_TRI_WAVE_V2_ONLY | index=%s | secid=%s | tag=%s",
-                    pair.index, secid, tag
-                )
+                if self.verbose_tick_logs:
+                    logger.info(
+                        "LEGACY_SYSTEM_SKIPPED_BY_TRI_WAVE_V2_ONLY | index=%s | secid=%s | tag=%s",
+                        pair.index, secid, tag
+                    )
                 return
             if tri_signal and tri_signal.action != "NO_TRADE":
                 executed = self._execute_tri_wave_signal(pair, tri_signal, raw)
