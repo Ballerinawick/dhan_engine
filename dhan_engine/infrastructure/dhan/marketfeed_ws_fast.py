@@ -96,6 +96,7 @@ class FastDhanLiveMarketFeedWS(DhanLiveMarketFeedWS):
             if parsed and parsed.get("type") == "Full Data":
                 secid = int(parsed.get("security_id"))
                 tag = self._tags.get(secid, str(secid))
+                self._last_full_data_ts_by_secid[secid] = time.time()
                 previous = self._previous_features.get(secid)
                 features = derive_full_data_features(parsed, previous)
                 self._previous_features[secid] = features

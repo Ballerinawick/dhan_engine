@@ -63,6 +63,9 @@ class DhanLiveMarketFeedWS:
         self._subs: List[Dict[str, str]] = []
         self._sub_keys = set()
         self._tags: Dict[int, str] = {}
+        self._last_subscribe_ts_by_secid: Dict[int, float] = {}
+        self._last_full_data_ts_by_secid: Dict[int, float] = {}
+        self._last_connected_ts = 0.0
         self._reconnect_attempt = 0
         self._lock = threading.Lock()
         self._callback_condition = threading.Condition()
@@ -77,6 +80,9 @@ class DhanLiveMarketFeedWS:
         self._last_message_ts = 0.0
         self._max_pending_messages = int(os.getenv("FULLQUOTE_MAX_PENDING_MESSAGES", "500") or 500)
         self._stale_reconnect_sec = float(os.getenv("FULLQUOTE_STALE_RECONNECT_SEC", "45") or 45)
+        self._subscription_stale_reconnect_sec = float(os.getenv("FULLQUOTE_SUBSCRIPTION_STALE_RECONNECT_SEC", "75") or 75)
+        self._subscription_stale_min_count = int(os.getenv("FULLQUOTE_SUBSCRIPTION_STALE_MIN_COUNT", "2") or 2)
+        self._last_subscription_stale_log_ts = 0.0
         self._ping_interval = float(os.getenv("FULLQUOTE_WS_PING_INTERVAL", "15") or 15)
         self._ping_timeout = float(os.getenv("FULLQUOTE_WS_PING_TIMEOUT", "8") or 8)
         self._feed_parser = (
@@ -111,16 +117,28 @@ class DhanLiveMarketFeedWS:
             pass
 
     def subscribe_full(self, instruments: List[Dict[str, str]]) -> None:
+        now = time.time()
         with self._lock:
             for item in instruments:
                 key = (str(item["ExchangeSegment"]), str(item["SecurityId"]))
                 if key not in self._sub_keys:
                     self._subs.append(dict(item))
                     self._sub_keys.add(key)
-                self._tags[int(item["SecurityId"])] = item.get("tag", item["SecurityId"])
+                secid = int(item["SecurityId"])
+                self._tags[secid] = item.get("tag", item["SecurityId"])
+                self._last_subscribe_ts_by_secid[secid] = now
 
         if self._connected.is_set():
             self._send_subscribe()
+
+    def reconnect(self, reason: str = "manual") -> None:
+        print(f"FULLQUOTE_FORCE_RECONNECT | reason={reason}")
+        self._connected.clear()
+        try:
+            if self._ws:
+                self._ws.close()
+        except Exception:
+            pass
 
     def _ensure_worker(self) -> None:
         if not (self._worker_thread and self._worker_thread.is_alive()):
@@ -193,6 +211,9 @@ class DhanLiveMarketFeedWS:
 
         with self._lock:
             subscriptions = list(self._subs)
+            now = time.time()
+            for item in subscriptions:
+                self._last_subscribe_ts_by_secid[int(item["SecurityId"])] = now
 
         if not subscriptions:
             return
@@ -220,6 +241,7 @@ class DhanLiveMarketFeedWS:
 
     def _on_open(self, ws) -> None:
         self._connected.set()
+        self._last_connected_ts = time.time()
         self._reconnect_attempt = 0
         print("WS_FULLQUOTE_CONNECTED")
         self._send_subscribe()
@@ -288,6 +310,7 @@ class DhanLiveMarketFeedWS:
             if parsed and parsed.get("type") == "Full Data":
                 secid = int(parsed.get("security_id"))
                 tag = self._tags.get(secid, str(secid))
+                self._last_full_data_ts_by_secid[secid] = time.time()
                 previous = self._previous_features.get(secid)
                 features = derive_full_data_features(parsed, previous)
                 self._previous_features[secid] = features
@@ -370,14 +393,50 @@ class DhanLiveMarketFeedWS:
     def _watchdog_loop(self) -> None:
         while not self._stop.is_set():
             time.sleep(5.0)
-            if not self._connected.is_set() or self._stale_reconnect_sec <= 0:
+            if not self._connected.is_set():
                 continue
             last_age = time.time() - self._last_message_ts if self._last_message_ts else 0.0
-            if last_age <= self._stale_reconnect_sec:
+            if self._stale_reconnect_sec > 0 and last_age > self._stale_reconnect_sec:
+                print(f"FULLQUOTE_STALE_RECONNECT | last_message_age={last_age:.2f}")
+                try:
+                    if self._ws:
+                        self._ws.close()
+                except Exception:
+                    pass
                 continue
-            print(f"FULLQUOTE_STALE_RECONNECT | last_message_age={last_age:.2f}")
-            try:
-                if self._ws:
-                    self._ws.close()
-            except Exception:
-                pass
+            self._check_subscription_staleness()
+
+    def _check_subscription_staleness(self) -> None:
+        if self._subscription_stale_reconnect_sec <= 0:
+            return
+        now = time.time()
+        with self._lock:
+            subscriptions = list(self._subs)
+            last_subscribe = dict(self._last_subscribe_ts_by_secid)
+            last_full = dict(self._last_full_data_ts_by_secid)
+            tags = dict(self._tags)
+        if not subscriptions:
+            return
+
+        stale = []
+        for item in subscriptions:
+            secid = int(item["SecurityId"])
+            subscribed_age = now - float(last_subscribe.get(secid, self._last_connected_ts or now))
+            if subscribed_age < self._subscription_stale_reconnect_sec:
+                continue
+            full_ts = float(last_full.get(secid, 0.0) or 0.0)
+            full_age = now - full_ts if full_ts else subscribed_age
+            if full_age >= self._subscription_stale_reconnect_sec:
+                stale.append((secid, tags.get(secid, str(secid)), full_age))
+
+        if len(stale) < min(self._subscription_stale_min_count, len(subscriptions)):
+            return
+        if now - self._last_subscription_stale_log_ts < self._subscription_stale_reconnect_sec:
+            return
+        self._last_subscription_stale_log_ts = now
+        stale_preview = ",".join(f"{tag}:{age:.0f}s" for _, tag, age in stale[:8])
+        print(
+            "FULLQUOTE_SUBSCRIPTION_STALE_RECONNECT | "
+            f"stale={len(stale)}/{len(subscriptions)} | threshold={self._subscription_stale_reconnect_sec:.0f}s | {stale_preview}"
+        )
+        self.reconnect("subscription_stale")

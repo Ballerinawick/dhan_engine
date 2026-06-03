@@ -130,10 +130,15 @@ class TradingRuntimeCoordinator:
         self.option_ltp_last_ts_by_secid = {}
         self.option_ltp_last_value_by_secid = {}
         self._last_pair_stale_log_ts = defaultdict(float)
+        self._last_pair_resubscribe_ts = defaultdict(float)
+        self._last_entry_stale_log_ts = defaultdict(float)
+        self._last_entry_cooldown_log_ts = defaultdict(float)
         self._last_option_chain_health_log_ts = defaultdict(float)
         self.stale_position_exit_sec = float(os.getenv("STALE_POSITION_EXIT_SEC", "90") or 90)
         self.stale_position_check_sec = float(os.getenv("STALE_POSITION_CHECK_SEC", "5") or 5)
         self.entry_fresh_ltp_max_age_sec = float(os.getenv("ENTRY_FRESH_LTP_MAX_AGE_SEC", "20") or 20)
+        self.pair_stale_resubscribe_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_SEC", "45") or 45)
+        self.pair_stale_resubscribe_cooldown_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_COOLDOWN_SEC", "45") or 45)
         self.verbose_tick_logs = str(os.getenv("TRIWAVE_VERBOSE_TICK_LOGS", "0")).strip().lower() in {"1", "true", "yes", "on"}
         self._last_stale_position_check_ts = 0.0
         self.portfolio_snapshot_interval_sec = float(os.getenv("TRIWAVE_PORTFOLIO_SNAPSHOT_SEC", "5") or 5)
@@ -653,15 +658,18 @@ class TradingRuntimeCoordinator:
         age = now - ltp_ts if ltp_ts else None
         if ltp_ts and age is not None and age <= self.entry_fresh_ltp_max_age_sec and ltp_value > 0:
             return True
-        logger.warning(
-            "TRI_WAVE_ENTRY_STALE_LTP_BLOCK | index=%s | side=%s | secid=%s | ltp_age=%s | ltp=%.2f | max_age=%.2f",
-            index,
-            side,
-            secid,
-            f"{age:.2f}" if age is not None else "missing",
-            ltp_value,
-            self.entry_fresh_ltp_max_age_sec,
-        )
+        log_key = f"{index}:{side}:{secid}"
+        if now - self._last_entry_stale_log_ts[log_key] >= 10:
+            self._last_entry_stale_log_ts[log_key] = now
+            logger.warning(
+                "TRI_WAVE_ENTRY_STALE_LTP_BLOCK | index=%s | side=%s | secid=%s | ltp_age=%s | ltp=%.2f | max_age=%.2f",
+                index,
+                side,
+                secid,
+                f"{age:.2f}" if age is not None else "missing",
+                ltp_value,
+                self.entry_fresh_ltp_max_age_sec,
+            )
         return False
 
     def _execute_tri_wave_signal(self, pair: PairRuntimeState, signal, raw: dict) -> bool:
@@ -917,10 +925,12 @@ class TradingRuntimeCoordinator:
             if last_net <= 0 and ("PROFIT" in reason_u or "GIVEBACK" in reason_u or "EXHAUSTION" in reason_u):
                 required = max(required, 120)
             if elapsed < required:
-                logger.info(
-                    "TRI_WAVE_V2_ENTRY_COOLDOWN_BLOCK | index=%s | elapsed=%.2f | required=%.2f | last_exit_reason=%s | last_net_pnl=%.2f",
-                    index, elapsed, required, last_reason, last_net
-                )
+                if now_ts - self._last_entry_cooldown_log_ts[index] >= 10:
+                    self._last_entry_cooldown_log_ts[index] = now_ts
+                    logger.info(
+                        "TRI_WAVE_V2_ENTRY_COOLDOWN_BLOCK | index=%s | elapsed=%.2f | required=%.2f | last_exit_reason=%s | last_net_pnl=%.2f",
+                        index, elapsed, required, last_reason, last_net
+                    )
                 return True
         return False
 
@@ -1043,16 +1053,48 @@ class TradingRuntimeCoordinator:
             pe_ltp_age = now - ltp_ts if ltp_ts else None
 
         if (
-            (ce_age is not None and ce_age > 60)
-            or (pe_age is not None and pe_age > 60)
-            or (ce_ltp_age is not None and ce_ltp_age > 60)
-            or (pe_ltp_age is not None and pe_ltp_age > 60)
+            (ce_age is not None and ce_age > self.pair_stale_resubscribe_sec)
+            or (pe_age is not None and pe_age > self.pair_stale_resubscribe_sec)
+            or (ce_ltp_age is not None and ce_ltp_age > self.pair_stale_resubscribe_sec)
+            or (pe_ltp_age is not None and pe_ltp_age > self.pair_stale_resubscribe_sec)
         ):
             self._last_pair_stale_log_ts[index] = now
             logger.warning(
                 "TRI_WAVE_PAIR_STALE | index=%s | ce_age=%s | pe_age=%s | ce_ltp_age=%s | pe_ltp_age=%s | ce_id=%s | pe_id=%s",
                 index, ce_age, pe_age, ce_ltp_age, pe_ltp_age, pair.ce_id, pair.pe_id
             )
+            self._recover_stale_option_pair(index, pair, now)
+
+    def _recover_stale_option_pair(self, index: str, pair: PairRuntimeState, now: Optional[float] = None) -> None:
+        if self.pair_stale_resubscribe_sec <= 0:
+            return
+        now = time.time() if now is None else now
+        if now - self._last_pair_resubscribe_ts[index] < self.pair_stale_resubscribe_cooldown_sec:
+            return
+
+        subscriptions = []
+        if pair.ce_id:
+            subscriptions.append((int(pair.ce_id), f"{index}_CE"))
+        if pair.pe_id:
+            subscriptions.append((int(pair.pe_id), f"{index}_PE"))
+        if not subscriptions:
+            return
+
+        self._last_pair_resubscribe_ts[index] = now
+        logger.warning(
+            "TRI_WAVE_PAIR_STALE_RECOVERY | index=%s | action=resubscribe_and_reconnect_option_shard | subscriptions=%s",
+            index,
+            subscriptions,
+        )
+        try:
+            if self.option_quote_stream is not None:
+                self.option_quote_stream.subscribe(subscriptions)
+                if hasattr(self.option_quote_stream, "reconnect_for_subscriptions"):
+                    self.option_quote_stream.reconnect_for_subscriptions(subscriptions, reason=f"pair_stale:{index}")
+            if self.option_depth_stream is not None:
+                self.option_depth_stream.subscribe(subscriptions)
+        except Exception:
+            logger.exception("TRI_WAVE_PAIR_STALE_RECOVERY_FAILED | index=%s", index)
 
     def _exit_stale_positions_if_needed(self) -> None:
         if self.stale_position_exit_sec <= 0:
