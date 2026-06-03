@@ -108,7 +108,7 @@ class FastDhanLiveMarketFeedWS(DhanLiveMarketFeedWS):
                 ask_qty = [int(item.get("ask_quantity", 0)) for item in depth]
 
                 now = time.time()
-                if now - self._last_feature_log_ts.get(secid, 0) >= 3:
+                if self._feature_log_interval_sec > 0 and now - self._last_feature_log_ts.get(secid, 0) >= self._feature_log_interval_sec:
                     self._last_feature_log_ts[secid] = now
                     logger.info(
                         "FULL_DATA_FEATURES | secid=%s | tag=%s | ltp=%.2f | spread_pct=%.4f | depth_imbalance_5=%.2f | top_depth_imbalance=%.2f | market_queue_imbalance=%.2f | volume_change=%s | oi_change=%s | recovery_score=%.2f | exhaustion_score=%.2f | clean_trade_score=%.2f",

@@ -73,6 +73,7 @@ class DhanLiveMarketFeedWS:
         self._last_message_backlog_log_ts = 0.0
         self._previous_features: Dict[int, dict] = {}
         self._last_feature_log_ts: Dict[int, float] = {}
+        self._feature_log_interval_sec = float(os.getenv("FULLQUOTE_FEATURE_LOG_SEC", "0") or 0)
         self._last_message_ts = 0.0
         self._max_pending_messages = int(os.getenv("FULLQUOTE_MAX_PENDING_MESSAGES", "500") or 500)
         self._stale_reconnect_sec = float(os.getenv("FULLQUOTE_STALE_RECONNECT_SEC", "45") or 45)
@@ -299,7 +300,7 @@ class DhanLiveMarketFeedWS:
                 ask_qty = [int(item.get("ask_quantity", 0)) for item in depth]
 
                 now = time.time()
-                if now - self._last_feature_log_ts.get(secid, 0) >= 3:
+                if self._feature_log_interval_sec > 0 and now - self._last_feature_log_ts.get(secid, 0) >= self._feature_log_interval_sec:
                     self._last_feature_log_ts[secid] = now
                     logger.info(
                         "FULL_DATA_FEATURES | secid=%s | tag=%s | ltp=%.2f | spread_pct=%.4f | depth_imbalance_5=%.2f | top_depth_imbalance=%.2f | market_queue_imbalance=%.2f | volume_change=%s | oi_change=%s | recovery_score=%.2f | exhaustion_score=%.2f | clean_trade_score=%.2f",
