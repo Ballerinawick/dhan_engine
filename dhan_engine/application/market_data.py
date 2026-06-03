@@ -188,6 +188,21 @@ class FutureQuoteStream:
         self._ensure_single_client()
         self._client.subscribe_full(instruments)
 
+    def reconnect_for_subscriptions(self, subscriptions: Iterable[Tuple[int, str]], reason: str = "runtime_stale") -> None:
+        subscription_list = list(subscriptions)
+        if not subscription_list:
+            return
+        is_option_stream = any(not str(tag).upper().endswith("_FUT") for _, tag in subscription_list)
+        if is_option_stream and self._option_shard_count > 1:
+            self._ensure_shards()
+            shard_indexes = {self._shard_for_tag(str(tag)) for _, tag in subscription_list}
+            for shard_idx in shard_indexes:
+                self._clients[shard_idx].reconnect(reason)
+            return
+
+        self._ensure_single_client()
+        self._client.reconnect(reason)
+
     def _make_client(self) -> DhanLiveMarketFeedWS:
         client = DhanLiveMarketFeedWS(
             token=self._token,

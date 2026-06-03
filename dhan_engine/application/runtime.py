@@ -130,10 +130,17 @@ class TradingRuntimeCoordinator:
         self.option_ltp_last_ts_by_secid = {}
         self.option_ltp_last_value_by_secid = {}
         self._last_pair_stale_log_ts = defaultdict(float)
+        self._last_pair_resubscribe_ts = defaultdict(float)
+        self._last_entry_stale_log_ts = defaultdict(float)
+        self._last_entry_cooldown_log_ts = defaultdict(float)
         self._last_option_chain_health_log_ts = defaultdict(float)
+        self._last_no_entry_watch_ts = 0.0
         self.stale_position_exit_sec = float(os.getenv("STALE_POSITION_EXIT_SEC", "90") or 90)
         self.stale_position_check_sec = float(os.getenv("STALE_POSITION_CHECK_SEC", "5") or 5)
         self.entry_fresh_ltp_max_age_sec = float(os.getenv("ENTRY_FRESH_LTP_MAX_AGE_SEC", "20") or 20)
+        self.pair_stale_resubscribe_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_SEC", "45") or 45)
+        self.pair_stale_resubscribe_cooldown_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_COOLDOWN_SEC", "45") or 45)
+        self.no_entry_watch_sec = float(os.getenv("TRIWAVE_NO_ENTRY_WATCH_SEC", "60") or 60)
         self.verbose_tick_logs = str(os.getenv("TRIWAVE_VERBOSE_TICK_LOGS", "0")).strip().lower() in {"1", "true", "yes", "on"}
         self._last_stale_position_check_ts = 0.0
         self.portfolio_snapshot_interval_sec = float(os.getenv("TRIWAVE_PORTFOLIO_SNAPSHOT_SEC", "5") or 5)
@@ -653,15 +660,18 @@ class TradingRuntimeCoordinator:
         age = now - ltp_ts if ltp_ts else None
         if ltp_ts and age is not None and age <= self.entry_fresh_ltp_max_age_sec and ltp_value > 0:
             return True
-        logger.warning(
-            "TRI_WAVE_ENTRY_STALE_LTP_BLOCK | index=%s | side=%s | secid=%s | ltp_age=%s | ltp=%.2f | max_age=%.2f",
-            index,
-            side,
-            secid,
-            f"{age:.2f}" if age is not None else "missing",
-            ltp_value,
-            self.entry_fresh_ltp_max_age_sec,
-        )
+        log_key = f"{index}:{side}:{secid}"
+        if now - self._last_entry_stale_log_ts[log_key] >= 10:
+            self._last_entry_stale_log_ts[log_key] = now
+            logger.warning(
+                "TRI_WAVE_ENTRY_STALE_LTP_BLOCK | index=%s | side=%s | secid=%s | ltp_age=%s | ltp=%.2f | max_age=%.2f",
+                index,
+                side,
+                secid,
+                f"{age:.2f}" if age is not None else "missing",
+                ltp_value,
+                self.entry_fresh_ltp_max_age_sec,
+            )
         return False
 
     def _execute_tri_wave_signal(self, pair: PairRuntimeState, signal, raw: dict) -> bool:
@@ -917,12 +927,138 @@ class TradingRuntimeCoordinator:
             if last_net <= 0 and ("PROFIT" in reason_u or "GIVEBACK" in reason_u or "EXHAUSTION" in reason_u):
                 required = max(required, 120)
             if elapsed < required:
-                logger.info(
-                    "TRI_WAVE_V2_ENTRY_COOLDOWN_BLOCK | index=%s | elapsed=%.2f | required=%.2f | last_exit_reason=%s | last_net_pnl=%.2f",
-                    index, elapsed, required, last_reason, last_net
-                )
+                if now_ts - self._last_entry_cooldown_log_ts[index] >= 10:
+                    self._last_entry_cooldown_log_ts[index] = now_ts
+                    logger.info(
+                        "TRI_WAVE_V2_ENTRY_COOLDOWN_BLOCK | index=%s | elapsed=%.2f | required=%.2f | last_exit_reason=%s | last_net_pnl=%.2f",
+                        index, elapsed, required, last_reason, last_net
+                    )
                 return True
         return False
+
+    def _tri_wave_cooldown_status(self, index: str, now_ts: Optional[float] = None) -> dict:
+        now_ts = time.time() if now_ts is None else now_ts
+        last_exit_ts = self.tri_wave_v2_last_exit_ts.get(index)
+        if not last_exit_ts:
+            return {"active": False, "remaining": 0.0, "required": 0.0, "last_reason": "NONE", "last_net": 0.0}
+
+        elapsed = now_ts - float(last_exit_ts)
+        last_reason = str(self.tri_wave_v2_last_exit_reason.get(index, "UNKNOWN"))
+        last_net = float(self.tri_wave_v2_last_exit_net_pnl.get(index, 0.0))
+        required = self.TRI_WAVE_REENTRY_COOLDOWN_SEC
+        if last_net > 0:
+            required = self.TRI_WAVE_PROFIT_REENTRY_COOLDOWN_SEC
+        elif last_net <= 0:
+            required = self.TRI_WAVE_LOSS_REENTRY_COOLDOWN_SEC
+        reason_u = last_reason.upper()
+        if last_net <= 0 and ("PROFIT" in reason_u or "GIVEBACK" in reason_u or "EXHAUSTION" in reason_u):
+            required = max(required, 120)
+
+        remaining = max(0.0, required - elapsed)
+        return {
+            "active": remaining > 0.0,
+            "remaining": remaining,
+            "required": float(required),
+            "last_reason": last_reason,
+            "last_net": last_net,
+        }
+
+    def _tri_wave_daily_guard_status(self, index: str, current_pnl: float, opened_today: int) -> str:
+        if self.tri_wave_trading_halted_for_day.get(index):
+            return "PROFIT_DECAY_LOCK"
+        if current_pnl >= self.TRI_WAVE_DAILY_PROFIT_LOCK:
+            return "DAILY_PROFIT_LOCK"
+        if current_pnl <= self.TRI_WAVE_DAILY_MAX_LOSS:
+            return "DAILY_MAX_LOSS"
+        if opened_today >= self.TRI_WAVE_MAX_TRADES_PER_DAY:
+            return "MAX_TRADES_PER_DAY"
+
+        fees_paid = float(getattr(self.paper_trader, "fees_paid_today", 0.0) or getattr(self.paper_trader, "fees_paid", 0.0) or 0.0)
+        if (fees_paid >= 900 and current_pnl <= 0) or (opened_today >= 15 and current_pnl <= 0):
+            return "FEE_GUARD"
+        return "OK"
+
+    def _option_ltp_age(self, secid: Optional[int], now_ts: Optional[float] = None) -> Optional[float]:
+        if not secid:
+            return None
+        now_ts = time.time() if now_ts is None else now_ts
+        ts = float(self.option_ltp_last_ts_by_secid.get(int(secid), 0.0) or 0.0)
+        return now_ts - ts if ts else None
+
+    def _fmt_age(self, value: Optional[float]) -> str:
+        return "missing" if value is None else f"{value:.1f}s"
+
+    def _log_no_entry_watch_if_needed(self, now_ts: Optional[float] = None) -> None:
+        if self.no_entry_watch_sec <= 0:
+            return
+        now_ts = time.time() if now_ts is None else now_ts
+        if now_ts - self._last_no_entry_watch_ts < self.no_entry_watch_sec:
+            return
+
+        positions = getattr(self.paper_trader, "positions", {}) or {}
+        if positions:
+            return
+
+        self._last_no_entry_watch_ts = now_ts
+        try:
+            self.paper_trader._maybe_reset_daily_counts(now_ts)
+        except Exception:
+            logger.exception("TRI_WAVE_NO_ENTRY_WATCH_DAILY_RESET_ERROR")
+
+        current_pnl = float(getattr(self.paper_trader, "realized_pnl", 0.0) or 0.0)
+        opened_today = int(getattr(self.paper_trader, "opened_today", 0) or 0)
+        closed_today = int(getattr(self.paper_trader, "closed_today", 0) or 0)
+        profile_states = []
+
+        for index, pair in self.pairs.items():
+            ce_age = self._option_ltp_age(pair.ce_id, now_ts)
+            pe_age = self._option_ltp_age(pair.pe_id, now_ts)
+            cooldown = self._tri_wave_cooldown_status(index, now_ts)
+            guard = self._tri_wave_daily_guard_status(index, current_pnl, opened_today)
+            missing = []
+            if not pair.underlying_ltp:
+                missing.append("underlying")
+            if not pair.ce_id:
+                missing.append("ce_id")
+            if not pair.pe_id:
+                missing.append("pe_id")
+            if not pair.ce_depth:
+                missing.append("ce_depth")
+            if not pair.pe_depth:
+                missing.append("pe_depth")
+
+            stale_sides = []
+            if pair.ce_id and (ce_age is None or ce_age > self.entry_fresh_ltp_max_age_sec):
+                stale_sides.append("CE")
+            if pair.pe_id and (pe_age is None or pe_age > self.entry_fresh_ltp_max_age_sec):
+                stale_sides.append("PE")
+
+            if guard != "OK":
+                state = f"guard={guard}"
+            elif cooldown["active"]:
+                state = f"cooldown={cooldown['remaining']:.1f}s"
+            elif missing:
+                state = "missing=" + ",".join(missing)
+            elif stale_sides:
+                state = "stale_ltp=" + ",".join(stale_sides)
+            else:
+                state = "waiting_for_signal"
+
+            profile_states.append(
+                (
+                    f"{index}:state={state},ready={pair.is_ready()},ce={pair.ce_id},pe={pair.pe_id},"
+                    f"ce_ltp_age={self._fmt_age(ce_age)},pe_ltp_age={self._fmt_age(pe_age)},"
+                    f"last_exit={cooldown['last_reason']},last_net={cooldown['last_net']:.2f}"
+                )
+            )
+
+        logger.info(
+            "TRI_WAVE_NO_ENTRY_WATCH | open_positions=0 | realized_pnl=%.2f | opened_today=%s | closed_today=%s | profiles=%s",
+            current_pnl,
+            opened_today,
+            closed_today,
+            " ; ".join(profile_states),
+        )
 
     def _process_option_update(self, index: str, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
         if not self.market_open():
@@ -1043,16 +1179,48 @@ class TradingRuntimeCoordinator:
             pe_ltp_age = now - ltp_ts if ltp_ts else None
 
         if (
-            (ce_age is not None and ce_age > 60)
-            or (pe_age is not None and pe_age > 60)
-            or (ce_ltp_age is not None and ce_ltp_age > 60)
-            or (pe_ltp_age is not None and pe_ltp_age > 60)
+            (ce_age is not None and ce_age > self.pair_stale_resubscribe_sec)
+            or (pe_age is not None and pe_age > self.pair_stale_resubscribe_sec)
+            or (ce_ltp_age is not None and ce_ltp_age > self.pair_stale_resubscribe_sec)
+            or (pe_ltp_age is not None and pe_ltp_age > self.pair_stale_resubscribe_sec)
         ):
             self._last_pair_stale_log_ts[index] = now
             logger.warning(
                 "TRI_WAVE_PAIR_STALE | index=%s | ce_age=%s | pe_age=%s | ce_ltp_age=%s | pe_ltp_age=%s | ce_id=%s | pe_id=%s",
                 index, ce_age, pe_age, ce_ltp_age, pe_ltp_age, pair.ce_id, pair.pe_id
             )
+            self._recover_stale_option_pair(index, pair, now)
+
+    def _recover_stale_option_pair(self, index: str, pair: PairRuntimeState, now: Optional[float] = None) -> None:
+        if self.pair_stale_resubscribe_sec <= 0:
+            return
+        now = time.time() if now is None else now
+        if now - self._last_pair_resubscribe_ts[index] < self.pair_stale_resubscribe_cooldown_sec:
+            return
+
+        subscriptions = []
+        if pair.ce_id:
+            subscriptions.append((int(pair.ce_id), f"{index}_CE"))
+        if pair.pe_id:
+            subscriptions.append((int(pair.pe_id), f"{index}_PE"))
+        if not subscriptions:
+            return
+
+        self._last_pair_resubscribe_ts[index] = now
+        logger.warning(
+            "TRI_WAVE_PAIR_STALE_RECOVERY | index=%s | action=resubscribe_and_reconnect_option_shard | subscriptions=%s",
+            index,
+            subscriptions,
+        )
+        try:
+            if self.option_quote_stream is not None:
+                self.option_quote_stream.subscribe(subscriptions)
+                if hasattr(self.option_quote_stream, "reconnect_for_subscriptions"):
+                    self.option_quote_stream.reconnect_for_subscriptions(subscriptions, reason=f"pair_stale:{index}")
+            if self.option_depth_stream is not None:
+                self.option_depth_stream.subscribe(subscriptions)
+        except Exception:
+            logger.exception("TRI_WAVE_PAIR_STALE_RECOVERY_FAILED | index=%s", index)
 
     def _exit_stale_positions_if_needed(self) -> None:
         if self.stale_position_exit_sec <= 0:
@@ -1685,6 +1853,7 @@ class TradingRuntimeCoordinator:
                     if pair.ce_id or pair.pe_id:
                         self._log_pair_stale_if_needed(index, pair)
                         self._log_option_chain_health_if_needed(index, pair)
+                self._log_no_entry_watch_if_needed(now)
 
             time.sleep(1.0)
 
