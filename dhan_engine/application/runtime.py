@@ -145,6 +145,7 @@ class TradingRuntimeCoordinator:
         self._last_stale_position_check_ts = 0.0
         self.portfolio_snapshot_interval_sec = float(os.getenv("TRIWAVE_PORTFOLIO_SNAPSHOT_SEC", "5") or 5)
         self._last_portfolio_snapshot_ts = 0.0
+        self.pair_stale_reconnect_enabled = str(os.getenv("PAIR_STALE_RECONNECT_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
         self.premium_flow = {
             "CE": {"ltp": 0.0, "prev": 0.0, "velocity": 0.0},
@@ -1207,15 +1208,17 @@ class TradingRuntimeCoordinator:
             return
 
         self._last_pair_resubscribe_ts[index] = now
+        action = "resubscribe_and_reconnect_option_shard" if self.pair_stale_reconnect_enabled else "resubscribe_only"
         logger.warning(
-            "TRI_WAVE_PAIR_STALE_RECOVERY | index=%s | action=resubscribe_and_reconnect_option_shard | subscriptions=%s",
+            "TRI_WAVE_PAIR_STALE_RECOVERY | index=%s | action=%s | subscriptions=%s",
             index,
+            action,
             subscriptions,
         )
         try:
             if self.option_quote_stream is not None:
                 self.option_quote_stream.subscribe(subscriptions)
-                if hasattr(self.option_quote_stream, "reconnect_for_subscriptions"):
+                if self.pair_stale_reconnect_enabled and hasattr(self.option_quote_stream, "reconnect_for_subscriptions"):
                     self.option_quote_stream.reconnect_for_subscriptions(subscriptions, reason=f"pair_stale:{index}")
             if self.option_depth_stream is not None:
                 self.option_depth_stream.subscribe(subscriptions)
