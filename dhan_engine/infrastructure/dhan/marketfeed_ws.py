@@ -67,6 +67,8 @@ class DhanLiveMarketFeedWS:
         self._last_full_data_ts_by_secid: Dict[int, float] = {}
         self._last_connected_ts = 0.0
         self._reconnect_attempt = 0
+        self._last_manual_reconnect_ts = 0.0
+        self._blocked_until_ts = 0.0
         self._lock = threading.Lock()
         self._callback_condition = threading.Condition()
         self._pending_callbacks: Dict[int, tuple] = {}
@@ -82,6 +84,8 @@ class DhanLiveMarketFeedWS:
         self._stale_reconnect_sec = float(os.getenv("FULLQUOTE_STALE_RECONNECT_SEC", "45") or 45)
         self._subscription_stale_reconnect_sec = float(os.getenv("FULLQUOTE_SUBSCRIPTION_STALE_RECONNECT_SEC", "75") or 75)
         self._subscription_stale_min_count = int(os.getenv("FULLQUOTE_SUBSCRIPTION_STALE_MIN_COUNT", "2") or 2)
+        self._manual_reconnect_min_sec = float(os.getenv("FULLQUOTE_MANUAL_RECONNECT_MIN_SEC", "120") or 120)
+        self._rate_limit_backoff_sec = float(os.getenv("FULLQUOTE_429_BACKOFF_SEC", "600") or 600)
         self._last_subscription_stale_log_ts = 0.0
         self._ping_interval = float(os.getenv("FULLQUOTE_WS_PING_INTERVAL", "15") or 15)
         self._ping_timeout = float(os.getenv("FULLQUOTE_WS_PING_TIMEOUT", "8") or 8)
@@ -132,6 +136,16 @@ class DhanLiveMarketFeedWS:
             self._send_subscribe()
 
     def reconnect(self, reason: str = "manual") -> None:
+        now = time.time()
+        if now < self._blocked_until_ts:
+            remaining = self._blocked_until_ts - now
+            print(f"FULLQUOTE_FORCE_RECONNECT_SKIPPED | reason={reason} | blocked_for={remaining:.0f}s")
+            return
+        if now - self._last_manual_reconnect_ts < self._manual_reconnect_min_sec:
+            remaining = self._manual_reconnect_min_sec - (now - self._last_manual_reconnect_ts)
+            print(f"FULLQUOTE_FORCE_RECONNECT_SKIPPED | reason={reason} | cooldown={remaining:.0f}s")
+            return
+        self._last_manual_reconnect_ts = now
         print(f"FULLQUOTE_FORCE_RECONNECT | reason={reason}")
         self._connected.clear()
         try:
@@ -168,6 +182,13 @@ class DhanLiveMarketFeedWS:
 
     def _run_loop(self) -> None:
         while not self._stop.is_set():
+            blocked_for = self._blocked_until_ts - time.time()
+            if blocked_for > 0:
+                wait = min(blocked_for, 30.0)
+                print(f"FULLQUOTE_429_BACKOFF_WAIT | sec={wait:.0f}")
+                time.sleep(wait)
+                continue
+
             self._connected.clear()
 
             url = (
@@ -201,7 +222,10 @@ class DhanLiveMarketFeedWS:
                 break
 
             self._reconnect_attempt += 1
+            blocked_for = self._blocked_until_ts - time.time()
             wait = min(30, 2 ** min(self._reconnect_attempt, 4))
+            if blocked_for > 0:
+                wait = min(max(wait, blocked_for), 30)
             print(f"FULLQUOTE_WS_RECONNECT_WAIT | sec={wait}")
             time.sleep(wait)
 
@@ -248,6 +272,7 @@ class DhanLiveMarketFeedWS:
 
     def _on_error(self, ws, error) -> None:
         print(f"FULLQUOTE_WS_ERROR | error={error}")
+        self._mark_rate_limited_if_needed(error)
         self._connected.clear()
         try:
             ws.close()
@@ -256,8 +281,23 @@ class DhanLiveMarketFeedWS:
 
     def _on_close(self, ws, code, message) -> None:
         self._connected.clear()
+        self._mark_rate_limited_if_needed(message)
         last_age = time.time() - self._last_message_ts if self._last_message_ts else -1.0
         print(f"WS_FULLQUOTE_CLOSED | code={code} | message={message} | last_message_age={last_age:.2f}")
+
+    def _mark_rate_limited_if_needed(self, error) -> None:
+        text = str(error or "")
+        if "429" not in text and "Too many requests" not in text and "client id is blocked" not in text:
+            return
+        blocked_until = time.time() + self._rate_limit_backoff_sec
+        if blocked_until <= self._blocked_until_ts:
+            return
+        self._blocked_until_ts = blocked_until
+        self._connected.clear()
+        print(
+            "FULLQUOTE_429_BACKOFF_ACTIVE | "
+            f"backoff_sec={self._rate_limit_backoff_sec:.0f} | error={text[:180]}"
+        )
 
     def process_data(self, data: bytes):
         if self._feed_parser is None:
