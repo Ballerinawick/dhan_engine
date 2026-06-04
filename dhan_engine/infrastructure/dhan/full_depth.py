@@ -16,7 +16,9 @@ class FullDepth:
         self.client_id = str(client_id)
         self.access_token = str(access_token)
 
-        self._subscribed: List[Tuple[int, str]] = []
+        self._subscribed: List[Tuple[str, str]] = []
+        self._sub_keys = set()
+        self._subscription_lock = threading.Lock()
         self._send_lock = threading.Lock()
 
         self._ws: Optional[websocket.WebSocketApp] = None
@@ -80,26 +82,47 @@ class FullDepth:
         return connected
 
     async def subscribe_async(self, instruments):
-        self._subscribed = list(instruments or [])
+        new_items = self._merge_subscriptions(instruments)
         if not self._subscribed:
             return
+        if not new_items:
+            return
 
-        await self.connect()
+        was_connected = self._connected_evt.is_set()
+        connected = await self.connect()
+        if not connected:
+            print("WARNING DEPTH subscription send skipped because socket is not connected yet")
+            return
+        if not was_connected:
+            return
 
-        sent = await asyncio.to_thread(self._send_subscription_now, self._subscribed)
+        sent = await asyncio.to_thread(self._send_subscription_now, new_items)
         if not sent:
             print("WARNING DEPTH subscription send skipped because socket is not connected yet")
 
     def subscribe(self, instruments):
-        self._subscribed = list(instruments or [])
-        if not self._subscribed:
+        incoming = list(instruments or [])
+        if not incoming:
             return
 
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self.subscribe_async(self._subscribed))
+            loop.create_task(self.subscribe_async(incoming))
         except RuntimeError:
             print("WARNING subscribe() called without asyncio loop")
+
+    def _merge_subscriptions(self, instruments) -> List[Tuple[str, str]]:
+        new_items: List[Tuple[str, str]] = []
+        with self._subscription_lock:
+            for seg, secid in instruments or []:
+                normalized = self._normalize_exchange_segment(seg)
+                key = (normalized, str(secid))
+                if key in self._sub_keys:
+                    continue
+                self._sub_keys.add(key)
+                self._subscribed.append(key)
+                new_items.append(key)
+        return new_items
 
     async def disconnect(self):
         self._stop_evt.set()
