@@ -121,19 +121,25 @@ class DhanLiveMarketFeedWS:
             pass
 
     def subscribe_full(self, instruments: List[Dict[str, str]]) -> None:
-        now = time.time()
+        new_subscriptions: List[Dict[str, str]] = []
         with self._lock:
             for item in instruments:
                 key = (str(item["ExchangeSegment"]), str(item["SecurityId"]))
                 if key not in self._sub_keys:
-                    self._subs.append(dict(item))
+                    subscription = dict(item)
+                    self._subs.append(subscription)
                     self._sub_keys.add(key)
+                    new_subscriptions.append(subscription)
                 secid = int(item["SecurityId"])
                 self._tags[secid] = item.get("tag", item["SecurityId"])
-                self._last_subscribe_ts_by_secid[secid] = now
+
+        if not new_subscriptions:
+            if self.debug:
+                print("WS_FULLQUOTE_SUBSCRIBE_SKIPPED_DUPLICATE")
+            return
 
         if self._connected.is_set():
-            self._send_subscribe()
+            self._send_subscribe(new_subscriptions)
 
     def reconnect(self, reason: str = "manual") -> None:
         now = time.time()
@@ -229,12 +235,12 @@ class DhanLiveMarketFeedWS:
             print(f"FULLQUOTE_WS_RECONNECT_WAIT | sec={wait}")
             time.sleep(wait)
 
-    def _send_subscribe(self) -> None:
+    def _send_subscribe(self, subscriptions: Optional[List[Dict[str, str]]] = None) -> None:
         if not self._ws:
             return
 
         with self._lock:
-            subscriptions = list(self._subs)
+            subscriptions = list(subscriptions if subscriptions is not None else self._subs)
             now = time.time()
             for item in subscriptions:
                 self._last_subscribe_ts_by_secid[int(item["SecurityId"])] = now
