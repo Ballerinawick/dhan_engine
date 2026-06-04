@@ -134,11 +134,20 @@ class TradingRuntimeCoordinator:
         self._last_pair_resubscribe_ts = defaultdict(float)
         self._last_entry_stale_log_ts = defaultdict(float)
         self._last_entry_cooldown_log_ts = defaultdict(float)
+        self._last_entry_quality_log_ts = defaultdict(float)
         self._last_option_chain_health_log_ts = defaultdict(float)
         self._last_no_entry_watch_ts = 0.0
         self.stale_position_exit_sec = float(os.getenv("STALE_POSITION_EXIT_SEC", "90") or 90)
         self.stale_position_check_sec = float(os.getenv("STALE_POSITION_CHECK_SEC", "5") or 5)
         self.entry_fresh_ltp_max_age_sec = float(os.getenv("ENTRY_FRESH_LTP_MAX_AGE_SEC", "20") or 20)
+        self.entry_pair_fresh_ltp_max_age_sec = float(os.getenv("ENTRY_PAIR_FRESH_LTP_MAX_AGE_SEC", str(self.entry_fresh_ltp_max_age_sec)) or self.entry_fresh_ltp_max_age_sec)
+        self.entry_min_dynamic_edge = float(os.getenv("TRIWAVE_ENTRY_MIN_DYNAMIC_EDGE", "0.15") or 0.15)
+        self.entry_min_support_score = float(os.getenv("TRIWAVE_ENTRY_MIN_SUPPORT_SCORE", "0.55") or 0.55)
+        self.entry_max_risk_score = float(os.getenv("TRIWAVE_ENTRY_MAX_RISK_SCORE", "0.45") or 0.45)
+        self.entry_min_expected_net_rupees = float(os.getenv("TRIWAVE_ENTRY_MIN_EXPECTED_NET_RUPEES", "120") or 120)
+        self.entry_min_expected_move_pct = float(os.getenv("TRIWAVE_ENTRY_MIN_EXPECTED_MOVE_PCT", "0.75") or 0.75)
+        self.stale_exit_quarantine_sec = float(os.getenv("TRIWAVE_STALE_EXIT_QUARANTINE_SEC", "600") or 600)
+        self.pair_stale_entry_quarantine_sec = float(os.getenv("TRIWAVE_PAIR_STALE_ENTRY_QUARANTINE_SEC", "120") or 120)
         self.pair_stale_resubscribe_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_SEC", "45") or 45)
         self.pair_stale_resubscribe_cooldown_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_COOLDOWN_SEC", "45") or 45)
         self.no_entry_watch_sec = float(os.getenv("TRIWAVE_NO_ENTRY_WATCH_SEC", "60") or 60)
@@ -173,6 +182,8 @@ class TradingRuntimeCoordinator:
         self.tri_wave_v2_last_exit_net_pnl: Dict[str, float] = {}
         self.tri_wave_peak_realized_pnl: Dict[str, float] = defaultdict(float)
         self.tri_wave_trading_halted_for_day: Dict[str, bool] = defaultdict(bool)
+        self.tri_wave_data_quarantine_until: Dict[str, float] = defaultdict(float)
+        self.tri_wave_data_quarantine_reason: Dict[str, str] = defaultdict(str)
 
         self.metrics = {
             "exit_reason_counts": defaultdict(int),
@@ -692,6 +703,153 @@ class TradingRuntimeCoordinator:
             )
         return False
 
+    def _lot_size_for_index(self, index: str) -> int:
+        lot_sizes = getattr(self.paper_trader, "LOT_SIZES", {}) or {}
+        return int(lot_sizes.get(index, lot_sizes.get(str(index).upper(), 1)) or 1)
+
+    def _round_trip_fee(self) -> float:
+        return float(getattr(self.paper_trader, "ROUND_TRIP_FEE", 60.0) or 60.0)
+
+    def _side_state_stats(self, index: str, side: str) -> dict:
+        try:
+            stream = self.tri_wave_v2_brain.streams.get(index, {}).get(side)
+            return dict(getattr(stream, "stats", {}) or {})
+        except Exception:
+            return {}
+
+    def _entry_expected_edge(self, index: str, side: str, ltp: float) -> dict:
+        stats = self._side_state_stats(index, side)
+        lot_size = self._lot_size_for_index(index)
+        fee = self._round_trip_fee()
+        recent_high = float(stats.get("recent_high", ltp) or ltp)
+        last_5_delta = max(0.0, float(stats.get("last_5_delta", 0.0) or 0.0))
+        breakout_budget = last_5_delta * 2.0
+        retest_budget = max(0.0, recent_high - float(ltp))
+        min_pct_budget = float(ltp) * (self.entry_min_expected_move_pct / 100.0)
+        expected_points = max(breakout_budget, retest_budget, min_pct_budget)
+        expected_gross = expected_points * lot_size
+        expected_net = expected_gross - fee
+        return {
+            "lot_size": lot_size,
+            "fee": fee,
+            "expected_points": expected_points,
+            "expected_gross": expected_gross,
+            "expected_net": expected_net,
+            "last_5_delta": last_5_delta,
+            "recent_high": recent_high,
+        }
+
+    def _set_tri_wave_data_quarantine(self, index: str, reason: str, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        until = time.time() + float(seconds)
+        self.tri_wave_data_quarantine_until[index] = max(float(self.tri_wave_data_quarantine_until.get(index, 0.0) or 0.0), until)
+        self.tri_wave_data_quarantine_reason[index] = str(reason)
+
+    def _tri_wave_entry_quality_gate(self, pair: PairRuntimeState, side: str, secid: Optional[int], ltp: float, signal) -> bool:
+        index = pair.index
+        now = time.time()
+        quarantine_until = float(self.tri_wave_data_quarantine_until.get(index, 0.0) or 0.0)
+        if quarantine_until > now:
+            self._log_tri_wave_entry_quality_block(
+                index,
+                side,
+                "DATA_QUARANTINE",
+                secid=secid,
+                ltp=ltp,
+                remaining=quarantine_until - now,
+                quarantine_reason=self.tri_wave_data_quarantine_reason.get(index, "UNKNOWN"),
+            )
+            return False
+
+        if not self._is_option_ltp_fresh(index, side, secid):
+            return False
+
+        ce_age = self._option_ltp_age(pair.ce_id, now)
+        pe_age = self._option_ltp_age(pair.pe_id, now)
+        pair_stale = (
+            ce_age is None
+            or pe_age is None
+            or ce_age > self.entry_pair_fresh_ltp_max_age_sec
+            or pe_age > self.entry_pair_fresh_ltp_max_age_sec
+        )
+        if pair_stale:
+            self._log_tri_wave_entry_quality_block(
+                index,
+                side,
+                "PAIR_LTP_NOT_FRESH",
+                secid=secid,
+                ltp=ltp,
+                ce_age=self._fmt_age(ce_age),
+                pe_age=self._fmt_age(pe_age),
+                max_age=self.entry_pair_fresh_ltp_max_age_sec,
+            )
+            return False
+
+        stats = self._side_state_stats(index, side)
+        support = float(stats.get("dynamic_support_score", 0.0) or 0.0)
+        risk = float(stats.get("dynamic_risk_score", 0.0) or 0.0)
+        edge = float(stats.get("dynamic_edge", 0.0) or 0.0)
+        phase = str(stats.get("phase") or "")
+        if not phase:
+            try:
+                stream = self.tri_wave_v2_brain.streams.get(index, {}).get(side)
+                phase = str(getattr(stream, "phase", "UNKNOWN"))
+            except Exception:
+                phase = "UNKNOWN"
+
+        if support < self.entry_min_support_score or risk > self.entry_max_risk_score or edge < self.entry_min_dynamic_edge:
+            self._log_tri_wave_entry_quality_block(
+                index,
+                side,
+                "WEAK_ENTRY_EDGE",
+                secid=secid,
+                ltp=ltp,
+                support=support,
+                risk=risk,
+                edge=edge,
+                phase=phase,
+                required_support=self.entry_min_support_score,
+                max_risk=self.entry_max_risk_score,
+                required_edge=self.entry_min_dynamic_edge,
+            )
+            return False
+
+        expected = self._entry_expected_edge(index, side, float(ltp))
+        if expected["expected_net"] < self.entry_min_expected_net_rupees:
+            self._log_tri_wave_entry_quality_block(
+                index,
+                side,
+                "EXPECTED_NET_BELOW_FEES",
+                secid=secid,
+                ltp=ltp,
+                expected_points=expected["expected_points"],
+                expected_net=expected["expected_net"],
+                required_net=self.entry_min_expected_net_rupees,
+                lot_size=expected["lot_size"],
+                fee=expected["fee"],
+                last_5_delta=expected["last_5_delta"],
+            )
+            return False
+
+        return True
+
+    def _log_tri_wave_entry_quality_block(self, index: str, side: str, reason: str, **fields) -> None:
+        now = time.time()
+        key = f"{index}:{side}:{reason}"
+        if now - self._last_entry_quality_log_ts[key] < 10:
+            return
+        self._last_entry_quality_log_ts[key] = now
+        details = " | ".join(f"{name}={value}" for name, value in fields.items())
+        logger.info(
+            "TRI_WAVE_ENTRY_QUALITY_BLOCK | index=%s | side=%s | reason=%s%s%s",
+            index,
+            side,
+            reason,
+            " | " if details else "",
+            details,
+        )
+
     def _execute_tri_wave_signal(self, pair: PairRuntimeState, signal, raw: dict) -> bool:
         action = signal.action
         if action == "NO_TRADE":
@@ -717,7 +875,7 @@ class TradingRuntimeCoordinator:
             secid = pair.ce_id
             tag = f"{pair.index}_CE"
             ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
-            if not self._is_option_ltp_fresh(pair.index, "CE", secid):
+            if not self._tri_wave_entry_quality_gate(pair, "CE", secid, float(ltp), signal):
                 return False
             accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=signal.reason, metadata=tri_meta)
             if accepted:
@@ -735,7 +893,7 @@ class TradingRuntimeCoordinator:
             secid = pair.pe_id
             tag = f"{pair.index}_PE"
             ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
-            if not self._is_option_ltp_fresh(pair.index, "PE", secid):
+            if not self._tri_wave_entry_quality_gate(pair, "PE", secid, float(ltp), signal):
                 return False
             accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=signal.reason, metadata=tri_meta)
             if accepted:
@@ -765,9 +923,9 @@ class TradingRuntimeCoordinator:
             old_ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
             if old_secid and old_secid in self.paper_trader.positions and not self._attempt_exit_once(pair, old_secid, old_tag, float(old_ltp), f"TRI_WAVE_FLIP_EXIT:{signal.reason}"):
                 return False
-            if self.paper_trader.has_open_position() or not self._is_option_ltp_fresh(pair.index, "CE", pair.ce_id):
-                return False
             new_ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
+            if self.paper_trader.has_open_position() or not self._tri_wave_entry_quality_gate(pair, "CE", pair.ce_id, float(new_ltp), signal):
+                return False
             accepted = self.paper_trader.on_entry(pair.ce_id, f"{pair.index}_CE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}", metadata=tri_meta)
             if accepted:
                 self._register_momentum_trade_from_entry(pair.ce_id, float(new_ltp), pair.ce_depth or raw, tri_wave_metadata=tri_meta)
@@ -779,9 +937,9 @@ class TradingRuntimeCoordinator:
             old_ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
             if old_secid and old_secid in self.paper_trader.positions and not self._attempt_exit_once(pair, old_secid, old_tag, float(old_ltp), f"TRI_WAVE_FLIP_EXIT:{signal.reason}"):
                 return False
-            if self.paper_trader.has_open_position() or not self._is_option_ltp_fresh(pair.index, "PE", pair.pe_id):
-                return False
             new_ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
+            if self.paper_trader.has_open_position() or not self._tri_wave_entry_quality_gate(pair, "PE", pair.pe_id, float(new_ltp), signal):
+                return False
             accepted = self.paper_trader.on_entry(pair.pe_id, f"{pair.index}_PE", "LONG", float(new_ltp), lots=1, reason=f"TRI_WAVE_FLIP_ENTRY:{signal.reason}", metadata=tri_meta)
             if accepted:
                 self._register_momentum_trade_from_entry(pair.pe_id, float(new_ltp), pair.pe_depth or raw, tri_wave_metadata=tri_meta)
@@ -884,6 +1042,8 @@ class TradingRuntimeCoordinator:
         self.tri_wave_v2_last_exit_reason[index] = str(reason)
         net_pnl = float((self.paper_trader.last_trade_summary or {}).get("net_pnl", 0.0) or 0.0)
         self.tri_wave_v2_last_exit_net_pnl[index] = net_pnl
+        if "STALE_MARKET_DATA" in str(reason).upper():
+            self._set_tri_wave_data_quarantine(index, "STALE_EXIT", self.stale_exit_quarantine_sec)
 
     def _should_block_tri_wave_entry(self, index: str, action: str) -> bool:
         now_ts = time.time()
@@ -1033,6 +1193,7 @@ class TradingRuntimeCoordinator:
             pe_age = self._option_ltp_age(pair.pe_id, now_ts)
             cooldown = self._tri_wave_cooldown_status(index, now_ts)
             guard = self._tri_wave_daily_guard_status(index, current_pnl, opened_today)
+            quarantine_remaining = max(0.0, float(self.tri_wave_data_quarantine_until.get(index, 0.0) or 0.0) - now_ts)
             missing = []
             if not pair.underlying_ltp:
                 missing.append("underlying")
@@ -1053,6 +1214,8 @@ class TradingRuntimeCoordinator:
 
             if guard != "OK":
                 state = f"guard={guard}"
+            elif quarantine_remaining > 0:
+                state = f"data_quarantine={quarantine_remaining:.1f}s:{self.tri_wave_data_quarantine_reason.get(index, 'UNKNOWN')}"
             elif cooldown["active"]:
                 state = f"cooldown={cooldown['remaining']:.1f}s"
             elif missing:
@@ -1225,6 +1388,7 @@ class TradingRuntimeCoordinator:
             return
 
         self._last_pair_resubscribe_ts[index] = now
+        self._set_tri_wave_data_quarantine(index, "PAIR_STALE_RECOVERY", self.pair_stale_entry_quarantine_sec)
         action = "resubscribe_and_reconnect_option_shard" if self.pair_stale_reconnect_enabled else "resubscribe_only"
         logger.warning(
             "TRI_WAVE_PAIR_STALE_RECOVERY | index=%s | action=%s | subscriptions=%s",
