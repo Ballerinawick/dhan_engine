@@ -14,13 +14,7 @@ load_dotenv()
 DEFAULT_INDEXES: Tuple[str, ...] = (
     "NIFTY",
     "FINNIFTY",
-    "HDFCBANK",
-    "RELIANCE",
-    "ICICIBANK",
-    "SBIN",
-    "AXISBANK",
-    "INFY",
-    "TCS",
+    "BANKNIFTY",
 )
 
 
