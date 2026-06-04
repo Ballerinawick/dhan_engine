@@ -130,8 +130,9 @@ class OptionDepthStream:
 class FutureQuoteStream:
     """Fullquote stream transport.
 
-    FUT subscriptions use one websocket. Option premium subscriptions are
-    sharded by symbol so a busy premium stream cannot stall every profile.
+    FUT subscriptions use one websocket. Option premium subscriptions default
+    to one websocket so production stays below Dhan's 5-connection limit:
+    1 FUT + 1 premium + 1 depth. Sharding remains available by env override.
     """
 
     def __init__(
@@ -151,7 +152,7 @@ class FutureQuoteStream:
         self._started = False
         self._client: Optional[DhanLiveMarketFeedWS] = None
         self._clients: List[DhanLiveMarketFeedWS] = []
-        self._option_shard_count = max(1, min(int(os.getenv("OPTION_QUOTE_WS_SHARDS", "3") or 3), 4))
+        self._option_shard_count = max(1, min(int(os.getenv("OPTION_QUOTE_WS_SHARDS", "1") or 1), 4))
 
     def start(self) -> None:
         self._started = True

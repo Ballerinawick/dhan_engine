@@ -116,6 +116,7 @@ class TradingRuntimeCoordinator:
         self.ws_retry_delay = 5
         self._future_ws_started = False
         self._future_ws_subscribed = False
+        self._option_streams_started = False
         self.timezone = ZoneInfo("Asia/Kolkata")
 
         self.pairs = {index: PairRuntimeState(index=index) for index in self.settings.indexes}
@@ -200,19 +201,6 @@ class TradingRuntimeCoordinator:
                 print("🚀 SUBSCRIBING FUTURE:", subscriptions)
                 self.future_quote_stream.subscribe(subscriptions)
                 self._future_ws_subscribed = True
-        except Exception as error:
-            self._handle_ws_error(error)
-
-        if self.option_quote_stream is None:
-            raise RuntimeError("Option quote stream is not configured")
-        try:
-            self.option_quote_stream.start()
-        except Exception as error:
-            self._handle_ws_error(error)
-        if self.option_depth_stream is None:
-            raise RuntimeError("Option depth stream is not configured")
-        try:
-            self.option_depth_stream.start()
         except Exception as error:
             self._handle_ws_error(error)
 
@@ -320,7 +308,25 @@ class TradingRuntimeCoordinator:
         with self._lock:
             return all(self.pairs[index].underlying_ltp for index in self.settings.indexes)
 
+    def _start_option_streams(self) -> None:
+        if self._option_streams_started:
+            return
+        if self.option_quote_stream is None:
+            raise RuntimeError("Option quote stream is not configured")
+        if self.option_depth_stream is None:
+            raise RuntimeError("Option depth stream is not configured")
+        try:
+            self.option_quote_stream.start()
+        except Exception as error:
+            self._handle_ws_error(error)
+        try:
+            self.option_depth_stream.start()
+        except Exception as error:
+            self._handle_ws_error(error)
+        self._option_streams_started = True
+
     def _select_and_subscribe_option_pairs(self) -> None:
+        all_subscriptions = []
         for index in self.settings.indexes:
             underlying_ltp = self.pairs[index].underlying_ltp
             try:
@@ -363,10 +369,21 @@ class TradingRuntimeCoordinator:
                 logger.info("PAIR_REGISTERED | %s | CE=%s | PE=%s", index, pair.ce_id, pair.pe_id)
 
             if subscriptions:
-                self.option_depth_stream.subscribe(subscriptions)
-                self.option_quote_stream.subscribe(subscriptions)
+                all_subscriptions.extend(subscriptions)
                 for secid, tag in subscriptions:
                     self.full_quote_secid_tag[secid] = tag
+
+        if not all_subscriptions:
+            logger.warning("TRI_WAVE_INITIAL_SELECTION_EMPTY | option_streams=NOT_STARTED")
+            return
+
+        logger.info(
+            "TRI_WAVE_OPTION_STREAM_START_ORDER | step=after_future_ltp_and_pair_selection | subscriptions=%s",
+            len(all_subscriptions),
+        )
+        self._start_option_streams()
+        self.option_quote_stream.subscribe(all_subscriptions)
+        self.option_depth_stream.subscribe(all_subscriptions)
 
     def on_future_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
         self._handle_ws_connected()
