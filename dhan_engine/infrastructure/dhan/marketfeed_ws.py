@@ -82,7 +82,7 @@ class DhanLiveMarketFeedWS:
         self._last_message_ts = 0.0
         self._max_pending_messages = int(os.getenv("FULLQUOTE_MAX_PENDING_MESSAGES", "500") or 500)
         self._stale_reconnect_sec = float(os.getenv("FULLQUOTE_STALE_RECONNECT_SEC", "45") or 45)
-        self._subscription_stale_reconnect_sec = float(os.getenv("FULLQUOTE_SUBSCRIPTION_STALE_RECONNECT_SEC", "75") or 75)
+        self._subscription_stale_reconnect_sec = float(os.getenv("FULLQUOTE_SUBSCRIPTION_STALE_RECONNECT_SEC", "0") or 0)
         self._subscription_stale_min_count = int(os.getenv("FULLQUOTE_SUBSCRIPTION_STALE_MIN_COUNT", "2") or 2)
         self._manual_reconnect_min_sec = float(os.getenv("FULLQUOTE_MANUAL_RECONNECT_MIN_SEC", "120") or 120)
         self._rate_limit_backoff_sec = float(os.getenv("FULLQUOTE_429_BACKOFF_SEC", "600") or 600)
@@ -475,6 +475,14 @@ class DhanLiveMarketFeedWS:
             return
         self._last_subscription_stale_log_ts = now
         stale_preview = ",".join(f"{tag}:{age:.0f}s" for _, tag, age in stale[:8])
+        last_message_age = now - self._last_message_ts if self._last_message_ts else None
+        if last_message_age is not None and last_message_age < self._subscription_stale_reconnect_sec:
+            print(
+                "FULLQUOTE_SUBSCRIPTION_STALE_OBSERVED | "
+                f"stale={len(stale)}/{len(subscriptions)} | socket_live_age={last_message_age:.1f}s | "
+                f"threshold={self._subscription_stale_reconnect_sec:.0f}s | {stale_preview}"
+            )
+            return
         print(
             "FULLQUOTE_SUBSCRIPTION_STALE_RECONNECT | "
             f"stale={len(stale)}/{len(subscriptions)} | threshold={self._subscription_stale_reconnect_sec:.0f}s | {stale_preview}"
