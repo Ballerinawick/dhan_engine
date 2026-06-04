@@ -155,7 +155,8 @@ class TradingRuntimeCoordinator:
         self._last_stale_position_check_ts = 0.0
         self.portfolio_snapshot_interval_sec = float(os.getenv("TRIWAVE_PORTFOLIO_SNAPSHOT_SEC", "5") or 5)
         self._last_portfolio_snapshot_ts = 0.0
-        self.pair_stale_reconnect_enabled = str(os.getenv("PAIR_STALE_RECONNECT_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        self.pair_stale_reconnect_enabled = str(os.getenv("PAIR_STALE_RECONNECT_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        self.active_position_stale_exit_sec = float(os.getenv("ACTIVE_POSITION_STALE_EXIT_SEC", "45") or 45)
 
         self.premium_flow = {
             "CE": {"ltp": 0.0, "prev": 0.0, "velocity": 0.0},
@@ -1370,7 +1371,52 @@ class TradingRuntimeCoordinator:
                 "TRI_WAVE_PAIR_STALE | index=%s | ce_age=%s | pe_age=%s | ce_ltp_age=%s | pe_ltp_age=%s | ce_id=%s | pe_id=%s",
                 index, ce_age, pe_age, ce_ltp_age, pe_ltp_age, pair.ce_id, pair.pe_id
             )
+            self._exit_active_position_on_stale_leg(index, pair, now, ce_ltp_age, pe_ltp_age)
             self._recover_stale_option_pair(index, pair, now)
+
+    def _exit_active_position_on_stale_leg(
+        self,
+        index: str,
+        pair: PairRuntimeState,
+        now: float,
+        ce_ltp_age: Optional[float],
+        pe_ltp_age: Optional[float],
+    ) -> bool:
+        if self.active_position_stale_exit_sec <= 0:
+            return False
+        active = self._get_active_position_for_pair(pair)
+        if not active:
+            return False
+
+        side = str(active.get("side") or "")
+        secid = int(active.get("secid") or 0)
+        ltp_age = ce_ltp_age if side == "CE" else pe_ltp_age if side == "PE" else None
+        if ltp_age is None or ltp_age < self.active_position_stale_exit_sec:
+            return False
+
+        position = self.paper_trader.positions.get(secid, {})
+        ltp = float(position.get("ltp", active.get("ltp", active.get("entry", 0.0))) or 0.0)
+        if ltp <= 0:
+            ltp = pair._best_leg_ltp(
+                pair.ce_depth if side == "CE" else pair.pe_depth,
+                pair.ce_ltp if side == "CE" else pair.pe_ltp,
+                active.get("entry", 0.0),
+            )
+        logger.warning(
+            "TRI_WAVE_ACTIVE_STALE_LEG_EXIT | index=%s | side=%s | secid=%s | ltp_age=%.2f | max_age=%.2f | ltp=%.2f | note=active_position_leg_stopped_updating",
+            index,
+            side,
+            secid,
+            float(ltp_age),
+            self.active_position_stale_exit_sec,
+            float(ltp),
+        )
+        return self._tri_wave_direct_exit(
+            pair,
+            secid,
+            float(ltp),
+            "TRI_WAVE_V2_EXIT:ACTIVE_SIDE_STALE_MARKET_DATA",
+        )
 
     def _recover_stale_option_pair(self, index: str, pair: PairRuntimeState, now: Optional[float] = None) -> None:
         if self.pair_stale_resubscribe_sec <= 0:
