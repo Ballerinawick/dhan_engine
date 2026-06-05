@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import requests
 
@@ -183,6 +183,12 @@ class TradingRuntimeCoordinator:
         self.pair_stale_entry_quarantine_sec = float(os.getenv("TRIWAVE_PAIR_STALE_ENTRY_QUARANTINE_SEC", "120") or 120)
         self.pair_stale_resubscribe_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_SEC", "45") or 45)
         self.pair_stale_resubscribe_cooldown_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_COOLDOWN_SEC", "45") or 45)
+        self.premium_rebuild_enabled = str(os.getenv("PREMIUM_STREAM_REBUILD_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        self.premium_rebuild_attempt_threshold = int(os.getenv("PREMIUM_STREAM_REBUILD_ATTEMPT_THRESHOLD", "2") or 2)
+        self.premium_rebuild_window_sec = float(os.getenv("PREMIUM_STREAM_REBUILD_WINDOW_SEC", "300") or 300)
+        self.premium_rebuild_cooldown_sec = float(os.getenv("PREMIUM_STREAM_REBUILD_COOLDOWN_SEC", "120") or 120)
+        self.premium_rebuild_verify_sec = float(os.getenv("PREMIUM_STREAM_REBUILD_VERIFY_SEC", "12") or 12)
+        self.premium_stream_down_quarantine_sec = float(os.getenv("PREMIUM_STREAM_DOWN_QUARANTINE_SEC", "60") or 60)
         self.no_entry_watch_sec = float(os.getenv("TRIWAVE_NO_ENTRY_WATCH_SEC", "60") or 60)
         self.verbose_tick_logs = str(os.getenv("TRIWAVE_VERBOSE_TICK_LOGS", "0")).strip().lower() in {"1", "true", "yes", "on"}
         self._last_stale_position_check_ts = 0.0
@@ -218,6 +224,10 @@ class TradingRuntimeCoordinator:
         self.tri_wave_trading_halted_for_day: Dict[str, bool] = defaultdict(bool)
         self.tri_wave_data_quarantine_until: Dict[str, float] = defaultdict(float)
         self.tri_wave_data_quarantine_reason: Dict[str, str] = defaultdict(str)
+        self.premium_stale_attempt_ts: Dict[str, deque] = defaultdict(lambda: deque(maxlen=12))
+        self.premium_rebuild_pending_until: Dict[str, float] = defaultdict(float)
+        self.premium_rebuild_generation: int = 0
+        self.last_premium_stream_rebuild_ts: float = 0.0
 
         self.metrics = {
             "exit_reason_counts": defaultdict(int),
@@ -595,6 +605,9 @@ class TradingRuntimeCoordinator:
                 now_ts = time.time()
                 self.option_ltp_last_ts_by_secid[int(secid)] = now_ts
                 self.option_ltp_last_value_by_secid[int(secid)] = float(ltp)
+                quarantine_reason = str(self.tri_wave_data_quarantine_reason.get(index, ""))
+                if self.premium_rebuild_pending_until.get(index) or quarantine_reason.startswith("PREMIUM_STREAM"):
+                    self._verify_premium_stream_for_index(index, now_ts)
 
             features = dict(getattr(depth, "features", None) or {})
             raw_full = dict(getattr(depth, "raw", None) or {})
@@ -767,6 +780,17 @@ class TradingRuntimeCoordinator:
         until = time.time() + float(seconds)
         self.tri_wave_data_quarantine_until[index] = max(float(self.tri_wave_data_quarantine_until.get(index, 0.0) or 0.0), until)
         self.tri_wave_data_quarantine_reason[index] = str(reason)
+
+    def _replace_tri_wave_data_quarantine(self, index: str, reason: str, seconds: float) -> None:
+        until = time.time() + max(float(seconds), 0.0)
+        self.tri_wave_data_quarantine_until[index] = until
+        self.tri_wave_data_quarantine_reason[index] = str(reason)
+
+    def _clear_tri_wave_data_quarantine(self, index: str, reason_prefix: str) -> None:
+        reason = str(self.tri_wave_data_quarantine_reason.get(index, ""))
+        if reason.startswith(reason_prefix):
+            self.tri_wave_data_quarantine_until[index] = 0.0
+            self.tri_wave_data_quarantine_reason[index] = ""
 
     def _tri_wave_entry_quality_gate(self, pair: PairRuntimeState, side: str, secid: Optional[int], ltp: float, signal) -> bool:
         index = pair.index
@@ -1477,6 +1501,149 @@ class TradingRuntimeCoordinator:
             "TRI_WAVE_V2_EXIT:ACTIVE_SIDE_STALE_MARKET_DATA",
         )
 
+    def _current_option_subscriptions(self) -> list[tuple[int, str]]:
+        subscriptions = []
+        seen = set()
+        for index, pair in self.pairs.items():
+            if pair.ce_id:
+                item = (int(pair.ce_id), f"{index}_CE")
+                if item[0] not in seen:
+                    subscriptions.append(item)
+                    seen.add(item[0])
+            if pair.pe_id:
+                item = (int(pair.pe_id), f"{index}_PE")
+                if item[0] not in seen:
+                    subscriptions.append(item)
+                    seen.add(item[0])
+        return subscriptions
+
+    def _make_option_quote_stream(self) -> FutureQuoteStream:
+        return FutureQuoteStream(
+            client_id=self.settings.credentials.client_id,
+            token=self.settings.credentials.access_token,
+            exchange_segment=self.settings.option_exchange_segment,
+            on_quote=self._on_option_full_quote,
+            debug=False,
+        )
+
+    def _record_premium_stale_recovery_attempt(self, index: str, now: float) -> int:
+        attempts = self.premium_stale_attempt_ts[index]
+        attempts.append(float(now))
+        while attempts and now - float(attempts[0]) > self.premium_rebuild_window_sec:
+            attempts.popleft()
+        return len(attempts)
+
+    def _should_rebuild_premium_stream(self, index: str, now: float) -> bool:
+        if not self.premium_rebuild_enabled:
+            return False
+        attempt_count = self._record_premium_stale_recovery_attempt(index, now)
+        if attempt_count < self.premium_rebuild_attempt_threshold:
+            return False
+        if now - self.last_premium_stream_rebuild_ts < self.premium_rebuild_cooldown_sec:
+            logger.warning(
+                "PREMIUM_STREAM_REBUILD_SKIPPED | index=%s | attempts=%s | cooldown_remaining=%.1f",
+                index,
+                attempt_count,
+                self.premium_rebuild_cooldown_sec - (now - self.last_premium_stream_rebuild_ts),
+            )
+            return False
+        return True
+
+    def _rebuild_option_quote_stream(self, trigger_index: str, reason: str, now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
+        subscriptions = self._current_option_subscriptions()
+        if not subscriptions:
+            logger.warning("PREMIUM_STREAM_REBUILD_SKIPPED | reason=no_subscriptions | trigger_index=%s", trigger_index)
+            return False
+
+        logger.warning(
+            "PREMIUM_STREAM_REBUILD_START | trigger_index=%s | reason=%s | subscriptions=%s | generation=%s",
+            trigger_index,
+            reason,
+            subscriptions,
+            self.premium_rebuild_generation + 1,
+        )
+        old_stream = self.option_quote_stream
+        try:
+            if old_stream is not None and hasattr(old_stream, "close"):
+                old_stream.close()
+        except Exception:
+            logger.exception("PREMIUM_STREAM_OLD_CLOSE_FAILED | trigger_index=%s", trigger_index)
+
+        try:
+            new_stream = self._make_option_quote_stream()
+            self.option_quote_stream = new_stream
+            self._option_streams_started = True
+            new_stream.start()
+            new_stream.subscribe(subscriptions)
+        except Exception:
+            logger.exception("PREMIUM_STREAM_REBUILD_FAILED | trigger_index=%s | reason=%s", trigger_index, reason)
+            self.option_quote_stream = old_stream
+            self._option_streams_started = bool(old_stream)
+            return False
+
+        self.premium_rebuild_generation += 1
+        self.last_premium_stream_rebuild_ts = now
+        verify_until = now + self.premium_rebuild_verify_sec
+        for profile in self.settings.indexes:
+            self.premium_rebuild_pending_until[profile] = verify_until
+            self._replace_tri_wave_data_quarantine(profile, "PREMIUM_STREAM_REBUILD_VERIFY", self.premium_rebuild_verify_sec)
+        if self.option_depth_stream is not None:
+            try:
+                self.option_depth_stream.subscribe(subscriptions)
+            except Exception:
+                logger.exception("PREMIUM_STREAM_REBUILD_DEPTH_RESUB_FAILED | trigger_index=%s", trigger_index)
+        logger.warning(
+            "PREMIUM_STREAM_REBUILD_DONE | generation=%s | verify_sec=%.1f | subscriptions=%s",
+            self.premium_rebuild_generation,
+            self.premium_rebuild_verify_sec,
+            len(subscriptions),
+        )
+        return True
+
+    def _verify_premium_stream_for_index(self, index: str, now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
+        pair = self.pairs.get(index)
+        if pair is None:
+            return False
+        freshness = PairFreshness(
+            ce_age=self._option_ltp_age(pair.ce_id, now),
+            pe_age=self._option_ltp_age(pair.pe_id, now),
+            max_age_sec=max(self.entry_pair_fresh_ltp_max_age_sec, self.premium_rebuild_verify_sec),
+        )
+        if freshness.is_fresh:
+            self.premium_rebuild_pending_until.pop(index, None)
+            self._clear_tri_wave_data_quarantine(index, "PREMIUM_STREAM")
+            logger.warning(
+                "PREMIUM_STREAM_REBUILD_VERIFIED | index=%s | ce_age=%s | pe_age=%s | generation=%s",
+                index,
+                self._fmt_age(freshness.ce_age),
+                self._fmt_age(freshness.pe_age),
+                self.premium_rebuild_generation,
+            )
+            return True
+        return False
+
+    def _check_premium_stream_rebuild_verification(self, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        for index, until in list(self.premium_rebuild_pending_until.items()):
+            if self._verify_premium_stream_for_index(index, now):
+                continue
+            if until and now >= float(until):
+                self.premium_rebuild_pending_until.pop(index, None)
+                self._replace_tri_wave_data_quarantine(index, "PREMIUM_STREAM_DOWN", self.premium_stream_down_quarantine_sec)
+                pair = self.pairs.get(index)
+                ce_age = self._option_ltp_age(pair.ce_id, now) if pair else None
+                pe_age = self._option_ltp_age(pair.pe_id, now) if pair else None
+                logger.error(
+                    "PREMIUM_STREAM_REBUILD_VERIFY_FAILED | index=%s | ce_age=%s | pe_age=%s | quarantine_sec=%.1f | generation=%s",
+                    index,
+                    self._fmt_age(ce_age),
+                    self._fmt_age(pe_age),
+                    self.premium_stream_down_quarantine_sec,
+                    self.premium_rebuild_generation,
+                )
+
     def _recover_stale_option_pair(self, index: str, pair: PairRuntimeState, now: Optional[float] = None) -> None:
         if self.pair_stale_resubscribe_sec <= 0:
             return
@@ -1493,6 +1660,10 @@ class TradingRuntimeCoordinator:
             return
 
         self._last_pair_resubscribe_ts[index] = now
+        if self._should_rebuild_premium_stream(index, now):
+            self._rebuild_option_quote_stream(index, reason=f"repeated_pair_stale:{index}", now=now)
+            return
+
         self._set_tri_wave_data_quarantine(index, "PAIR_STALE_RECOVERY", self.pair_stale_entry_quarantine_sec)
         action = "resubscribe_and_reconnect_option_shard" if self.pair_stale_reconnect_enabled else "resubscribe_only"
         logger.warning(
@@ -2128,6 +2299,7 @@ class TradingRuntimeCoordinator:
                 continue
 
             now = time.time()
+            self._check_premium_stream_rebuild_verification(now)
             self._exit_stale_positions_if_needed()
             if now - last_heartbeat >= self.settings.heartbeat_sec:
                 last_heartbeat = now
