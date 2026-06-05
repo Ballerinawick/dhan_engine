@@ -100,6 +100,9 @@ class PaperTradeManager:
     # ENTRY
     # --------------------------------------------------
     def on_entry(self, secid, tag, side, ltp, lots=1, reason="ENTRY", metadata: dict | None = None):
+        if secid is not None and int(secid) in self.positions:
+            return self._scale_in_position(int(secid), tag, side, float(ltp), int(lots), reason, metadata)
+
         # 🚫 BLOCK ANY NEW ENTRY IF ONE EXISTS
         if self.has_open_position():
             print(
@@ -159,6 +162,9 @@ class PaperTradeManager:
             "entry_ts": now_ts,
             "last_tick_ts": now_ts,
             "entry_reason": reason,
+            "entry_count": 1,
+            "scale_in_count": 0,
+            "last_add_ts": now_ts,
         }
         metadata = dict(metadata or {})
         strategy_owner = metadata.get("strategy_owner")
@@ -193,6 +199,58 @@ class PaperTradeManager:
     # --------------------------------------------------
     # EXIT (FULL LOT ONLY) — FEES APPLIED HERE
     # --------------------------------------------------
+    def _scale_in_position(self, secid: int, tag: str, side: str, ltp: float, lots: int, reason: str, metadata: dict | None = None):
+        pos = self.positions.get(secid)
+        if not pos or str(pos.get("tag")) != str(tag):
+            self.debug_position_snapshot()
+            return False
+
+        index = self._extract_index(tag)
+        if not index:
+            self.debug_position_snapshot()
+            return False
+
+        lot_size = self.LOT_SIZES[index]
+        add_qty = int(lots) * lot_size
+        add_cost = add_qty * float(ltp)
+        if add_qty <= 0 or add_cost > self.cash:
+            self.debug_position_snapshot()
+            return False
+
+        now_ts = time.time()
+        old_qty = int(pos.get("qty", 0) or 0)
+        old_entry = float(pos.get("entry", 0.0) or 0.0)
+        new_qty = old_qty + add_qty
+        avg_entry = ((old_entry * old_qty) + add_cost) / new_qty if new_qty > 0 else float(ltp)
+
+        self.cash -= add_cost
+        self._maybe_reset_daily_counts(now_ts)
+        self.entries_total += 1
+        self.entries_by_index[index] += 1
+        self.opened_today += 1
+
+        pos["lots"] = int(pos.get("lots", 0) or 0) + int(lots)
+        pos["qty"] = new_qty
+        pos["entry"] = float(avg_entry)
+        pos["ltp"] = float(ltp)
+        pos["last_tick_ts"] = now_ts
+        pos["entry_count"] = int(pos.get("entry_count", 1) or 1) + 1
+        pos["scale_in_count"] = int(pos.get("scale_in_count", 0) or 0) + 1
+        pos["last_add_ts"] = now_ts
+        pos["last_scale_in_reason"] = reason
+
+        for key, value in dict(metadata or {}).items():
+            pos.setdefault(key, value)
+
+        self.open_positions_dirty = True
+        print(
+            f"SCALE_IN_COMMITTED | {tag} | {side} | "
+            f"AddLots:{lots} | TotalLots:{pos['lots']} | AvgEntry:{avg_entry:.2f} | LTP:{ltp:.2f} | Reason:{reason}"
+        )
+        self.debug_position_snapshot()
+        self._log_consolidated()
+        return True
+
     def on_exit(self, secid, ltp, reason="EXIT"):
         pos = self.positions.pop(secid, None)
         if not pos:
@@ -208,7 +266,8 @@ class PaperTradeManager:
             gross_pnl = (entry - ltp) * qty
 
         # ✅ APPLY REALISTIC ROUND-TRIP FEE
-        fee = self.ROUND_TRIP_FEE
+        entry_count = max(int(pos.get("entry_count", 1) or 1), 1)
+        fee = self.ROUND_TRIP_FEE * entry_count
         net_pnl = gross_pnl - fee
 
         self.cash += qty * ltp
@@ -239,6 +298,9 @@ class PaperTradeManager:
             "exit_ts": float(now_ts),
             "entry_time": entry_time_ist,
             "exit_time": exit_time_ist,
+            "entry_count": entry_count,
+            "scale_in_count": int(pos.get("scale_in_count", 0) or 0),
+            "last_scale_in_reason": pos.get("last_scale_in_reason"),
         }
 
         self.exits_total += 1
