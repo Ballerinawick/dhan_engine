@@ -161,6 +161,21 @@ class FutureQuoteStream:
         for client in self._clients:
             client.connect()
 
+    def close(self) -> None:
+        self._started = False
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                logger.exception("FULLQUOTE_STREAM_CLOSE_FAILED | client=single")
+        for idx, client in enumerate(list(self._clients)):
+            try:
+                client.close()
+            except Exception:
+                logger.exception("FULLQUOTE_STREAM_CLOSE_FAILED | client=shard_%s", idx)
+        self._client = None
+        self._clients = []
+
     def subscribe(self, subscriptions: Iterable[Tuple[int, str]]) -> None:
         subscription_list = list(subscriptions)
         instruments = [
