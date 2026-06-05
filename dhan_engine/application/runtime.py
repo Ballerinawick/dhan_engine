@@ -10,6 +10,14 @@ from collections import defaultdict
 import requests
 
 from dhan_engine.application.market_data import FutureQuoteStream, OptionDepthStream
+from dhan_engine.application.market_health import PairFreshness, age_from_ts, format_age
+from dhan_engine.application.risk_manager import (
+    EntryGateConfig,
+    ScaleInGateConfig,
+    entry_expected_edge,
+    evaluate_entry_quality,
+    evaluate_scale_in_quality,
+)
 from dhan_engine.analytics.tri_wave_live_analyzer import TriWaveLiveAnalyzer
 from dhan_engine.analytics.tri_wave_session_recorder import TriWaveSessionRecorder
 from dhan_engine.config.settings import RuntimeSettings
@@ -154,6 +162,23 @@ class TradingRuntimeCoordinator:
         self.scale_in_min_edge = float(os.getenv("TRIWAVE_SCALE_IN_MIN_EDGE", "0.45") or 0.45)
         self.scale_in_cooldown_sec = float(os.getenv("TRIWAVE_SCALE_IN_COOLDOWN_SEC", "30") or 30)
         self.scale_in_fresh_ltp_max_age_sec = float(os.getenv("TRIWAVE_SCALE_IN_FRESH_LTP_MAX_AGE_SEC", "5") or 5)
+        self.entry_gate_config = EntryGateConfig(
+            min_support_score=self.entry_min_support_score,
+            max_risk_score=self.entry_max_risk_score,
+            min_dynamic_edge=self.entry_min_dynamic_edge,
+            min_expected_net_rupees=self.entry_min_expected_net_rupees,
+            min_expected_move_pct=self.entry_min_expected_move_pct,
+        )
+        self.scale_in_gate_config = ScaleInGateConfig(
+            enabled=self.scale_in_enabled,
+            max_lots=self.scale_in_max_lots,
+            min_profit_pct=self.scale_in_min_profit_pct,
+            min_support_score=self.scale_in_min_support_score,
+            max_risk_score=self.scale_in_max_risk_score,
+            min_edge=self.scale_in_min_edge,
+            cooldown_sec=self.scale_in_cooldown_sec,
+            fresh_ltp_max_age_sec=self.scale_in_fresh_ltp_max_age_sec,
+        )
         self.stale_exit_quarantine_sec = float(os.getenv("TRIWAVE_STALE_EXIT_QUARANTINE_SEC", "600") or 600)
         self.pair_stale_entry_quarantine_sec = float(os.getenv("TRIWAVE_PAIR_STALE_ENTRY_QUARANTINE_SEC", "120") or 120)
         self.pair_stale_resubscribe_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_SEC", "45") or 45)
@@ -728,25 +753,13 @@ class TradingRuntimeCoordinator:
 
     def _entry_expected_edge(self, index: str, side: str, ltp: float) -> dict:
         stats = self._side_state_stats(index, side)
-        lot_size = self._lot_size_for_index(index)
-        fee = self._round_trip_fee()
-        recent_high = float(stats.get("recent_high", ltp) or ltp)
-        last_5_delta = max(0.0, float(stats.get("last_5_delta", 0.0) or 0.0))
-        breakout_budget = last_5_delta * 2.0
-        retest_budget = max(0.0, recent_high - float(ltp))
-        min_pct_budget = float(ltp) * (self.entry_min_expected_move_pct / 100.0)
-        expected_points = max(breakout_budget, retest_budget, min_pct_budget)
-        expected_gross = expected_points * lot_size
-        expected_net = expected_gross - fee
-        return {
-            "lot_size": lot_size,
-            "fee": fee,
-            "expected_points": expected_points,
-            "expected_gross": expected_gross,
-            "expected_net": expected_net,
-            "last_5_delta": last_5_delta,
-            "recent_high": recent_high,
-        }
+        return entry_expected_edge(
+            stats=stats,
+            ltp=float(ltp),
+            lot_size=self._lot_size_for_index(index),
+            fee=self._round_trip_fee(),
+            min_expected_move_pct=self.entry_gate_config.min_expected_move_pct,
+        )
 
     def _set_tri_wave_data_quarantine(self, index: str, reason: str, seconds: float) -> None:
         if seconds <= 0:
@@ -774,31 +787,25 @@ class TradingRuntimeCoordinator:
         if not self._is_option_ltp_fresh(index, side, secid):
             return False
 
-        ce_age = self._option_ltp_age(pair.ce_id, now)
-        pe_age = self._option_ltp_age(pair.pe_id, now)
-        pair_stale = (
-            ce_age is None
-            or pe_age is None
-            or ce_age > self.entry_pair_fresh_ltp_max_age_sec
-            or pe_age > self.entry_pair_fresh_ltp_max_age_sec
+        freshness = PairFreshness(
+            ce_age=self._option_ltp_age(pair.ce_id, now),
+            pe_age=self._option_ltp_age(pair.pe_id, now),
+            max_age_sec=self.entry_pair_fresh_ltp_max_age_sec,
         )
-        if pair_stale:
+        if not freshness.is_fresh:
             self._log_tri_wave_entry_quality_block(
                 index,
                 side,
                 "PAIR_LTP_NOT_FRESH",
                 secid=secid,
                 ltp=ltp,
-                ce_age=self._fmt_age(ce_age),
-                pe_age=self._fmt_age(pe_age),
+                ce_age=self._fmt_age(freshness.ce_age),
+                pe_age=self._fmt_age(freshness.pe_age),
                 max_age=self.entry_pair_fresh_ltp_max_age_sec,
             )
             return False
 
         stats = self._side_state_stats(index, side)
-        support = float(stats.get("dynamic_support_score", 0.0) or 0.0)
-        risk = float(stats.get("dynamic_risk_score", 0.0) or 0.0)
-        edge = float(stats.get("dynamic_edge", 0.0) or 0.0)
         phase = str(stats.get("phase") or "")
         if not phase:
             try:
@@ -807,37 +814,22 @@ class TradingRuntimeCoordinator:
             except Exception:
                 phase = "UNKNOWN"
 
-        if support < self.entry_min_support_score or risk > self.entry_max_risk_score or edge < self.entry_min_dynamic_edge:
+        decision = evaluate_entry_quality(
+            stats=stats,
+            ltp=float(ltp),
+            lot_size=self._lot_size_for_index(index),
+            fee=self._round_trip_fee(),
+            phase=phase,
+            config=self.entry_gate_config,
+        )
+        if not decision.allowed:
             self._log_tri_wave_entry_quality_block(
                 index,
                 side,
-                "WEAK_ENTRY_EDGE",
+                decision.reason,
                 secid=secid,
                 ltp=ltp,
-                support=support,
-                risk=risk,
-                edge=edge,
-                phase=phase,
-                required_support=self.entry_min_support_score,
-                max_risk=self.entry_max_risk_score,
-                required_edge=self.entry_min_dynamic_edge,
-            )
-            return False
-
-        expected = self._entry_expected_edge(index, side, float(ltp))
-        if expected["expected_net"] < self.entry_min_expected_net_rupees:
-            self._log_tri_wave_entry_quality_block(
-                index,
-                side,
-                "EXPECTED_NET_BELOW_FEES",
-                secid=secid,
-                ltp=ltp,
-                expected_points=expected["expected_points"],
-                expected_net=expected["expected_net"],
-                required_net=self.entry_min_expected_net_rupees,
-                lot_size=expected["lot_size"],
-                fee=expected["fee"],
-                last_5_delta=expected["last_5_delta"],
+                **(decision.fields or {}),
             )
             return False
 
@@ -864,45 +856,29 @@ class TradingRuntimeCoordinator:
             return False
 
         position = self.paper_trader.positions.get(secid, {})
-        current_lots = int(position.get("lots", 0) or 0)
-        if current_lots >= self.scale_in_max_lots:
-            self._log_tri_wave_entry_quality_block(pair.index, side, "SCALE_IN_MAX_LOTS", secid=secid, lots=current_lots, max_lots=self.scale_in_max_lots)
-            return False
-
         now = time.time()
-        last_add_ts = float(position.get("last_add_ts", position.get("entry_ts", 0.0)) or 0.0)
-        if last_add_ts and now - last_add_ts < self.scale_in_cooldown_sec:
-            self._log_tri_wave_entry_quality_block(pair.index, side, "SCALE_IN_COOLDOWN", secid=secid, elapsed=round(now - last_add_ts, 2), required=self.scale_in_cooldown_sec)
-            return False
-
         ltp_ts = float(self.option_ltp_last_ts_by_secid.get(int(secid), 0.0) or 0.0)
         ltp_age = now - ltp_ts if ltp_ts else None
-        if not ltp_ts or ltp_age is None or ltp_age > self.scale_in_fresh_ltp_max_age_sec:
-            self._log_tri_wave_entry_quality_block(pair.index, side, "SCALE_IN_STALE_LTP", secid=secid, ltp_age=self._fmt_age(ltp_age), max_age=self.scale_in_fresh_ltp_max_age_sec)
-            return False
-
-        entry = float(position.get("entry", 0.0) or 0.0)
-        pnl_pct = ((float(ltp) - entry) / entry) * 100.0 if entry > 0 else 0.0
-        if pnl_pct < self.scale_in_min_profit_pct:
-            self._log_tri_wave_entry_quality_block(pair.index, side, "SCALE_IN_NOT_IN_PROFIT", secid=secid, pnl_pct=round(pnl_pct, 3), required=self.scale_in_min_profit_pct)
-            return False
 
         stats = self._side_state_stats(pair.index, side)
-        support = float(stats.get("dynamic_support_score", 0.0) or 0.0)
-        risk = float(stats.get("dynamic_risk_score", 0.0) or 0.0)
-        edge = float(stats.get("dynamic_edge", 0.0) or 0.0)
-        if support < self.scale_in_min_support_score or risk > self.scale_in_max_risk_score or edge < self.scale_in_min_edge:
+        decision = evaluate_scale_in_quality(
+            position=position,
+            ltp=float(ltp),
+            stats=stats,
+            ltp_age=ltp_age,
+            now_ts=now,
+            config=self.scale_in_gate_config,
+        )
+        if not decision.allowed:
+            fields = dict(decision.fields or {})
+            if "ltp_age" in fields:
+                fields["ltp_age"] = self._fmt_age(fields["ltp_age"])
             self._log_tri_wave_entry_quality_block(
                 pair.index,
                 side,
-                "SCALE_IN_WEAK_EDGE",
+                decision.reason,
                 secid=secid,
-                support=support,
-                risk=risk,
-                edge=edge,
-                required_support=self.scale_in_min_support_score,
-                max_risk=self.scale_in_max_risk_score,
-                required_edge=self.scale_in_min_edge,
+                **fields,
             )
             return False
 
@@ -921,11 +897,11 @@ class TradingRuntimeCoordinator:
                 "TRI_WAVE_SCALE_IN_COMMITTED | %s | ltp=%.2f | lots=%s | pnl_pct=%.2f | support=%.2f | risk=%.2f | edge=%.2f | reason=%s",
                 tag,
                 float(ltp),
-                int(self.paper_trader.positions.get(int(secid), {}).get("lots", current_lots)),
-                pnl_pct,
-                support,
-                risk,
-                edge,
+                int(self.paper_trader.positions.get(int(secid), {}).get("lots", position.get("lots", 0))),
+                float((decision.fields or {}).get("pnl_pct", 0.0) or 0.0),
+                float((decision.fields or {}).get("support", 0.0) or 0.0),
+                float((decision.fields or {}).get("risk", 0.0) or 0.0),
+                float((decision.fields or {}).get("edge", 0.0) or 0.0),
                 signal.reason,
             )
             self._record_tri_wave_portfolio_snapshot(pair.index)
@@ -1245,11 +1221,10 @@ class TradingRuntimeCoordinator:
         if not secid:
             return None
         now_ts = time.time() if now_ts is None else now_ts
-        ts = float(self.option_ltp_last_ts_by_secid.get(int(secid), 0.0) or 0.0)
-        return now_ts - ts if ts else None
+        return age_from_ts(float(self.option_ltp_last_ts_by_secid.get(int(secid), 0.0) or 0.0), now_ts)
 
     def _fmt_age(self, value: Optional[float]) -> str:
-        return "missing" if value is None else f"{value:.1f}s"
+        return format_age(value)
 
     def _log_no_entry_watch_if_needed(self, now_ts: Optional[float] = None) -> None:
         if self.no_entry_watch_sec <= 0:
