@@ -13,7 +13,6 @@ load_dotenv()
 
 DEFAULT_INDEXES: Tuple[str, ...] = (
     "NIFTY",
-    "FINNIFTY",
     "BANKNIFTY",
 )
 

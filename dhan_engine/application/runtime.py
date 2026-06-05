@@ -146,6 +146,14 @@ class TradingRuntimeCoordinator:
         self.entry_max_risk_score = float(os.getenv("TRIWAVE_ENTRY_MAX_RISK_SCORE", "0.45") or 0.45)
         self.entry_min_expected_net_rupees = float(os.getenv("TRIWAVE_ENTRY_MIN_EXPECTED_NET_RUPEES", "120") or 120)
         self.entry_min_expected_move_pct = float(os.getenv("TRIWAVE_ENTRY_MIN_EXPECTED_MOVE_PCT", "0.75") or 0.75)
+        self.scale_in_enabled = str(os.getenv("TRIWAVE_SCALE_IN_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        self.scale_in_max_lots = int(os.getenv("TRIWAVE_SCALE_IN_MAX_LOTS", "2") or 2)
+        self.scale_in_min_profit_pct = float(os.getenv("TRIWAVE_SCALE_IN_MIN_PROFIT_PCT", "0.80") or 0.80)
+        self.scale_in_min_support_score = float(os.getenv("TRIWAVE_SCALE_IN_MIN_SUPPORT_SCORE", "0.70") or 0.70)
+        self.scale_in_max_risk_score = float(os.getenv("TRIWAVE_SCALE_IN_MAX_RISK_SCORE", "0.25") or 0.25)
+        self.scale_in_min_edge = float(os.getenv("TRIWAVE_SCALE_IN_MIN_EDGE", "0.45") or 0.45)
+        self.scale_in_cooldown_sec = float(os.getenv("TRIWAVE_SCALE_IN_COOLDOWN_SEC", "30") or 30)
+        self.scale_in_fresh_ltp_max_age_sec = float(os.getenv("TRIWAVE_SCALE_IN_FRESH_LTP_MAX_AGE_SEC", "5") or 5)
         self.stale_exit_quarantine_sec = float(os.getenv("TRIWAVE_STALE_EXIT_QUARANTINE_SEC", "600") or 600)
         self.pair_stale_entry_quarantine_sec = float(os.getenv("TRIWAVE_PAIR_STALE_ENTRY_QUARANTINE_SEC", "120") or 120)
         self.pair_stale_resubscribe_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_SEC", "45") or 45)
@@ -851,6 +859,78 @@ class TradingRuntimeCoordinator:
             details,
         )
 
+    def _try_tri_wave_scale_in(self, pair: PairRuntimeState, side: str, secid: Optional[int], ltp: float, signal, raw: dict, tri_meta: dict) -> bool:
+        if not self.scale_in_enabled or not secid or secid not in self.paper_trader.positions:
+            return False
+
+        position = self.paper_trader.positions.get(secid, {})
+        current_lots = int(position.get("lots", 0) or 0)
+        if current_lots >= self.scale_in_max_lots:
+            self._log_tri_wave_entry_quality_block(pair.index, side, "SCALE_IN_MAX_LOTS", secid=secid, lots=current_lots, max_lots=self.scale_in_max_lots)
+            return False
+
+        now = time.time()
+        last_add_ts = float(position.get("last_add_ts", position.get("entry_ts", 0.0)) or 0.0)
+        if last_add_ts and now - last_add_ts < self.scale_in_cooldown_sec:
+            self._log_tri_wave_entry_quality_block(pair.index, side, "SCALE_IN_COOLDOWN", secid=secid, elapsed=round(now - last_add_ts, 2), required=self.scale_in_cooldown_sec)
+            return False
+
+        ltp_ts = float(self.option_ltp_last_ts_by_secid.get(int(secid), 0.0) or 0.0)
+        ltp_age = now - ltp_ts if ltp_ts else None
+        if not ltp_ts or ltp_age is None or ltp_age > self.scale_in_fresh_ltp_max_age_sec:
+            self._log_tri_wave_entry_quality_block(pair.index, side, "SCALE_IN_STALE_LTP", secid=secid, ltp_age=self._fmt_age(ltp_age), max_age=self.scale_in_fresh_ltp_max_age_sec)
+            return False
+
+        entry = float(position.get("entry", 0.0) or 0.0)
+        pnl_pct = ((float(ltp) - entry) / entry) * 100.0 if entry > 0 else 0.0
+        if pnl_pct < self.scale_in_min_profit_pct:
+            self._log_tri_wave_entry_quality_block(pair.index, side, "SCALE_IN_NOT_IN_PROFIT", secid=secid, pnl_pct=round(pnl_pct, 3), required=self.scale_in_min_profit_pct)
+            return False
+
+        stats = self._side_state_stats(pair.index, side)
+        support = float(stats.get("dynamic_support_score", 0.0) or 0.0)
+        risk = float(stats.get("dynamic_risk_score", 0.0) or 0.0)
+        edge = float(stats.get("dynamic_edge", 0.0) or 0.0)
+        if support < self.scale_in_min_support_score or risk > self.scale_in_max_risk_score or edge < self.scale_in_min_edge:
+            self._log_tri_wave_entry_quality_block(
+                pair.index,
+                side,
+                "SCALE_IN_WEAK_EDGE",
+                secid=secid,
+                support=support,
+                risk=risk,
+                edge=edge,
+                required_support=self.scale_in_min_support_score,
+                max_risk=self.scale_in_max_risk_score,
+                required_edge=self.scale_in_min_edge,
+            )
+            return False
+
+        tag = f"{pair.index}_{side}"
+        accepted = self.paper_trader.on_entry(
+            int(secid),
+            tag,
+            "LONG",
+            float(ltp),
+            lots=1,
+            reason=f"TRI_WAVE_SCALE_IN:{signal.reason}",
+            metadata=tri_meta,
+        )
+        if accepted:
+            logger.info(
+                "TRI_WAVE_SCALE_IN_COMMITTED | %s | ltp=%.2f | lots=%s | pnl_pct=%.2f | support=%.2f | risk=%.2f | edge=%.2f | reason=%s",
+                tag,
+                float(ltp),
+                int(self.paper_trader.positions.get(int(secid), {}).get("lots", current_lots)),
+                pnl_pct,
+                support,
+                risk,
+                edge,
+                signal.reason,
+            )
+            self._record_tri_wave_portfolio_snapshot(pair.index)
+        return bool(accepted)
+
     def _execute_tri_wave_signal(self, pair: PairRuntimeState, signal, raw: dict) -> bool:
         action = signal.action
         if action == "NO_TRADE":
@@ -876,6 +956,8 @@ class TradingRuntimeCoordinator:
             secid = pair.ce_id
             tag = f"{pair.index}_CE"
             ltp = pair._best_leg_ltp(pair.ce_depth, pair.ce_ltp, raw.get("ltp", 0))
+            if secid in self.paper_trader.positions:
+                return self._try_tri_wave_scale_in(pair, "CE", secid, float(ltp), signal, raw, tri_meta)
             if not self._tri_wave_entry_quality_gate(pair, "CE", secid, float(ltp), signal):
                 return False
             accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=signal.reason, metadata=tri_meta)
@@ -894,6 +976,8 @@ class TradingRuntimeCoordinator:
             secid = pair.pe_id
             tag = f"{pair.index}_PE"
             ltp = pair._best_leg_ltp(pair.pe_depth, pair.pe_ltp, raw.get("ltp", 0))
+            if secid in self.paper_trader.positions:
+                return self._try_tri_wave_scale_in(pair, "PE", secid, float(ltp), signal, raw, tri_meta)
             if not self._tri_wave_entry_quality_gate(pair, "PE", secid, float(ltp), signal):
                 return False
             accepted = self.paper_trader.on_entry(secid, tag, "LONG", float(ltp), lots=1, reason=signal.reason, metadata=tri_meta)
