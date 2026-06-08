@@ -143,6 +143,7 @@ class TradingRuntimeCoordinator:
         self._last_pair_resubscribe_ts = defaultdict(float)
         self._last_entry_stale_log_ts = defaultdict(float)
         self._last_depth_ltp_fallback_log_ts = defaultdict(float)
+        self._recovery_fresh_since_ts = defaultdict(float)
         self._last_entry_cooldown_log_ts = defaultdict(float)
         self._last_entry_quality_log_ts = defaultdict(float)
         self._last_option_chain_health_log_ts = defaultdict(float)
@@ -185,6 +186,7 @@ class TradingRuntimeCoordinator:
         )
         self.stale_exit_quarantine_sec = float(os.getenv("TRIWAVE_STALE_EXIT_QUARANTINE_SEC", "600") or 600)
         self.pair_stale_entry_quarantine_sec = float(os.getenv("TRIWAVE_PAIR_STALE_ENTRY_QUARANTINE_SEC", "120") or 120)
+        self.pair_stale_recovery_clear_fresh_sec = float(os.getenv("TRIWAVE_PAIR_STALE_RECOVERY_CLEAR_FRESH_SEC", "3") or 3)
         self.pair_stale_resubscribe_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_SEC", "45") or 45)
         self.pair_stale_resubscribe_cooldown_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_COOLDOWN_SEC", "45") or 45)
         self.premium_rebuild_enabled = str(os.getenv("PREMIUM_STREAM_REBUILD_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
@@ -658,8 +660,18 @@ class TradingRuntimeCoordinator:
             pair = self.pairs.get(index)
             if pair is None:
                 return
+            side = "CE" if int(secid) == pair.ce_id else "PE" if int(secid) == pair.pe_id else None
+            if side is None:
+                logger.info(
+                    "TRI_WAVE_STALE_OPTION_PACKET_IGNORED | index=%s | secid=%s | tag=%s | current_ce=%s | current_pe=%s | source=FULL_QUOTE",
+                    index,
+                    secid,
+                    tag,
+                    pair.ce_id,
+                    pair.pe_id,
+                )
+                return
             if float(ltp or 0.0) > 0:
-                side = "CE" if int(secid) == pair.ce_id else "PE" if int(secid) == pair.pe_id else None
                 self._mark_option_ltp_fresh(
                     secid=int(secid),
                     ltp=float(ltp),
@@ -724,6 +736,16 @@ class TradingRuntimeCoordinator:
 
         with self._lock:
             side = "CE" if secid == pair.ce_id else "PE" if secid == pair.pe_id else None
+            if side is None:
+                logger.info(
+                    "TRI_WAVE_STALE_OPTION_PACKET_IGNORED | index=%s | secid=%s | tag=%s | current_ce=%s | current_pe=%s | source=DEPTH",
+                    index,
+                    secid,
+                    tag,
+                    pair.ce_id,
+                    pair.pe_id,
+                )
+                return
             now_ts = time.time()
             ws_ltp = pair.ce_ltp if secid == pair.ce_id else pair.pe_ltp if secid == pair.pe_id else None
             ws_ltp_ts = float(self.option_ltp_last_ts_by_secid.get(secid, 0.0) or 0.0)
@@ -877,10 +899,51 @@ class TradingRuntimeCoordinator:
         if reason.startswith(reason_prefix):
             self.tri_wave_data_quarantine_until[index] = 0.0
             self.tri_wave_data_quarantine_reason[index] = ""
+            self._recovery_fresh_since_ts[index] = 0.0
+
+    def _maybe_clear_pair_stale_recovery_quarantine(
+        self,
+        index: str,
+        pair: PairRuntimeState,
+        now: Optional[float] = None,
+    ) -> bool:
+        now = time.time() if now is None else now
+        reason = str(self.tri_wave_data_quarantine_reason.get(index, ""))
+        quarantine_until = float(self.tri_wave_data_quarantine_until.get(index, 0.0) or 0.0)
+        if reason != "PAIR_STALE_RECOVERY" or quarantine_until <= now:
+            self._recovery_fresh_since_ts[index] = 0.0
+            return False
+
+        freshness = PairFreshness(
+            ce_age=self._option_ltp_age(pair.ce_id, now),
+            pe_age=self._option_ltp_age(pair.pe_id, now),
+            max_age_sec=self.entry_pair_fresh_ltp_max_age_sec,
+        )
+        if not freshness.is_fresh:
+            self._recovery_fresh_since_ts[index] = 0.0
+            return False
+
+        fresh_since = float(self._recovery_fresh_since_ts.get(index, 0.0) or 0.0)
+        if fresh_since <= 0:
+            self._recovery_fresh_since_ts[index] = now
+            return False
+        if now - fresh_since < self.pair_stale_recovery_clear_fresh_sec:
+            return False
+
+        self._clear_tri_wave_data_quarantine(index, "PAIR_STALE_RECOVERY")
+        logger.info(
+            "TRI_WAVE_PAIR_STALE_RECOVERY_CLEARED | index=%s | ce_age=%s | pe_age=%s | fresh_for=%.1fs",
+            index,
+            self._fmt_age(freshness.ce_age),
+            self._fmt_age(freshness.pe_age),
+            now - fresh_since,
+        )
+        return True
 
     def _tri_wave_entry_quality_gate(self, pair: PairRuntimeState, side: str, secid: Optional[int], ltp: float, signal) -> bool:
         index = pair.index
         now = time.time()
+        self._maybe_clear_pair_stale_recovery_quarantine(index, pair, now)
         quarantine_until = float(self.tri_wave_data_quarantine_until.get(index, 0.0) or 0.0)
         if quarantine_until > now:
             self._log_tri_wave_entry_quality_block(
@@ -1359,6 +1422,7 @@ class TradingRuntimeCoordinator:
         profile_states = []
 
         for index, pair in self.pairs.items():
+            self._maybe_clear_pair_stale_recovery_quarantine(index, pair, now_ts)
             ce_age = self._option_ltp_age(pair.ce_id, now_ts)
             pe_age = self._option_ltp_age(pair.pe_id, now_ts)
             cooldown = self._tri_wave_cooldown_status(index, now_ts)
