@@ -138,9 +138,11 @@ class TradingRuntimeCoordinator:
         self.option_last_tick_ts_by_secid = {}
         self.option_ltp_last_ts_by_secid = {}
         self.option_ltp_last_value_by_secid = {}
+        self.option_ltp_source_by_secid = {}
         self._last_pair_stale_log_ts = defaultdict(float)
         self._last_pair_resubscribe_ts = defaultdict(float)
         self._last_entry_stale_log_ts = defaultdict(float)
+        self._last_depth_ltp_fallback_log_ts = defaultdict(float)
         self._last_entry_cooldown_log_ts = defaultdict(float)
         self._last_entry_quality_log_ts = defaultdict(float)
         self._last_option_chain_health_log_ts = defaultdict(float)
@@ -149,6 +151,8 @@ class TradingRuntimeCoordinator:
         self.stale_position_check_sec = float(os.getenv("STALE_POSITION_CHECK_SEC", "5") or 5)
         self.entry_fresh_ltp_max_age_sec = float(os.getenv("ENTRY_FRESH_LTP_MAX_AGE_SEC", "20") or 20)
         self.entry_pair_fresh_ltp_max_age_sec = float(os.getenv("ENTRY_PAIR_FRESH_LTP_MAX_AGE_SEC", str(self.entry_fresh_ltp_max_age_sec)) or self.entry_fresh_ltp_max_age_sec)
+        self.entry_depth_ltp_fallback_enabled = str(os.getenv("ENTRY_DEPTH_LTP_FALLBACK_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        self.entry_depth_ltp_max_spread_pct = float(os.getenv("ENTRY_DEPTH_LTP_MAX_SPREAD_PCT", "2.5") or 2.5)
         self.entry_min_dynamic_edge = float(os.getenv("TRIWAVE_ENTRY_MIN_DYNAMIC_EDGE", "0.15") or 0.15)
         self.entry_min_support_score = float(os.getenv("TRIWAVE_ENTRY_MIN_SUPPORT_SCORE", "0.55") or 0.55)
         self.entry_max_risk_score = float(os.getenv("TRIWAVE_ENTRY_MAX_RISK_SCORE", "0.45") or 0.45)
@@ -591,6 +595,60 @@ class TradingRuntimeCoordinator:
             index, new_ce, new_pe
         )
 
+    def _mark_option_ltp_fresh(
+        self,
+        *,
+        secid: int,
+        ltp: float,
+        source: str,
+        pair: Optional[PairRuntimeState] = None,
+        index: Optional[str] = None,
+        side: Optional[str] = None,
+        features: Optional[dict] = None,
+        update_pair_ltp: bool = False,
+    ) -> bool:
+        try:
+            secid = int(secid)
+            ltp = float(ltp or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if ltp <= 0:
+            return False
+
+        source = str(source or "UNKNOWN").upper()
+        if source.startswith("DEPTH") and self.entry_depth_ltp_fallback_enabled:
+            features = features or {}
+            bid = float(features.get("bid_price") or features.get("best_bid") or 0.0)
+            ask = float(features.get("ask_price") or features.get("best_ask") or 0.0)
+            if bid <= 0 or ask <= 0 or ask < bid:
+                return False
+            spread_pct = ((ask - bid) / max(ltp, 1e-9)) * 100.0
+            if spread_pct > self.entry_depth_ltp_max_spread_pct:
+                return False
+        elif source.startswith("DEPTH"):
+            return False
+
+        now_ts = time.time()
+        self.option_ltp_last_ts_by_secid[secid] = now_ts
+        self.option_ltp_last_value_by_secid[secid] = ltp
+        self.option_ltp_source_by_secid[secid] = source
+        if update_pair_ltp and pair is not None:
+            pair.update_option_ltp(secid, ltp)
+
+        if source.startswith("DEPTH"):
+            log_key = f"{index or ''}:{side or ''}:{secid}"
+            if now_ts - self._last_depth_ltp_fallback_log_ts[log_key] >= 60:
+                self._last_depth_ltp_fallback_log_ts[log_key] = now_ts
+                logger.info(
+                    "TRI_WAVE_DEPTH_LTP_FRESHNESS_FALLBACK | index=%s | side=%s | secid=%s | ltp=%.2f | source=%s",
+                    index,
+                    side,
+                    secid,
+                    ltp,
+                    source,
+                )
+        return True
+
     def _on_option_full_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
         self._handle_ws_connected()
         with self._lock:
@@ -600,11 +658,18 @@ class TradingRuntimeCoordinator:
             pair = self.pairs.get(index)
             if pair is None:
                 return
-            pair.update_option_ltp(int(secid), float(ltp))
             if float(ltp or 0.0) > 0:
+                side = "CE" if int(secid) == pair.ce_id else "PE" if int(secid) == pair.pe_id else None
+                self._mark_option_ltp_fresh(
+                    secid=int(secid),
+                    ltp=float(ltp),
+                    source="FULL_QUOTE",
+                    pair=pair,
+                    index=index,
+                    side=side,
+                    update_pair_ltp=True,
+                )
                 now_ts = time.time()
-                self.option_ltp_last_ts_by_secid[int(secid)] = now_ts
-                self.option_ltp_last_value_by_secid[int(secid)] = float(ltp)
                 quarantine_reason = str(self.tri_wave_data_quarantine_reason.get(index, ""))
                 if self.premium_rebuild_pending_until.get(index) or quarantine_reason.startswith("PREMIUM_STREAM"):
                     self._verify_premium_stream_for_index(index, now_ts)
@@ -658,10 +723,31 @@ class TradingRuntimeCoordinator:
             return
 
         with self._lock:
-            ws_ltp = pair.ce_ltp if secid == pair.ce_id else pair.pe_ltp if secid == pair.pe_id else None
-            merged["ltp"] = float(ws_ltp) if ws_ltp and ws_ltp > 0 else merged.get("ltp", raw.get("ltp", 0))
-            merged["feature_source"] = "DEPTH_PLUS_FULL" if full else "DEPTH_ONLY"
             side = "CE" if secid == pair.ce_id else "PE" if secid == pair.pe_id else None
+            now_ts = time.time()
+            ws_ltp = pair.ce_ltp if secid == pair.ce_id else pair.pe_ltp if secid == pair.pe_id else None
+            ws_ltp_ts = float(self.option_ltp_last_ts_by_secid.get(secid, 0.0) or 0.0)
+            ws_ltp_source = str(self.option_ltp_source_by_secid.get(secid, "") or "")
+            ws_ltp_is_fresh = (
+                ws_ltp_source == "FULL_QUOTE"
+                and ws_ltp_ts > 0
+                and now_ts - ws_ltp_ts <= self.entry_pair_fresh_ltp_max_age_sec
+            )
+            if ws_ltp and ws_ltp > 0 and ws_ltp_is_fresh:
+                merged["ltp"] = float(ws_ltp)
+                merged["feature_source"] = "DEPTH_PLUS_FULL"
+            else:
+                merged["ltp"] = float(raw.get("ltp", 0.0) or 0.0)
+                merged["feature_source"] = "DEPTH_LTP_FALLBACK" if self._mark_option_ltp_fresh(
+                    secid=secid,
+                    ltp=float(merged.get("ltp", 0.0) or 0.0),
+                    source=str(raw.get("ltp_source") or "DEPTH_MICROPRICE"),
+                    pair=pair,
+                    index=index,
+                    side=side,
+                    features=merged,
+                    update_pair_ltp=False,
+                ) else "DEPTH_ONLY"
             if self.TRI_WAVE_V2_ONLY_MODE and side:
                 self.tri_wave_recorder.record_tick(index=index, stream=side, secid=int(secid), ltp=float(merged.get("ltp", 0.0) or 0.0), features=dict(merged))
             pair.update_option_depth(secid, merged)
