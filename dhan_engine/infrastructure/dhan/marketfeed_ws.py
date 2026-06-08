@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover - optional dependency path
 
 
 REQ_FULL = 21
+MAX_INSTRUMENTS_PER_SUBSCRIBE_MESSAGE = 100
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +39,8 @@ class DhanLiveMarketFeedWS:
     The websocket thread must stay light. Dhan closes the connection when
     ping/pong is not handled quickly, so strategy callbacks run on a worker.
     """
+    _global_rate_limit_lock = threading.Lock()
+    _global_blocked_until_by_client_id: Dict[str, float] = {}
 
     def __init__(
         self,
@@ -87,7 +90,7 @@ class DhanLiveMarketFeedWS:
         self._manual_reconnect_min_sec = float(os.getenv("FULLQUOTE_MANUAL_RECONNECT_MIN_SEC", "120") or 120)
         self._rate_limit_backoff_sec = float(os.getenv("FULLQUOTE_429_BACKOFF_SEC", "600") or 600)
         self._last_subscription_stale_log_ts = 0.0
-        self._ping_interval = float(os.getenv("FULLQUOTE_WS_PING_INTERVAL", "15") or 15)
+        self._ping_interval = float(os.getenv("FULLQUOTE_WS_PING_INTERVAL", "0") or 0)
         self._ping_timeout = float(os.getenv("FULLQUOTE_WS_PING_TIMEOUT", "8") or 8)
         self._feed_parser = (
             DhanFeed(
@@ -143,8 +146,9 @@ class DhanLiveMarketFeedWS:
 
     def reconnect(self, reason: str = "manual") -> None:
         now = time.time()
-        if now < self._blocked_until_ts:
-            remaining = self._blocked_until_ts - now
+        blocked_until = self._effective_blocked_until()
+        if now < blocked_until:
+            remaining = blocked_until - now
             print(f"FULLQUOTE_FORCE_RECONNECT_SKIPPED | reason={reason} | blocked_for={remaining:.0f}s")
             return
         if now - self._last_manual_reconnect_ts < self._manual_reconnect_min_sec:
@@ -188,7 +192,7 @@ class DhanLiveMarketFeedWS:
 
     def _run_loop(self) -> None:
         while not self._stop.is_set():
-            blocked_for = self._blocked_until_ts - time.time()
+            blocked_for = self._effective_blocked_until() - time.time()
             if blocked_for > 0:
                 wait = min(blocked_for, 30.0)
                 print(f"FULLQUOTE_429_BACKOFF_WAIT | sec={wait:.0f}")
@@ -219,7 +223,7 @@ class DhanLiveMarketFeedWS:
             try:
                 self._ws.run_forever(
                     ping_interval=self._ping_interval,
-                    ping_timeout=self._ping_timeout,
+                    ping_timeout=self._ping_timeout if self._ping_interval > 0 else None,
                 )
             except Exception as exc:
                 print(f"FULLQUOTE_WS_EXCEPTION | error={exc}")
@@ -228,7 +232,7 @@ class DhanLiveMarketFeedWS:
                 break
 
             self._reconnect_attempt += 1
-            blocked_for = self._blocked_until_ts - time.time()
+            blocked_for = self._effective_blocked_until() - time.time()
             wait = min(30, 2 ** min(self._reconnect_attempt, 4))
             if blocked_for > 0:
                 wait = min(max(wait, blocked_for), 30)
@@ -248,26 +252,34 @@ class DhanLiveMarketFeedWS:
         if not subscriptions:
             return
 
-        payload = {
-            "RequestCode": REQ_FULL,
-            "InstrumentCount": len(subscriptions),
-            "InstrumentList": [
-                {
-                    "ExchangeSegment": item["ExchangeSegment"],
-                    "SecurityId": item["SecurityId"],
-                }
-                for item in subscriptions
-            ],
-        }
+        chunks = [
+            subscriptions[start:start + MAX_INSTRUMENTS_PER_SUBSCRIBE_MESSAGE]
+            for start in range(0, len(subscriptions), MAX_INSTRUMENTS_PER_SUBSCRIBE_MESSAGE)
+        ]
+        for idx, chunk in enumerate(chunks, start=1):
+            payload = {
+                "RequestCode": REQ_FULL,
+                "InstrumentCount": len(chunk),
+                "InstrumentList": [
+                    {
+                        "ExchangeSegment": item["ExchangeSegment"],
+                        "SecurityId": item["SecurityId"],
+                    }
+                    for item in chunk
+                ],
+            }
 
-        if self.debug:
-            print("WS_FULLQUOTE_SUB", payload)
+            if self.debug:
+                print("WS_FULLQUOTE_SUB", payload)
 
-        try:
-            print("WS_FULLQUOTE_SUBSCRIBE | count=%s" % payload["InstrumentCount"])
-            self._ws.send(json.dumps(payload))
-        except Exception as exc:
-            print(f"FULLQUOTE_WS_SUBSCRIBE_ERROR | error={exc}")
+            try:
+                print(
+                    "WS_FULLQUOTE_SUBSCRIBE | count=%s | chunk=%s/%s"
+                    % (payload["InstrumentCount"], idx, len(chunks))
+                )
+                self._ws.send(json.dumps(payload))
+            except Exception as exc:
+                print(f"FULLQUOTE_WS_SUBSCRIBE_ERROR | error={exc}")
 
     def _on_open(self, ws) -> None:
         self._connected.set()
@@ -299,11 +311,20 @@ class DhanLiveMarketFeedWS:
         if blocked_until <= self._blocked_until_ts:
             return
         self._blocked_until_ts = blocked_until
+        with self._global_rate_limit_lock:
+            current = float(self._global_blocked_until_by_client_id.get(str(self.client_id), 0.0) or 0.0)
+            if blocked_until > current:
+                self._global_blocked_until_by_client_id[str(self.client_id)] = blocked_until
         self._connected.clear()
         print(
             "FULLQUOTE_429_BACKOFF_ACTIVE | "
             f"backoff_sec={self._rate_limit_backoff_sec:.0f} | error={text[:180]}"
         )
+
+    def _effective_blocked_until(self) -> float:
+        with self._global_rate_limit_lock:
+            global_until = float(self._global_blocked_until_by_client_id.get(str(self.client_id), 0.0) or 0.0)
+        return max(float(self._blocked_until_ts or 0.0), global_until)
 
     def process_data(self, data: bytes):
         if self._feed_parser is None:
