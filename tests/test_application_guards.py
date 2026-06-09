@@ -65,6 +65,76 @@ class RiskManagerTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason, "EXPECTED_NET_BELOW_FEES")
 
+    def test_entry_quality_allows_near_miss_expected_net_with_production_scalp_gate(self):
+        decision = evaluate_entry_quality(
+            stats={
+                "dynamic_support_score": 0.6,
+                "dynamic_risk_score": 0.1,
+                "dynamic_edge": 0.5,
+                "last_5_delta": 1.1,
+                "recent_high": 79.55,
+            },
+            ltp=79.55,
+            lot_size=65,
+            fee=60.0,
+            phase="EXPANSION",
+            config=EntryGateConfig(
+                min_support_score=0.40,
+                max_risk_score=0.45,
+                min_dynamic_edge=0.15,
+                min_expected_net_rupees=80.0,
+                min_expected_move_pct=0.75,
+            ),
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_entry_quality_keeps_blocking_negative_expected_net(self):
+        decision = evaluate_entry_quality(
+            stats={
+                "dynamic_support_score": 0.8,
+                "dynamic_risk_score": 0.1,
+                "dynamic_edge": 0.7,
+                "last_5_delta": 0.35,
+                "recent_high": 76.65,
+            },
+            ltp=76.65,
+            lot_size=65,
+            fee=60.0,
+            phase="RECOVERY",
+            config=EntryGateConfig(
+                min_support_score=0.40,
+                max_risk_score=0.45,
+                min_dynamic_edge=0.15,
+                min_expected_net_rupees=80.0,
+                min_expected_move_pct=0.75,
+            ),
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "EXPECTED_NET_BELOW_FEES")
+
+    def test_entry_quality_allows_lower_support_when_risk_is_clean_and_edge_is_strong(self):
+        decision = evaluate_entry_quality(
+            stats={
+                "dynamic_support_score": 0.4,
+                "dynamic_risk_score": 0.0,
+                "dynamic_edge": 0.4,
+                "last_5_delta": 3.0,
+                "recent_high": 702.7,
+            },
+            ltp=702.7,
+            lot_size=30,
+            fee=60.0,
+            phase="RECOVERY",
+            config=EntryGateConfig(
+                min_support_score=0.40,
+                max_risk_score=0.45,
+                min_dynamic_edge=0.15,
+                min_expected_net_rupees=80.0,
+                min_expected_move_pct=0.75,
+            ),
+        )
+        self.assertTrue(decision.allowed)
+
     def test_scale_in_requires_green_fresh_strong_same_trade(self):
         config = ScaleInGateConfig(
             enabled=True,
