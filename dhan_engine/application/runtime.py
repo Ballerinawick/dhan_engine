@@ -234,6 +234,17 @@ class TradingRuntimeCoordinator:
         self.premium_rebuild_pending_until: Dict[str, float] = defaultdict(float)
         self.premium_rebuild_generation: int = 0
         self.last_premium_stream_rebuild_ts: float = 0.0
+        self.feed_health_log_sec = float(os.getenv("TRIWAVE_FEED_HEALTH_LOG_SEC", "1") or 1)
+        self.stale_entry_block_ms = float(os.getenv("TRIWAVE_STALE_ENTRY_BLOCK_MS", "1500") or 1500)
+        self.feed_slow_feature_ms = float(os.getenv("TRIWAVE_FEATURE_SLOW_MS", "50") or 50)
+        self.feed_slow_decision_ms = float(os.getenv("TRIWAVE_DECISION_SLOW_MS", "50") or 50)
+        self._feed_health_last_log_mono = defaultdict(float)
+        self._feed_health_current_sec = defaultdict(int)
+        self._feed_health_counters = defaultdict(lambda: defaultdict(int))
+        self._feed_health_last_queue_size = defaultdict(int)
+        self._feed_health_queue_growth = defaultdict(int)
+        self._engine_tick_age_ms_by_secid: Dict[int, float] = {}
+        self._last_stale_entry_block_log_mono = defaultdict(float)
 
         self.metrics = {
             "exit_reason_counts": defaultdict(int),
@@ -244,6 +255,12 @@ class TradingRuntimeCoordinator:
 
     def run(self) -> None:
         logger.info("MODE: FUTURE_WS_STREAM + OPTION_WS_STREAM + OPTION_DEPTH_STREAM")
+        logger.info(
+            "THREAD_HEALTH | stage=startup | active_thread_count=%s | indexes=%s | stale_entry_block_ms=%.1f",
+            threading.active_count(),
+            ",".join(self.settings.indexes),
+            self.stale_entry_block_ms,
+        )
         logger.info("TRI_WAVE_BRAIN_VERSION | production_dynamic_exit_v3 | owner_locked=True | legacy_exit_skip=True | weak_exit_removed=True | static_40s_disabled_for_triwave=True")
         if self.TRI_WAVE_V2_ONLY_MODE:
             logger.info("TRI_WAVE_V2_ONLY_MODE_ACTIVE")
@@ -364,6 +381,113 @@ class TradingRuntimeCoordinator:
             self.ws_retry_delay = 5
             self.ws_blocked_until = 0
             logger.info("✅ WS_CONNECTED | retry_reset")
+
+    @staticmethod
+    def _diag_from_depth(depth) -> dict:
+        return dict(getattr(depth, "diag", None) or {})
+
+    def _feed_key(self, index: str, side: Optional[str], secid: int) -> str:
+        return f"{index}:{side or 'UNKNOWN'}:{int(secid)}"
+
+    def _bump_feed_counter(self, key: str, name: str, count: int = 1) -> None:
+        sec = int(time.time())
+        if self._feed_health_current_sec[key] != sec:
+            self._feed_health_current_sec[key] = sec
+            self._feed_health_counters[key] = defaultdict(int)
+        self._feed_health_counters[key][name] += int(count)
+
+    def _observe_feed_health(
+        self,
+        *,
+        index: str,
+        side: Optional[str],
+        secid: int,
+        source: str,
+        diag: Optional[dict] = None,
+        feature_duration_ms: Optional[float] = None,
+        decision_duration_ms: Optional[float] = None,
+        engine_start_mono: Optional[float] = None,
+        count_engine_tick: bool = True,
+        emit_log: bool = True,
+    ) -> float:
+        now_mono = time.monotonic()
+        diag = dict(diag or {})
+        raw_mono = float(diag.get("raw_received_mono") or now_mono)
+        parsed_mono = float(diag.get("parsed_mono") or raw_mono)
+        engine_mono = float(engine_start_mono or now_mono)
+        raw_age_ms = max((now_mono - raw_mono) * 1000.0, 0.0)
+        parsed_age_ms = max((now_mono - parsed_mono) * 1000.0, 0.0)
+        feature_age_ms = max((now_mono - float(diag.get("feature_mono") or parsed_mono)) * 1000.0, 0.0)
+        engine_age_ms = max((now_mono - engine_mono) * 1000.0, 0.0)
+        engine_delay_from_raw_ms = max((engine_mono - raw_mono) * 1000.0, 0.0)
+        key = self._feed_key(index, side, secid)
+        queue_size = int(diag.get("queue_size") or 0)
+        previous_queue_size = int(self._feed_health_last_queue_size.get(key, 0) or 0)
+        self._feed_health_last_queue_size[key] = queue_size
+        self._feed_health_queue_growth[key] += max(queue_size - previous_queue_size, 0)
+        self._engine_tick_age_ms_by_secid[int(secid)] = raw_age_ms
+        if count_engine_tick:
+            self._bump_feed_counter(key, "engine_ticks")
+
+        if emit_log and now_mono - self._feed_health_last_log_mono[key] >= self.feed_health_log_sec:
+            self._feed_health_last_log_mono[key] = now_mono
+            counters = dict(self._feed_health_counters.get(key, {}))
+            logger.info(
+                "FEED_HEALTH | index=%s | side=%s | secid=%s | source=%s | connection_id=%s | "
+                "raw_age_ms=%.1f | parsed_age_ms=%.1f | feature_age_ms=%.1f | engine_age_ms=%.1f | "
+                "engine_delay_from_raw_ms=%.1f | queue_size=%s | queue_max_size=%s | queue_backlog_growth=%s | "
+                "ticks_received_per_sec=%s | ticks_parsed_per_sec=%s | ticks_processed_by_engine_per_sec=%s | "
+                "feature_extraction_duration_ms=%.1f | decision_engine_duration_ms=%.1f | lock_wait_duration_ms=%.1f | "
+                "exception_count=%s | dropped_tick_count=%s | stale_tick_count=%s | active_thread_count=%s",
+                index,
+                side,
+                secid,
+                source,
+                diag.get("connection_id", "unknown"),
+                raw_age_ms,
+                parsed_age_ms,
+                feature_age_ms,
+                engine_age_ms,
+                engine_delay_from_raw_ms,
+                queue_size,
+                diag.get("queue_max_size", "unknown"),
+                self._feed_health_queue_growth[key],
+                counters.get("raw_ticks", 0),
+                counters.get("parsed_ticks", 0),
+                counters.get("engine_ticks", 0),
+                float(feature_duration_ms or diag.get("feature_duration_ms") or 0.0),
+                float(decision_duration_ms or 0.0),
+                float(diag.get("lock_wait_duration_ms") or 0.0),
+                diag.get("exception_count", 0),
+                diag.get("dropped_tick_count", 0),
+                counters.get("stale_ticks", 0),
+                threading.active_count(),
+            )
+            self._feed_health_queue_growth[key] = 0
+        return raw_age_ms
+
+    def _entry_data_is_fresh_for_engine(self, index: str, side: str, secid: Optional[int], ltp: float) -> bool:
+        if not secid:
+            return False
+        age_ms = self._engine_tick_age_ms_by_secid.get(int(secid))
+        if age_ms is None or age_ms <= self.stale_entry_block_ms:
+            return True
+        key = f"{index}:{side}:{secid}"
+        now_mono = time.monotonic()
+        self._bump_feed_counter(self._feed_key(index, side, int(secid)), "stale_ticks")
+        if now_mono - self._last_stale_entry_block_log_mono[key] >= 1.0:
+            self._last_stale_entry_block_log_mono[key] = now_mono
+            logger.warning(
+                "STALE_DATA_ENTRY_BLOCKED | index=%s | side=%s | secid=%s | ltp=%.2f | "
+                "engine_tick_age_ms=%.1f | max_age_ms=%.1f",
+                index,
+                side,
+                secid,
+                float(ltp or 0.0),
+                float(age_ms),
+                self.stale_entry_block_ms,
+            )
+        return False
 
     def _all_underlyings_ready(self) -> bool:
         with self._lock:
@@ -653,7 +777,9 @@ class TradingRuntimeCoordinator:
 
     def _on_option_full_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
         self._handle_ws_connected()
+        lock_wait_start_mono = time.monotonic()
         with self._lock:
+            lock_wait_duration_ms = (time.monotonic() - lock_wait_start_mono) * 1000.0
             index = self.option_index_by_secid.get(int(secid))
             if index is None:
                 index = str(tag).split("_")[0].upper()
@@ -688,6 +814,8 @@ class TradingRuntimeCoordinator:
 
             features = dict(getattr(depth, "features", None) or {})
             raw_full = dict(getattr(depth, "raw", None) or {})
+            diag = self._diag_from_depth(depth)
+            diag["lock_wait_duration_ms"] = lock_wait_duration_ms
             self.latest_full_features_by_secid[int(secid)] = dict(features)
             self.latest_full_raw_by_secid[int(secid)] = dict(raw_full)
 
@@ -701,7 +829,12 @@ class TradingRuntimeCoordinator:
             merged["tag"] = str(tag)
             merged["ts"] = time.time()
             merged["feature_source"] = "FULL_QUOTE_PRIMARY"
+            merged["_diag"] = dict(diag)
             side = "CE" if int(secid) == pair.ce_id else "PE" if int(secid) == pair.pe_id else None
+            if side:
+                feed_key = self._feed_key(index, side, int(secid))
+                self._bump_feed_counter(feed_key, "raw_ticks")
+                self._bump_feed_counter(feed_key, "parsed_ticks")
             if self.TRI_WAVE_V2_ONLY_MODE and side:
                 self.tri_wave_recorder.record_tick(index=index, stream=side, secid=int(secid), ltp=float(ltp), features=dict(merged))
             self._process_option_update(index, pair, int(secid), str(tag), merged)
@@ -710,9 +843,21 @@ class TradingRuntimeCoordinator:
         if not self.market_open():
             return
 
+        raw_mono = time.monotonic()
+        feature_start_mono = time.monotonic()
         raw = self.feature_builder.build(secid, bid, ask)
+        feature_done_mono = time.monotonic()
         if not raw:
             return
+        feature_duration_ms = (feature_done_mono - feature_start_mono) * 1000.0
+        if feature_duration_ms > self.feed_slow_feature_ms:
+            logger.warning(
+                "FEATURE_EXTRACTION_SLOW | secid=%s | tag=%s | duration_ms=%.1f | threshold_ms=%.1f",
+                secid,
+                tag,
+                feature_duration_ms,
+                self.feed_slow_feature_ms,
+            )
 
         secid = int(secid)
         self.latest_depth_features_by_secid[secid] = dict(raw)
@@ -726,6 +871,15 @@ class TradingRuntimeCoordinator:
         merged["secid"] = secid
         merged["tag"] = str(tag)
         merged["ts"] = time.time()
+        merged["_diag"] = {
+            "connection_id": "DEPTH",
+            "raw_received_mono": raw_mono,
+            "parsed_mono": feature_done_mono,
+            "feature_mono": feature_done_mono,
+            "feature_duration_ms": feature_duration_ms,
+            "queue_size": 0,
+            "queue_max_size": "unbounded",
+        }
 
         index = self.option_index_by_secid.get(int(secid))
         if index is None:
@@ -734,7 +888,9 @@ class TradingRuntimeCoordinator:
         if pair is None:
             return
 
+        lock_wait_start_mono = time.monotonic()
         with self._lock:
+            lock_wait_duration_ms = (time.monotonic() - lock_wait_start_mono) * 1000.0
             side = "CE" if secid == pair.ce_id else "PE" if secid == pair.pe_id else None
             if side is None:
                 logger.info(
@@ -746,6 +902,10 @@ class TradingRuntimeCoordinator:
                     pair.pe_id,
                 )
                 return
+            feed_key = self._feed_key(index, side, secid)
+            self._bump_feed_counter(feed_key, "raw_ticks")
+            self._bump_feed_counter(feed_key, "parsed_ticks")
+            merged["_diag"]["lock_wait_duration_ms"] = lock_wait_duration_ms
             now_ts = time.time()
             ws_ltp = pair.ce_ltp if secid == pair.ce_id else pair.pe_ltp if secid == pair.pe_id else None
             ws_ltp_ts = float(self.option_ltp_last_ts_by_secid.get(secid, 0.0) or 0.0)
@@ -955,6 +1115,9 @@ class TradingRuntimeCoordinator:
                 remaining=quarantine_until - now,
                 quarantine_reason=self.tri_wave_data_quarantine_reason.get(index, "UNKNOWN"),
             )
+            return False
+
+        if not self._entry_data_is_fresh_for_engine(index, side, secid, ltp):
             return False
 
         if not self._is_option_ltp_fresh(index, side, secid):
@@ -1478,6 +1641,9 @@ class TradingRuntimeCoordinator:
     def _process_option_update(self, index: str, pair: PairRuntimeState, secid: int, tag: str, raw: dict) -> None:
         if not self.market_open():
             return
+        engine_start_mono = time.monotonic()
+        diag = dict(raw.get("_diag") or {})
+        feature_duration_ms = float(diag.get("feature_duration_ms") or 0.0)
         self.option_last_tick_ts_by_secid[int(secid)] = time.time()
         self._log_pair_stale_if_needed(index, pair)
 
@@ -1536,7 +1702,40 @@ class TradingRuntimeCoordinator:
 
         if pair.is_ready():
             active_position = self._get_active_position_for_pair(pair)
+            self._observe_feed_health(
+                index=index,
+                side=side,
+                secid=int(secid),
+                source=str(raw.get("feature_source") or "UNKNOWN"),
+                diag=diag,
+                feature_duration_ms=feature_duration_ms,
+                decision_duration_ms=0.0,
+                engine_start_mono=engine_start_mono,
+                count_engine_tick=False,
+                emit_log=False,
+            )
+            decision_start_mono = time.monotonic()
             tri_signal = self.tri_wave_v2_brain.evaluate(pair.index, active_position=active_position) if self.TRI_WAVE_V2_ONLY_MODE else self.tri_wave_brain.evaluate(pair.index, active_position=active_position)
+            decision_duration_ms = (time.monotonic() - decision_start_mono) * 1000.0
+            if decision_duration_ms > self.feed_slow_decision_ms:
+                logger.warning(
+                    "DECISION_ENGINE_SLOW | index=%s | side=%s | secid=%s | duration_ms=%.1f | threshold_ms=%.1f",
+                    index,
+                    side,
+                    secid,
+                    decision_duration_ms,
+                    self.feed_slow_decision_ms,
+                )
+            self._observe_feed_health(
+                index=index,
+                side=side,
+                secid=int(secid),
+                source=str(raw.get("feature_source") or "UNKNOWN"),
+                diag=diag,
+                feature_duration_ms=feature_duration_ms,
+                decision_duration_ms=decision_duration_ms,
+                engine_start_mono=engine_start_mono,
+            )
             if self.TRI_WAVE_V2_ONLY_MODE:
                 try:
                     snapshot = self.tri_wave_v2_brain.get_state_snapshot(pair.index, active_position=active_position)

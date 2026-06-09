@@ -32,6 +32,11 @@ class FullDepth:
         self._first_binary_logged = False
         self._last_message_ts = 0.0
         self._connected_ts = 0.0
+        self._connection_seq = 0
+        self._connection_id = ""
+        self._last_queue_health_ts = 0.0
+        self._queue_high_watermark = 0
+        self._dropped_payload_count = 0
 
     @staticmethod
     def _normalize_exchange_segment(segment) -> str:
@@ -60,6 +65,10 @@ class FullDepth:
             self._queue = asyncio.Queue()
 
         if self._ws_thread and self._ws_thread.is_alive():
+            print(
+                "DUPLICATE_THREAD_WARNING | feed=DEPTH | "
+                f"thread={self._ws_thread.name} | active_thread_count={threading.active_count()}"
+            )
             if not self._connected_evt.is_set():
                 connected = await asyncio.to_thread(self._connected_evt.wait, 8.0)
                 if not connected:
@@ -113,15 +122,25 @@ class FullDepth:
 
     def _merge_subscriptions(self, instruments) -> List[Tuple[str, str]]:
         new_items: List[Tuple[str, str]] = []
+        duplicate_count = 0
         with self._subscription_lock:
             for seg, secid in instruments or []:
                 normalized = self._normalize_exchange_segment(seg)
                 key = (normalized, str(secid))
                 if key in self._sub_keys:
+                    duplicate_count += 1
                     continue
                 self._sub_keys.add(key)
                 self._subscribed.append(key)
                 new_items.append(key)
+            total_subscribed = len(self._subscribed)
+            total_unique = len(self._sub_keys)
+        if duplicate_count:
+            print(
+                "DUPLICATE_SUBSCRIPTION_WARNING | feed=DEPTH | "
+                f"duplicates={duplicate_count} | subscribed_instrument_count={total_subscribed} | "
+                f"unique_subscribed_instrument_keys={total_unique}"
+            )
         return new_items
 
     async def disconnect(self):
@@ -181,11 +200,22 @@ class FullDepth:
             if self._stop_evt.is_set():
                 break
 
+            print(
+                "WS_RECONNECT | feed=DEPTH | "
+                f"connection_id={self._connection_id or 'unknown'} | reconnect_count={self._connection_seq}"
+            )
             time.sleep(2.0)
 
     def _on_open(self, ws):
         self._connected_evt.set()
         self._connected_ts = time.time()
+        self._connection_seq += 1
+        self._connection_id = f"DEPTH-{id(self)}-{self._connection_seq}"
+        print(
+            "WS_CONNECTION_OPENED | feed=DEPTH | "
+            f"connection_id={self._connection_id} | reconnect_count={self._connection_seq - 1} | "
+            f"active_thread_count={threading.active_count()}"
+        )
         print("DEPTH WS CONNECTED")
 
         if self._subscribed:
@@ -227,12 +257,42 @@ class FullDepth:
 
     def _push_async(self, payload):
         if self._loop is None or self._queue is None or self._loop.is_closed():
+            self._dropped_payload_count += 1
             return
         self._loop.call_soon_threadsafe(self._queue.put_nowait, payload)
+        try:
+            queue_size = int(self._queue.qsize())
+        except Exception:
+            queue_size = -1
+        if queue_size > self._queue_high_watermark:
+            self._queue_high_watermark = queue_size
+        now = time.time()
+        if now - self._last_queue_health_ts >= 1.0:
+            self._last_queue_health_ts = now
+            print(
+                "QUEUE_HEALTH | feed=DEPTH | "
+                f"connection_id={self._connection_id or 'pending'} | queue_size={queue_size} | "
+                f"queue_max_size=unbounded | queue_high_watermark={self._queue_high_watermark} | "
+                f"dropped_tick_count={self._dropped_payload_count}"
+            )
 
     def _send_subscription_now(self, instruments) -> bool:
         if not instruments:
             return False
+        unique_keys = {
+            (self._normalize_exchange_segment(seg), str(secid))
+            for seg, secid in instruments
+        }
+        with self._subscription_lock:
+            total_subscribed = len(self._subscribed)
+            total_unique = len(self._sub_keys)
+        print(
+            "WS_SUBSCRIPTION_SNAPSHOT | feed=DEPTH | "
+            f"connection_id={self._connection_id or 'pending'} | "
+            f"subscribed_instrument_count={total_subscribed} | "
+            f"message_instrument_count={len(instruments)} | unique_message_keys={len(unique_keys)} | "
+            f"unique_subscribed_instrument_keys={total_unique}"
+        )
 
         payload = {
             "RequestCode": 23,
