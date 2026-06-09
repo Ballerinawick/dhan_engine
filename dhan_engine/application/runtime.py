@@ -567,7 +567,10 @@ class TradingRuntimeCoordinator:
             len(all_subscriptions),
         )
         self._start_option_streams()
-        self.option_quote_stream.subscribe(all_subscriptions)
+        if hasattr(self.option_quote_stream, "replace_subscriptions"):
+            self.option_quote_stream.replace_subscriptions(all_subscriptions, reason="initial_option_pair_selection")
+        else:
+            self.option_quote_stream.subscribe(all_subscriptions)
         self.option_depth_stream.subscribe(all_subscriptions)
 
     def on_future_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
@@ -704,10 +707,10 @@ class TradingRuntimeCoordinator:
         if subscriptions:
             if self.option_depth_stream is not None:
                 self.option_depth_stream.subscribe(subscriptions)
-            if self.option_quote_stream is not None:
-                self.option_quote_stream.subscribe(subscriptions)
             for secid, mapped_tag in subscriptions:
                 self.full_quote_secid_tag[secid] = mapped_tag
+            if self.option_quote_stream is not None:
+                self._rebuild_option_quote_stream(index, reason=f"pair_reselected:{index}")
 
         self.last_selected_underlying[index] = float(pair.underlying_ltp)
         self.last_reselection_ts = time.time()
@@ -1924,7 +1927,10 @@ class TradingRuntimeCoordinator:
             self.option_quote_stream = new_stream
             self._option_streams_started = True
             new_stream.start()
-            new_stream.subscribe(subscriptions)
+            if hasattr(new_stream, "replace_subscriptions"):
+                new_stream.replace_subscriptions(subscriptions, reason=f"premium_rebuild:{reason}")
+            else:
+                new_stream.subscribe(subscriptions)
         except Exception:
             logger.exception("PREMIUM_STREAM_REBUILD_FAILED | trigger_index=%s | reason=%s", trigger_index, reason)
             self.option_quote_stream = old_stream
@@ -2023,11 +2029,8 @@ class TradingRuntimeCoordinator:
         )
         try:
             if self.option_quote_stream is not None:
-                self.option_quote_stream.subscribe(subscriptions)
                 if self.pair_stale_reconnect_enabled and hasattr(self.option_quote_stream, "reconnect_for_subscriptions"):
                     self.option_quote_stream.reconnect_for_subscriptions(subscriptions, reason=f"pair_stale:{index}")
-            if self.option_depth_stream is not None:
-                self.option_depth_stream.subscribe(subscriptions)
         except Exception:
             logger.exception("TRI_WAVE_PAIR_STALE_RECOVERY_FAILED | index=%s", index)
 
