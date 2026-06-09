@@ -155,9 +155,9 @@ class TradingRuntimeCoordinator:
         self.entry_depth_ltp_fallback_enabled = str(os.getenv("ENTRY_DEPTH_LTP_FALLBACK_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
         self.entry_depth_ltp_max_spread_pct = float(os.getenv("ENTRY_DEPTH_LTP_MAX_SPREAD_PCT", "2.5") or 2.5)
         self.entry_min_dynamic_edge = float(os.getenv("TRIWAVE_ENTRY_MIN_DYNAMIC_EDGE", "0.15") or 0.15)
-        self.entry_min_support_score = float(os.getenv("TRIWAVE_ENTRY_MIN_SUPPORT_SCORE", "0.55") or 0.55)
+        self.entry_min_support_score = float(os.getenv("TRIWAVE_ENTRY_MIN_SUPPORT_SCORE", "0.40") or 0.40)
         self.entry_max_risk_score = float(os.getenv("TRIWAVE_ENTRY_MAX_RISK_SCORE", "0.45") or 0.45)
-        self.entry_min_expected_net_rupees = float(os.getenv("TRIWAVE_ENTRY_MIN_EXPECTED_NET_RUPEES", "120") or 120)
+        self.entry_min_expected_net_rupees = float(os.getenv("TRIWAVE_ENTRY_MIN_EXPECTED_NET_RUPEES", "80") or 80)
         self.entry_min_expected_move_pct = float(os.getenv("TRIWAVE_ENTRY_MIN_EXPECTED_MOVE_PCT", "0.75") or 0.75)
         self.scale_in_enabled = str(os.getenv("TRIWAVE_SCALE_IN_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
         self.scale_in_max_lots = int(os.getenv("TRIWAVE_SCALE_IN_MAX_LOTS", "2") or 2)
