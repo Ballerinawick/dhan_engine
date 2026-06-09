@@ -204,6 +204,33 @@ class FutureQuoteStream:
         self._ensure_single_client()
         self._client.subscribe_full(instruments)
 
+    def replace_subscriptions(self, subscriptions: Iterable[Tuple[int, str]], reason: str = "runtime_replace") -> None:
+        subscription_list = list(subscriptions)
+        instruments = [
+            {
+                "ExchangeSegment": self.exchange_segment,
+                "SecurityId": str(secid),
+                "tag": tag,
+            }
+            for secid, tag in subscription_list
+        ]
+        is_option_stream = any(not str(tag).upper().endswith("_FUT") for _, tag in subscription_list)
+        if is_option_stream and self._option_shard_count > 1:
+            self._ensure_shards()
+            by_shard: Dict[int, List[Dict[str, str]]] = {idx: [] for idx in range(self._option_shard_count)}
+            for item in instruments:
+                shard_idx = self._shard_for_tag(str(item.get("tag", "")))
+                by_shard[shard_idx].append(item)
+            for shard_idx, shard_instruments in by_shard.items():
+                self._clients[shard_idx].replace_subscriptions(
+                    shard_instruments,
+                    reason=f"{reason}:shard_{shard_idx}",
+                )
+            return
+
+        self._ensure_single_client()
+        self._client.replace_subscriptions(instruments, reason=reason)
+
     def reconnect_for_subscriptions(self, subscriptions: Iterable[Tuple[int, str]], reason: str = "runtime_stale") -> None:
         subscription_list = list(subscriptions)
         if not subscription_list:

@@ -74,6 +74,7 @@ class DhanLiveMarketFeedWS:
         self._last_manual_reconnect_ts = 0.0
         self._blocked_until_ts = 0.0
         self._lock = threading.Lock()
+        self._reconnect_lock = threading.Lock()
         self._callback_condition = threading.Condition()
         self._pending_callbacks: Dict[int, tuple] = {}
         self._message_condition = threading.Condition()
@@ -128,11 +129,7 @@ class DhanLiveMarketFeedWS:
             self._message_condition.notify_all()
         with self._callback_condition:
             self._callback_condition.notify_all()
-        try:
-            if self._ws:
-                self._ws.close()
-        except Exception:
-            pass
+        self._safe_close_ws("close")
 
     def subscribe_full(self, instruments: List[Dict[str, str]]) -> None:
         new_subscriptions: List[Dict[str, str]] = []
@@ -162,6 +159,40 @@ class DhanLiveMarketFeedWS:
         if self._connected.is_set():
             self._send_subscribe(new_subscriptions)
 
+    def replace_subscriptions(self, instruments: List[Dict[str, str]], reason: str = "replace_subscriptions") -> bool:
+        desired: List[Dict[str, str]] = []
+        seen = set()
+        for item in instruments or []:
+            key = (str(item["ExchangeSegment"]), str(item["SecurityId"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            desired.append(dict(item))
+
+        with self._lock:
+            current_keys = set(self._sub_keys)
+            desired_keys = set(seen)
+            changed = current_keys != desired_keys
+            self._subs = list(desired)
+            self._sub_keys = set(desired_keys)
+            self._tags = {
+                int(item["SecurityId"]): item.get("tag", item["SecurityId"])
+                for item in desired
+            }
+            desired_secids = {int(item["SecurityId"]) for item in desired}
+            for secid in list(self._last_subscribe_ts_by_secid):
+                if secid not in desired_secids:
+                    self._last_subscribe_ts_by_secid.pop(secid, None)
+                    self._last_full_data_ts_by_secid.pop(secid, None)
+                    self._previous_features.pop(secid, None)
+
+        print(
+            "FULLQUOTE_SUBSCRIPTION_REPLACED | "
+            f"reason={reason} | changed={changed} | subscribed_instrument_count={len(desired)} | "
+            f"unique_subscribed_instrument_keys={len(desired_keys)}"
+        )
+        return changed
+
     def reconnect(self, reason: str = "manual") -> None:
         now = time.time()
         blocked_until = self._effective_blocked_until()
@@ -173,14 +204,28 @@ class DhanLiveMarketFeedWS:
             remaining = self._manual_reconnect_min_sec - (now - self._last_manual_reconnect_ts)
             print(f"FULLQUOTE_FORCE_RECONNECT_SKIPPED | reason={reason} | cooldown={remaining:.0f}s")
             return
-        self._last_manual_reconnect_ts = now
-        print(f"FULLQUOTE_FORCE_RECONNECT | reason={reason}")
-        self._connected.clear()
+        with self._reconnect_lock:
+            now = time.time()
+            if now - self._last_manual_reconnect_ts < self._manual_reconnect_min_sec:
+                remaining = self._manual_reconnect_min_sec - (now - self._last_manual_reconnect_ts)
+                print(f"FULLQUOTE_FORCE_RECONNECT_SKIPPED | reason={reason} | cooldown={remaining:.0f}s")
+                return
+            self._last_manual_reconnect_ts = now
+            print(f"FULLQUOTE_FORCE_RECONNECT | reason={reason}")
+            self._connected.clear()
+            self._safe_close_ws(reason)
+
+    def _safe_close_ws(self, reason: str) -> None:
+        ws = self._ws
+        if ws is None:
+            print(f"FULLQUOTE_WS_CLOSE_SKIPPED | reason={reason} | state=no_socket")
+            return
         try:
-            if self._ws:
-                self._ws.close()
-        except Exception:
-            pass
+            ws.close()
+        except AttributeError as exc:
+            print(f"FULLQUOTE_WS_CLOSE_SKIPPED | reason={reason} | state=closing | error={exc}")
+        except Exception as exc:
+            print(f"FULLQUOTE_WS_CLOSE_ERROR | reason={reason} | error={exc}")
 
     def _ensure_worker(self) -> None:
         if not (self._worker_thread and self._worker_thread.is_alive()):
