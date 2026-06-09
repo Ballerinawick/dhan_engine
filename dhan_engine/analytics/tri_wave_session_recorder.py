@@ -23,6 +23,7 @@ class TriWaveSessionRecorder:
         self.portfolio_written = 0
         self._last_heartbeat_ts = 0.0
         self.heartbeat_interval_sec = 30.0
+        self.slow_write_ms = float(os.getenv("TRIWAVE_RECORDER_SLOW_WRITE_MS", "25") or 25)
         self.session_date = datetime.now(self.timezone).strftime("%Y-%m-%d")
         self.session_dir = os.path.join(self.base_dir, self.session_date, f"expiry={self.expiry_key}")
         persistent_hint = "VOLUME_OR_EXTERNAL" if self.base_dir.startswith("/data") or self.base_dir.startswith("/mnt") else "EPHEMERAL_CONTAINER"
@@ -68,6 +69,7 @@ class TriWaveSessionRecorder:
     def _write(self, filename: str, row: dict) -> bool:
         if not self.enabled:
             return False
+        start = time.monotonic()
         try:
             with self._lock:
                 handle = self._handles.get(filename)
@@ -77,6 +79,14 @@ class TriWaveSessionRecorder:
                     self._handles[filename] = handle
                 handle.write(json.dumps(self._to_safe(row), ensure_ascii=False) + "\n")
                 handle.flush()
+                duration_ms = (time.monotonic() - start) * 1000.0
+                if duration_ms > self.slow_write_ms:
+                    logger.warning(
+                        "DB_WRITE_SLOW | persistence=jsonl | file=%s | duration_ms=%.1f | threshold_ms=%.1f",
+                        filename,
+                        duration_ms,
+                        self.slow_write_ms,
+                    )
                 return True
         except Exception:
             logger.warning("TRI_WAVE_SESSION_RECORDER_WRITE_FAILED | file=%s", filename, exc_info=True)

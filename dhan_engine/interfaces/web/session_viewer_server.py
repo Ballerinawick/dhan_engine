@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
+SLOW_BROADCAST_MS = float(os.getenv("TRIWAVE_BROADCAST_SLOW_MS", "50") or 50)
 
 
 def start_session_viewer_server() -> None:
@@ -161,8 +162,17 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
                 return
 
     def _sse(self, event_name: str, payload: dict) -> None:
+        start = time.monotonic()
         body = f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
         self.wfile.write(body.encode("utf-8"))
+        duration_ms = (time.monotonic() - start) * 1000.0
+        if duration_ms > SLOW_BROADCAST_MS:
+            logger.warning(
+                "BROADCAST_SLOW | event=%s | duration_ms=%.1f | threshold_ms=%.1f",
+                event_name,
+                duration_ms,
+                SLOW_BROADCAST_MS,
+            )
 
     def _stream_session(self, query: dict) -> Path | None:
         date = (query.get("date") or [""])[0]

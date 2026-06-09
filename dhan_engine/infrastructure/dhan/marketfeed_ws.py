@@ -30,6 +30,7 @@ class QuoteDepth:
     ts: float
     raw: Optional[dict] = None
     features: Optional[dict] = None
+    diag: Optional[dict] = None
 
 
 class DhanLiveMarketFeedWS:
@@ -84,6 +85,12 @@ class DhanLiveMarketFeedWS:
         self._feature_log_interval_sec = float(os.getenv("FULLQUOTE_FEATURE_LOG_SEC", "0") or 0)
         self._last_message_ts = 0.0
         self._max_pending_messages = int(os.getenv("FULLQUOTE_MAX_PENDING_MESSAGES", "500") or 500)
+        self._queue_high_watermark = 0
+        self._queue_dropped_count = 0
+        self._exception_count = 0
+        self._last_queue_health_ts = 0.0
+        self._connection_seq = 0
+        self._connection_id = ""
         self._stale_reconnect_sec = float(os.getenv("FULLQUOTE_STALE_RECONNECT_SEC", "45") or 45)
         self._subscription_stale_reconnect_sec = float(os.getenv("FULLQUOTE_SUBSCRIPTION_STALE_RECONNECT_SEC", "0") or 0)
         self._subscription_stale_min_count = int(os.getenv("FULLQUOTE_SUBSCRIPTION_STALE_MIN_COUNT", "2") or 2)
@@ -105,6 +112,10 @@ class DhanLiveMarketFeedWS:
 
     def connect(self) -> None:
         if self._thread and self._thread.is_alive():
+            print(
+                "DUPLICATE_THREAD_WARNING | feed=FULLQUOTE | "
+                f"thread={self._thread.name} | active_thread_count={threading.active_count()}"
+            )
             return
         self._ensure_worker()
         self._ensure_watchdog()
@@ -125,6 +136,7 @@ class DhanLiveMarketFeedWS:
 
     def subscribe_full(self, instruments: List[Dict[str, str]]) -> None:
         new_subscriptions: List[Dict[str, str]] = []
+        duplicate_count = 0
         with self._lock:
             for item in instruments:
                 key = (str(item["ExchangeSegment"]), str(item["SecurityId"]))
@@ -133,12 +145,18 @@ class DhanLiveMarketFeedWS:
                     self._subs.append(subscription)
                     self._sub_keys.add(key)
                     new_subscriptions.append(subscription)
+                else:
+                    duplicate_count += 1
                 secid = int(item["SecurityId"])
                 self._tags[secid] = item.get("tag", item["SecurityId"])
 
         if not new_subscriptions:
-            if self.debug:
-                print("WS_FULLQUOTE_SUBSCRIBE_SKIPPED_DUPLICATE")
+            if duplicate_count:
+                print(
+                    "DUPLICATE_SUBSCRIPTION_WARNING | feed=FULLQUOTE | "
+                    f"duplicates={duplicate_count} | subscribed_instrument_count={len(self._subs)} | "
+                    f"unique_subscribed_instrument_keys={len(self._sub_keys)}"
+                )
             return
 
         if self._connected.is_set():
@@ -236,6 +254,10 @@ class DhanLiveMarketFeedWS:
             wait = min(30, 2 ** min(self._reconnect_attempt, 4))
             if blocked_for > 0:
                 wait = min(max(wait, blocked_for), 30)
+            print(
+                "WS_RECONNECT | feed=FULLQUOTE | "
+                f"connection_id={self._connection_id or 'unknown'} | reconnect_count={self._connection_seq}"
+            )
             print(f"FULLQUOTE_WS_RECONNECT_WAIT | sec={wait}")
             time.sleep(wait)
 
@@ -251,6 +273,21 @@ class DhanLiveMarketFeedWS:
 
         if not subscriptions:
             return
+
+        unique_keys = {
+            (str(item["ExchangeSegment"]), str(item["SecurityId"]))
+            for item in subscriptions
+        }
+        with self._lock:
+            total_unique_keys = len(self._sub_keys)
+            total_subscribed = len(self._subs)
+        print(
+            "WS_SUBSCRIPTION_SNAPSHOT | feed=FULLQUOTE | "
+            f"connection_id={self._connection_id or 'pending'} | "
+            f"subscribed_instrument_count={total_subscribed} | "
+            f"message_instrument_count={len(subscriptions)} | unique_message_keys={len(unique_keys)} | "
+            f"unique_subscribed_instrument_keys={total_unique_keys}"
+        )
 
         chunks = [
             subscriptions[start:start + MAX_INSTRUMENTS_PER_SUBSCRIBE_MESSAGE]
@@ -285,6 +322,13 @@ class DhanLiveMarketFeedWS:
         self._connected.set()
         self._last_connected_ts = time.time()
         self._reconnect_attempt = 0
+        self._connection_seq += 1
+        self._connection_id = f"FULLQUOTE-{id(self)}-{self._connection_seq}"
+        print(
+            "WS_CONNECTION_OPENED | feed=FULLQUOTE | "
+            f"connection_id={self._connection_id} | reconnect_count={self._connection_seq - 1} | "
+            f"active_thread_count={threading.active_count()}"
+        )
         print("WS_FULLQUOTE_CONNECTED")
         self._send_subscribe()
 
