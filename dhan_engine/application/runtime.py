@@ -1943,11 +1943,6 @@ class TradingRuntimeCoordinator:
         for profile in self.settings.indexes:
             self.premium_rebuild_pending_until[profile] = verify_until
             self._replace_tri_wave_data_quarantine(profile, "PREMIUM_STREAM_REBUILD_VERIFY", self.premium_rebuild_verify_sec)
-        if self.option_depth_stream is not None:
-            try:
-                self.option_depth_stream.subscribe(subscriptions)
-            except Exception:
-                logger.exception("PREMIUM_STREAM_REBUILD_DEPTH_RESUB_FAILED | trigger_index=%s", trigger_index)
         logger.warning(
             "PREMIUM_STREAM_REBUILD_DONE | generation=%s | verify_sec=%.1f | subscriptions=%s",
             self.premium_rebuild_generation,
@@ -1955,6 +1950,12 @@ class TradingRuntimeCoordinator:
             len(subscriptions),
         )
         return True
+
+    def _premium_rebuild_verify_remaining(self, now: Optional[float] = None) -> float:
+        now = time.time() if now is None else now
+        pending_until = max((float(until) for until in self.premium_rebuild_pending_until.values()), default=0.0)
+        cooldown_until = float(self.last_premium_stream_rebuild_ts or 0.0) + float(self.premium_rebuild_verify_sec or 0.0)
+        return max(pending_until, cooldown_until) - now
 
     def _verify_premium_stream_for_index(self, index: str, now: Optional[float] = None) -> bool:
         now = time.time() if now is None else now
@@ -2012,6 +2013,18 @@ class TradingRuntimeCoordinator:
         if pair.pe_id:
             subscriptions.append((int(pair.pe_id), f"{index}_PE"))
         if not subscriptions:
+            return
+
+        verify_remaining = self._premium_rebuild_verify_remaining(now)
+        if verify_remaining > 0:
+            self._replace_tri_wave_data_quarantine(index, "PREMIUM_STREAM_REBUILD_VERIFY", verify_remaining)
+            logger.warning(
+                "PREMIUM_STREAM_RECOVERY_SKIPPED | index=%s | reason=rebuild_in_progress_or_verify | generation=%s | verify_remaining=%.1f | subscriptions=%s",
+                index,
+                self.premium_rebuild_generation,
+                verify_remaining,
+                subscriptions,
+            )
             return
 
         self._last_pair_resubscribe_ts[index] = now
