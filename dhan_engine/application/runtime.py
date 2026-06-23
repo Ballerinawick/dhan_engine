@@ -189,6 +189,8 @@ class TradingRuntimeCoordinator:
         self.pair_stale_recovery_clear_fresh_sec = float(os.getenv("TRIWAVE_PAIR_STALE_RECOVERY_CLEAR_FRESH_SEC", "3") or 3)
         self.pair_stale_resubscribe_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_SEC", "45") or 45)
         self.pair_stale_resubscribe_cooldown_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_COOLDOWN_SEC", "45") or 45)
+        self.static_daily_option_pairs = str(os.getenv("OPTION_STATIC_DAILY_PAIRS", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        self.option_reselection_enabled = str(os.getenv("OPTION_RESELECTION_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
         self.premium_rebuild_enabled = str(os.getenv("PREMIUM_STREAM_REBUILD_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
         self.premium_rebuild_attempt_threshold = int(os.getenv("PREMIUM_STREAM_REBUILD_ATTEMPT_THRESHOLD", "2") or 2)
         self.premium_rebuild_window_sec = float(os.getenv("PREMIUM_STREAM_REBUILD_WINDOW_SEC", "300") or 300)
@@ -200,7 +202,8 @@ class TradingRuntimeCoordinator:
         self._last_stale_position_check_ts = 0.0
         self.portfolio_snapshot_interval_sec = float(os.getenv("TRIWAVE_PORTFOLIO_SNAPSHOT_SEC", "5") or 5)
         self._last_portfolio_snapshot_ts = 0.0
-        self.pair_stale_reconnect_enabled = str(os.getenv("PAIR_STALE_RECONNECT_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        pair_stale_reconnect_default = "0" if self.static_daily_option_pairs else "1"
+        self.pair_stale_reconnect_enabled = str(os.getenv("PAIR_STALE_RECONNECT_ENABLED", pair_stale_reconnect_default)).strip().lower() in {"1", "true", "yes", "on"}
         self.active_position_stale_exit_sec = float(os.getenv("ACTIVE_POSITION_STALE_EXIT_SEC", "45") or 45)
 
         self.premium_flow = {
@@ -256,10 +259,13 @@ class TradingRuntimeCoordinator:
     def run(self) -> None:
         logger.info("MODE: FUTURE_WS_STREAM + OPTION_WS_STREAM + OPTION_DEPTH_STREAM")
         logger.info(
-            "THREAD_HEALTH | stage=startup | active_thread_count=%s | indexes=%s | stale_entry_block_ms=%.1f",
+            "THREAD_HEALTH | stage=startup | active_thread_count=%s | indexes=%s | stale_entry_block_ms=%.1f | static_daily_option_pairs=%s | option_reselection_enabled=%s | pair_stale_reconnect_enabled=%s",
             threading.active_count(),
             ",".join(self.settings.indexes),
             self.stale_entry_block_ms,
+            self.static_daily_option_pairs,
+            self.option_reselection_enabled,
+            self.pair_stale_reconnect_enabled,
         )
         logger.info("TRI_WAVE_BRAIN_VERSION | production_dynamic_exit_v3 | owner_locked=True | legacy_exit_skip=True | weak_exit_removed=True | static_40s_disabled_for_triwave=True")
         if self.TRI_WAVE_V2_ONLY_MODE:
@@ -641,6 +647,9 @@ class TradingRuntimeCoordinator:
         return False
 
     def _reselect_option_pair_if_needed(self, index: str) -> None:
+        if self.static_daily_option_pairs or not self.option_reselection_enabled:
+            return
+
         pair = self.pairs.get(index)
         if pair is None or pair.underlying_ltp is None:
             return
@@ -1943,11 +1952,6 @@ class TradingRuntimeCoordinator:
         for profile in self.settings.indexes:
             self.premium_rebuild_pending_until[profile] = verify_until
             self._replace_tri_wave_data_quarantine(profile, "PREMIUM_STREAM_REBUILD_VERIFY", self.premium_rebuild_verify_sec)
-        if self.option_depth_stream is not None:
-            try:
-                self.option_depth_stream.subscribe(subscriptions)
-            except Exception:
-                logger.exception("PREMIUM_STREAM_REBUILD_DEPTH_RESUB_FAILED | trigger_index=%s", trigger_index)
         logger.warning(
             "PREMIUM_STREAM_REBUILD_DONE | generation=%s | verify_sec=%.1f | subscriptions=%s",
             self.premium_rebuild_generation,
@@ -1955,6 +1959,12 @@ class TradingRuntimeCoordinator:
             len(subscriptions),
         )
         return True
+
+    def _premium_rebuild_verify_remaining(self, now: Optional[float] = None) -> float:
+        now = time.time() if now is None else now
+        pending_until = max((float(until) for until in self.premium_rebuild_pending_until.values()), default=0.0)
+        cooldown_until = float(self.last_premium_stream_rebuild_ts or 0.0) + float(self.premium_rebuild_verify_sec or 0.0)
+        return max(pending_until, cooldown_until) - now
 
     def _verify_premium_stream_for_index(self, index: str, now: Optional[float] = None) -> bool:
         now = time.time() if now is None else now
@@ -2012,6 +2022,28 @@ class TradingRuntimeCoordinator:
         if pair.pe_id:
             subscriptions.append((int(pair.pe_id), f"{index}_PE"))
         if not subscriptions:
+            return
+
+        if self.static_daily_option_pairs:
+            self._last_pair_resubscribe_ts[index] = now
+            self._set_tri_wave_data_quarantine(index, "STATIC_PAIR_STALE_DATA", self.pair_stale_entry_quarantine_sec)
+            logger.warning(
+                "TRI_WAVE_PAIR_STALE_STATIC_NO_RESUBSCRIBE | index=%s | subscriptions=%s | note=static_daily_option_pairs_enabled",
+                index,
+                subscriptions,
+            )
+            return
+
+        verify_remaining = self._premium_rebuild_verify_remaining(now)
+        if verify_remaining > 0:
+            self._replace_tri_wave_data_quarantine(index, "PREMIUM_STREAM_REBUILD_VERIFY", verify_remaining)
+            logger.warning(
+                "PREMIUM_STREAM_RECOVERY_SKIPPED | index=%s | reason=rebuild_in_progress_or_verify | generation=%s | verify_remaining=%.1f | subscriptions=%s",
+                index,
+                self.premium_rebuild_generation,
+                verify_remaining,
+                subscriptions,
+            )
             return
 
         self._last_pair_resubscribe_ts[index] = now
