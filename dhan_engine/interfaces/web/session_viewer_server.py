@@ -61,6 +61,14 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
             session = self._resolve_session(date, expiry)
             self._json(self._session_payload(session, query))
             return
+        if parsed.path == "/api/session/health":
+            session = self._stream_session(query)
+            self._json(self._session_health(session, query))
+            return
+        if parsed.path == "/api/session/download":
+            session = self._stream_session(query)
+            self._download_session_file(session, query)
+            return
         self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def _authorized(self, parsed) -> bool:
@@ -116,6 +124,116 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
             "signals": _read_jsonl(session / "signals.jsonl", limit=limit),
             "portfolio": _read_jsonl(session / "portfolio.jsonl", limit=limit),
         }
+
+    def _session_health(self, session: Path | None, query: dict) -> dict:
+        if session is None:
+            return {"session": None, "status": "offline", "summary": {}, "feeds": [], "events": []}
+
+        now = time.time()
+        tick_limit = _positive_int((query.get("tick_limit") or ["2000"])[0], 2000)
+        event_limit = _positive_int((query.get("event_limit") or ["50"])[0], 50)
+        ticks = _read_jsonl(session / "ticks.jsonl", limit=tick_limit)
+        trades = _read_jsonl(session / "trades.jsonl", limit=500)
+        portfolio = _read_jsonl(session / "portfolio.jsonl", limit=100)
+        signals = _read_jsonl(session / "signals.jsonl", limit=300)
+
+        latest_by_feed: dict[str, dict] = {}
+        for row in ticks:
+            tick = row if isinstance(row, dict) else {}
+            features = tick.get("features") if isinstance(tick.get("features"), dict) else {}
+            raw = tick.get("raw") if isinstance(tick.get("raw"), dict) else {}
+            index = str(tick.get("index") or features.get("index") or "").upper()
+            stream = str(tick.get("stream") or features.get("stream") or "").upper()
+            secid = tick.get("secid") or features.get("secid") or raw.get("security_id") or raw.get("SecurityId") or ""
+            key = f"{index}_{stream}_{secid}".strip("_")
+            if not key:
+                continue
+            ts = _number(tick.get("ts") or features.get("ts") or raw.get("ts"))
+            ltp = _number(tick.get("ltp") or features.get("ltp") or raw.get("LTP") or raw.get("ltp"))
+            current = latest_by_feed.get(key)
+            if current is None or ts >= current.get("ts", 0):
+                latest_by_feed[key] = {
+                    "key": key,
+                    "index": index,
+                    "stream": stream,
+                    "secid": secid,
+                    "ts": ts,
+                    "age_sec": max(0.0, now - ts) if ts else None,
+                    "ltp": ltp,
+                    "ticks": 1,
+                }
+            else:
+                current["ticks"] = int(current.get("ticks", 1)) + 1
+
+        feeds = sorted(latest_by_feed.values(), key=lambda item: (item.get("index") or "", item.get("stream") or ""))
+        stale_feeds = [feed for feed in feeds if feed.get("age_sec") is not None and feed["age_sec"] > 20]
+        latest_portfolio = _last_json_object(portfolio)
+        latest_trade_rows = [_last_json_object([row]) for row in trades]
+        latest_trade_rows = [row for row in latest_trade_rows if row]
+        net = sum(_number((row.get("trade") or row).get("net_pnl")) for row in latest_trade_rows)
+        open_positions = 0
+        if latest_portfolio:
+            p = latest_portfolio.get("portfolio") if isinstance(latest_portfolio.get("portfolio"), dict) else latest_portfolio
+            open_positions = int(_number(p.get("open_positions") or len(p.get("positions") or [])))
+
+        events = _recent_health_events(trades, signals, stale_feeds, event_limit)
+        status = "healthy"
+        if not feeds:
+            status = "waiting"
+        if stale_feeds:
+            status = "stale"
+        if any(event.get("level") == "error" for event in events):
+            status = "error"
+
+        return {
+            "session": {
+                "date": session.parent.name,
+                "expiry": session.name.replace("expiry=", "", 1),
+                "path": str(session),
+            },
+            "status": status,
+            "summary": {
+                "tick_rows_loaded": len(ticks),
+                "feeds": len(feeds),
+                "stale_feeds": len(stale_feeds),
+                "trades": len(latest_trade_rows),
+                "net_pnl": net,
+                "open_positions": open_positions,
+                "portfolio_snapshots": len(portfolio),
+                "last_file_update_sec": _session_file_age_sec(session, now),
+            },
+            "feeds": feeds,
+            "events": events,
+        }
+
+    def _download_session_file(self, session: Path | None, query: dict) -> None:
+        if session is None:
+            self._json({"error": "session not found"}, HTTPStatus.NOT_FOUND)
+            return
+        file_key = (query.get("file") or [""])[0].strip().lower()
+        allowed = {
+            "ticks": "ticks.jsonl",
+            "trades": "trades.jsonl",
+            "signals": "signals.jsonl",
+            "portfolio": "portfolio.jsonl",
+        }
+        filename = allowed.get(file_key)
+        if not filename:
+            self._json({"error": "invalid file"}, HTTPStatus.BAD_REQUEST)
+            return
+        path = (session / filename).resolve()
+        if session.resolve() not in path.parents or not path.exists():
+            self._json({"error": "file not found"}, HTTPStatus.NOT_FOUND)
+            return
+        body = path.read_bytes()
+        download_name = f"{session.parent.name}_{session.name.replace('expiry=', '')}_{filename}"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/jsonl; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _stream_live_session(self, query: dict) -> None:
         session = self._stream_session(query)
@@ -277,3 +395,62 @@ def _read_jsonl_since(path: Path, offset: int) -> list[tuple[dict, int]]:
     except Exception:
         logger.warning("TRIWAVE_VIEWER_TAIL_FAILED | path=%s", path, exc_info=True)
     return rows
+
+
+def _number(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _last_json_object(rows: list[dict]) -> dict:
+    for row in reversed(rows or []):
+        if isinstance(row, dict):
+            return row
+    return {}
+
+
+def _session_file_age_sec(session: Path, now: float) -> float | None:
+    mtimes = []
+    for filename in ("ticks.jsonl", "trades.jsonl", "signals.jsonl", "portfolio.jsonl"):
+        path = session / filename
+        if path.exists():
+            mtimes.append(path.stat().st_mtime)
+    if not mtimes:
+        return None
+    return max(0.0, now - max(mtimes))
+
+
+def _recent_health_events(trades: list[dict], signals: list[dict], stale_feeds: list[dict], limit: int) -> list[dict]:
+    events = []
+    for feed in stale_feeds:
+        events.append({
+            "level": "warning",
+            "time": "",
+            "message": f"Stale feed {feed.get('index')} {feed.get('stream')} age {feed.get('age_sec', 0):.0f}s",
+        })
+    for row in reversed(trades or []):
+        trade = row.get("trade") if isinstance(row.get("trade"), dict) else row
+        reason = str(trade.get("exit_reason") or "")
+        if "STALE" in reason or "ADVERSE" in reason or "TIME_LOSS" in reason or "ERROR" in reason:
+            level = "error" if "ERROR" in reason else "warning"
+            events.append({
+                "level": level,
+                "time": str(row.get("time") or ""),
+                "message": f"{trade.get('tag', 'TRADE')} exit {reason.replace('TRI_WAVE_V2_EXIT:', '')}",
+            })
+        if len(events) >= limit:
+            return events[:limit]
+    for row in reversed(signals or []):
+        text = json.dumps(row, ensure_ascii=False)
+        upper = text.upper()
+        if any(key in upper for key in ("ERROR", "WARNING", "STALE", "BLOCKED", "FAILED")):
+            events.append({
+                "level": "warning",
+                "time": str(row.get("time") or ""),
+                "message": text[:220],
+            })
+        if len(events) >= limit:
+            return events[:limit]
+    return events[:limit]

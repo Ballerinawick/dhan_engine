@@ -14,6 +14,9 @@ const state = {
   eventSource: null,
   liveCount: 0,
   lastLiveTs: 0,
+  currentSession: null,
+  health: null,
+  healthTimer: 0,
   dragging: null,
 };
 
@@ -33,6 +36,14 @@ const els = {
   statusText: document.getElementById("statusText"),
   inspectText: document.getElementById("inspectText"),
   liveBadge: document.getElementById("liveBadge"),
+  botStatus: document.getElementById("botStatus"),
+  feedStatus: document.getElementById("feedStatus"),
+  healthUpdated: document.getElementById("healthUpdated"),
+  healthCounts: document.getElementById("healthCounts"),
+  feedHealthStatus: document.getElementById("feedHealthStatus"),
+  feedHealthTable: document.getElementById("feedHealthTable"),
+  errorStatus: document.getElementById("errorStatus"),
+  errorList: document.getElementById("errorList"),
   instrumentTabs: document.getElementById("instrumentTabs"),
   portfolioCards: document.getElementById("portfolioCards"),
   portfolioUpdated: document.getElementById("portfolioUpdated"),
@@ -44,6 +55,10 @@ const els = {
   priceCanvas: document.getElementById("priceCanvas"),
   volumeCanvas: document.getElementById("volumeCanvas"),
   waveCanvas: document.getElementById("waveCanvas"),
+  downloadTrades: document.getElementById("downloadTrades"),
+  downloadPortfolio: document.getElementById("downloadPortfolio"),
+  downloadSignals: document.getElementById("downloadSignals"),
+  downloadTicks: document.getElementById("downloadTicks"),
 };
 
 const NUMERIC_SKIP = new Set([
@@ -99,6 +114,7 @@ async function loadCloudSession(session) {
   if (!session) return;
   closeLiveStream();
   setLive(false);
+  state.currentSession = session;
   els.statusText.textContent = `Loading ${session.date} / ${session.expiry}`;
   const query = new URLSearchParams({ date: session.date, expiry: session.expiry, limit: "100000" });
   const response = await fetch(apiUrl(`/api/session?${query}`), { cache: "no-store" });
@@ -113,6 +129,8 @@ async function loadCloudSession(session) {
   state.liveCount = 0;
   resetView(true);
   render();
+  await refreshHealth();
+  startHealthPolling();
   startLiveStream(session);
 }
 
@@ -145,6 +163,30 @@ function startLiveStream(session) {
 function closeLiveStream() {
   if (state.eventSource) state.eventSource.close();
   state.eventSource = null;
+}
+
+function startHealthPolling() {
+  if (state.healthTimer) clearInterval(state.healthTimer);
+  state.healthTimer = setInterval(refreshHealth, 5000);
+}
+
+async function refreshHealth() {
+  if (!state.currentSession) return;
+  try {
+    const query = new URLSearchParams({ date: state.currentSession.date, expiry: state.currentSession.expiry });
+    const response = await fetch(apiUrl(`/api/session/health?${query}`), { cache: "no-store" });
+    if (!response.ok) return;
+    state.health = await response.json();
+    renderHealth();
+  } catch {
+    state.health = {
+      status: "error",
+      summary: {},
+      feeds: [],
+      events: [{ level: "error", message: "Dashboard could not load health API" }],
+    };
+    renderHealth();
+  }
 }
 
 function setLive(active) {
@@ -392,9 +434,59 @@ function latestPositions() {
 }
 
 function renderDashboard() {
+  renderHealth();
   renderPortfolioCards();
   renderOpenPositions();
   renderTradeSummaryTable();
+}
+
+function renderHealth() {
+  const health = state.health || {};
+  const summary = health.summary || {};
+  const feeds = Array.isArray(health.feeds) ? health.feeds : [];
+  const events = Array.isArray(health.events) ? health.events : [];
+  const status = String(health.status || (state.eventSource ? "live" : "waiting")).toUpperCase();
+  const statusClass = status === "HEALTHY" ? "profit" : status === "ERROR" || status === "STALE" ? "loss" : "";
+
+  els.botStatus.textContent = status;
+  els.botStatus.className = statusClass;
+  els.feedStatus.textContent = `${Number(summary.feeds || feeds.length)} feeds / ${Number(summary.stale_feeds || 0)} stale`;
+  els.healthUpdated.textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  els.healthCounts.textContent = `${Number(summary.open_positions || 0)} open / ${Number(summary.trades || state.trades.length)} trades`;
+  els.feedHealthStatus.textContent = feeds.length ? `${feeds.length} feeds` : "Waiting";
+  els.errorStatus.textContent = events.length ? `${events.length} events` : "No errors";
+
+  if (!feeds.length) {
+    els.feedHealthTable.innerHTML = emptyTable("No feed health yet");
+  } else {
+    const rows = feeds.slice(0, 20).map((feed) => {
+      const age = Number(feed.age_sec || 0);
+      const ageClass = age > 20 ? "loss" : age > 8 ? "warn" : "profit";
+      return `
+        <div class="data-row">
+          <span title="${escapeHtml(feed.key)}">${escapeHtml(feed.index || "-")}</span>
+          <span>${escapeHtml(feed.stream || "-")}</span>
+          <span>${Number(feed.ltp || 0).toFixed(2)}</span>
+          <span class="${ageClass}">${age.toFixed(0)}s</span>
+          <span>${escapeHtml(feed.secid || "")}</span>
+        </div>
+      `;
+    }).join("");
+    els.feedHealthTable.innerHTML = `
+      <div class="data-header"><span>Index</span><span>Side</span><span>LTP</span><span>Age</span><span>Secid</span></div>
+      ${rows}
+    `;
+  }
+
+  els.errorList.innerHTML = events.length
+    ? events.slice(0, 12).map((event) => `
+        <div class="event-item ${escapeHtml(event.level || "warning")}">
+          <strong>${escapeHtml(String(event.level || "warning").toUpperCase())}</strong>
+          <span>${escapeHtml(event.time || "")}</span>
+          <p>${escapeHtml(event.message || "")}</p>
+        </div>
+      `).join("")
+    : `<div class="inspect-text">No warning/error events found in session files</div>`;
 }
 
 function renderPortfolioCards() {
@@ -850,6 +942,16 @@ function emptyTable(text) {
   return `<div class="data-row"><span>${escapeHtml(text)}</span><span></span><span></span><span></span><span></span></div>`;
 }
 
+function downloadSessionFile(file) {
+  if (!state.currentSession) return;
+  const query = new URLSearchParams({
+    date: state.currentSession.date,
+    expiry: state.currentSession.expiry,
+    file,
+  });
+  window.location.href = apiUrl(`/api/session/download?${query}`);
+}
+
 function formatTime(ts) {
   if (!ts) return "";
   return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -887,6 +989,11 @@ els.signalsFile.addEventListener("change", (event) => readJsonlFile(event.target
   state.signals = rows;
   render();
 }));
+
+els.downloadTrades.addEventListener("click", () => downloadSessionFile("trades"));
+els.downloadPortfolio.addEventListener("click", () => downloadSessionFile("portfolio"));
+els.downloadSignals.addEventListener("click", () => downloadSessionFile("signals"));
+els.downloadTicks.addEventListener("click", () => downloadSessionFile("ticks"));
 
 els.sessionSelect.addEventListener("change", async () => {
   const idx = Number(els.sessionSelect.value);
