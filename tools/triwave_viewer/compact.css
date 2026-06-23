@@ -17,13 +17,13 @@
 }
 
 .workspace {
-  grid-template-rows: 50px 38px 190px minmax(0, 1fr);
+  grid-template-rows: 50px 38px auto 138px 190px minmax(0, 1fr);
   min-height: 0;
 }
 
 .chart-stack {
   grid-template-rows: minmax(240px, 1.9fr) minmax(84px, .55fr) minmax(110px, .7fr);
-  max-height: calc(100vh - 278px);
+  max-height: calc(100vh - 424px);
   overflow: hidden;
 }
 

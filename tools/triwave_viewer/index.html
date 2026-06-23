@@ -50,6 +50,16 @@
 
       <section class="panel stats" id="statsPanel"></section>
 
+      <section class="panel download-panel">
+        <h2>Downloads</h2>
+        <div class="download-grid">
+          <button id="downloadTrades" type="button">Trades</button>
+          <button id="downloadPortfolio" type="button">Portfolio</button>
+          <button id="downloadSignals" type="button">Signals</button>
+          <button id="downloadTicks" type="button">Ticks</button>
+        </div>
+      </section>
+
       <section class="panel local-files">
         <h2>Local Replay</h2>
         <label class="file-control">
@@ -87,6 +97,42 @@
       </div>
 
       <div id="instrumentTabs" class="instrument-tabs"></div>
+
+      <section class="health-strip">
+        <div class="health-card">
+          <span>Bot Status</span>
+          <strong id="botStatus">Checking</strong>
+        </div>
+        <div class="health-card">
+          <span>Feeds</span>
+          <strong id="feedStatus">-</strong>
+        </div>
+        <div class="health-card">
+          <span>Last Update</span>
+          <strong id="healthUpdated">-</strong>
+        </div>
+        <div class="health-card">
+          <span>Open / Trades</span>
+          <strong id="healthCounts">-</strong>
+        </div>
+      </section>
+
+      <section class="dashboard-grid health-grid">
+        <div class="dashboard-panel feed-health-panel">
+          <div class="panel-head">
+            <h2>Live Feed Health</h2>
+            <span id="feedHealthStatus" class="mini-status">Waiting</span>
+          </div>
+          <div id="feedHealthTable" class="data-table compact-table"></div>
+        </div>
+        <div class="dashboard-panel error-panel">
+          <div class="panel-head">
+            <h2>Warnings / Errors</h2>
+            <span id="errorStatus" class="mini-status">No errors</span>
+          </div>
+          <div id="errorList" class="event-list"></div>
+        </div>
+      </section>
 
       <section class="dashboard-grid">
         <div class="dashboard-panel portfolio-panel">
