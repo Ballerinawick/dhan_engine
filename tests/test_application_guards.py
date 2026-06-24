@@ -1,4 +1,6 @@
 import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from dhan_engine.application.market_health import PairFreshness, age_from_ts, format_age
 from dhan_engine.application.risk_manager import (
@@ -7,6 +9,7 @@ from dhan_engine.application.risk_manager import (
     evaluate_entry_quality,
     evaluate_scale_in_quality,
 )
+from dhan_engine.domain.market.tri_wave_v2_brain import TriWaveStreamState, TriWaveV2Brain
 
 
 class MarketHealthTests(unittest.TestCase):
@@ -169,6 +172,30 @@ class RiskManagerTests(unittest.TestCase):
         )
         self.assertFalse(stale.allowed)
         self.assertEqual(stale.reason, "SCALE_IN_STALE_LTP")
+
+
+class TriWaveDayAwarePremiumTests(unittest.TestCase):
+    def test_expiry_day_profile_maps_wednesday_to_day_one(self):
+        brain = TriWaveV2Brain()
+        ts = datetime(2026, 6, 24, 10, 30, tzinfo=ZoneInfo("Asia/Kolkata")).timestamp()
+
+        profile = brain._expiry_day_profile("NIFTY", ts)
+
+        self.assertEqual(profile["cycle_day"], 1)
+        self.assertEqual(profile["label"], "WED_D1")
+        self.assertEqual(profile["index"], "NIFTY")
+
+    def test_day_entry_filter_blocks_weak_edge_for_expiry_day(self):
+        brain = TriWaveV2Brain()
+        stream = TriWaveStreamState(stream="CE")
+        stream.stats = {"dynamic_edge": 0.05, "spread_pct": 0.2}
+        ts = datetime(2026, 6, 24, 10, 30, tzinfo=ZoneInfo("Asia/Kolkata")).timestamp()
+
+        allowed, reason, profile = brain._day_entry_filter("NIFTY", "CE", stream, ts)
+
+        self.assertFalse(allowed)
+        self.assertEqual(profile["label"], "WED_D1")
+        self.assertIn("CE_DAY_EDGE_WEAK", reason)
 
 
 if __name__ == "__main__":

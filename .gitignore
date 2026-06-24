@@ -1,3 +1,8 @@
-.env 
-_pycache_/ 
-*.pyc 
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+_pycache_/
+*.pyc

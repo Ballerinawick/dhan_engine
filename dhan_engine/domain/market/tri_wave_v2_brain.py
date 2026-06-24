@@ -2,7 +2,9 @@ from __future__ import annotations
 import logging, os, time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Deque, Dict, Optional
+from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -22,10 +24,52 @@ class TriWaveV2Brain:
     TIME_LOSS_EXIT_SEC=240;TIME_LOSS_EXIT_PCT=-1.0;DEAD_TRADE_EXIT_SEC=300;DEAD_TRADE_MIN_PROFIT_PCT=0.20
     PROFIT_ARM_PCT=1.20;PROFIT_GIVEBACK_RATIO=0.50;MIN_PEAK_PNL_FOR_GIVEBACK_PCT=1.20;MAX_HOLD_SEC=600
     ENTRY_CONFIRM_TICKS=3;ENTRY_CONFIRM_MAX_WINDOW_SEC=8;ENTRY_CONFIRM_MIN_INTERVAL_SEC=0.8;ENTRY_MIN_HOLD_AFTER_PHASE_CHANGE_SEC=0.0
+    EXPIRY_DAY_PROFILES={
+        2: {"cycle_day":1,"label":"WED_D1","entry_min_edge":0.18,"max_spread_pct":1.20,"hard_hold_sec":75,"hard_loss_points":7.0,"hard_loss_pct":-6.0,"profit_hold_sec":90,"profit_arm_pct":1.40,"profit_giveback_pct":0.75},
+        3: {"cycle_day":2,"label":"THU_D2","entry_min_edge":0.20,"max_spread_pct":1.20,"hard_hold_sec":60,"hard_loss_points":5.5,"hard_loss_pct":-5.0,"profit_hold_sec":75,"profit_arm_pct":1.25,"profit_giveback_pct":0.65},
+        4: {"cycle_day":3,"label":"FRI_D3","entry_min_edge":0.22,"max_spread_pct":1.10,"hard_hold_sec":45,"hard_loss_points":4.5,"hard_loss_pct":-4.2,"profit_hold_sec":60,"profit_arm_pct":1.10,"profit_giveback_pct":0.55},
+        0: {"cycle_day":4,"label":"MON_D4","entry_min_edge":0.25,"max_spread_pct":1.00,"hard_hold_sec":30,"hard_loss_points":3.8,"hard_loss_pct":-3.6,"profit_hold_sec":45,"profit_arm_pct":1.00,"profit_giveback_pct":0.45},
+        1: {"cycle_day":5,"label":"TUE_D5","entry_min_edge":0.28,"max_spread_pct":0.90,"hard_hold_sec":18,"hard_loss_points":3.0,"hard_loss_pct":-3.0,"profit_hold_sec":30,"profit_arm_pct":0.85,"profit_giveback_pct":0.35},
+        5: {"cycle_day":3,"label":"SAT_D3_PROXY","entry_min_edge":0.22,"max_spread_pct":1.10,"hard_hold_sec":45,"hard_loss_points":4.5,"hard_loss_pct":-4.2,"profit_hold_sec":60,"profit_arm_pct":1.10,"profit_giveback_pct":0.55},
+        6: {"cycle_day":4,"label":"SUN_D4_PROXY","entry_min_edge":0.25,"max_spread_pct":1.00,"hard_hold_sec":30,"hard_loss_points":3.8,"hard_loss_pct":-3.6,"profit_hold_sec":45,"profit_arm_pct":1.00,"profit_giveback_pct":0.45},
+    }
     def __init__(self):
         self.streams=defaultdict(lambda:{k:TriWaveStreamState(stream=k) for k in ("FUT","CE","PE")}); self.pos=defaultdict(TriWavePositionState); self._exit_conf=defaultdict(int); self._last_wait_log=defaultdict(float); self._last_visual=defaultdict(float); self._entry_confirm=defaultdict(lambda:{"side":None,"count":0,"first_ts":0.0,"last_ts":0.0,"last_reason":None}); self._exit_health_memory=defaultdict(lambda:deque(maxlen=12))
         self.verbose_logs=str(os.getenv("TRIWAVE_V2_VERBOSE_LOGS","0")).strip().lower() in {"1","true","yes","on"}
         self.phase_logs=str(os.getenv("TRIWAVE_V2_PHASE_LOGS","0")).strip().lower() in {"1","true","yes","on"}
+        self.day_aware_enabled=str(os.getenv("TRIWAVE_DAY_AWARE_PREMIUM","1")).strip().lower() in {"1","true","yes","on"}
+        self.day_aware_entry_enabled=str(os.getenv("TRIWAVE_DAY_AWARE_ENTRY_FILTER","1")).strip().lower() in {"1","true","yes","on"}
+        self.day_aware_exit_enabled=str(os.getenv("TRIWAVE_DAY_AWARE_EXIT_GUARD","1")).strip().lower() in {"1","true","yes","on"}
+
+    def _expiry_day_profile(self, index: str, now: Optional[float] = None) -> dict:
+        ts=time.time() if now is None else float(now)
+        dt=datetime.fromtimestamp(ts, ZoneInfo("Asia/Kolkata"))
+        profile=dict(self.EXPIRY_DAY_PROFILES.get(dt.weekday(), self.EXPIRY_DAY_PROFILES[2]))
+        profile["index"]=index; profile["weekday"]=dt.weekday(); profile["date"]=dt.date().isoformat()
+        return profile
+
+    def _day_entry_filter(self, index: str, side: str, target: TriWaveStreamState, now: float) -> tuple[bool, str, dict]:
+        profile=self._expiry_day_profile(index, now)
+        if not (self.day_aware_enabled and self.day_aware_entry_enabled): return True,"DAY_FILTER_DISABLED",profile
+        edge=float(target.stats.get("dynamic_edge",0.0) or 0.0)
+        spread=float(target.stats.get("spread_pct",0.0) or 0.0)
+        if edge<float(profile["entry_min_edge"]): return False,f"{side}_DAY_EDGE_WEAK:{profile['label']}",profile
+        if spread>float(profile["max_spread_pct"]): return False,f"{side}_DAY_SPREAD_WIDE:{profile['label']}",profile
+        return True,f"{side}_DAY_OK:{profile['label']}",profile
+
+    def _day_exit_signal(self, *, index: str, side: str, now: float, hold: float, pnl_pct: float, gross_points: float, net_rupees: float, peak_pnl_pct: float) -> Optional[TriWaveV2Signal]:
+        profile=self._expiry_day_profile(index, now)
+        if not (self.day_aware_enabled and self.day_aware_exit_enabled): return None
+        giveback=peak_pnl_pct-pnl_pct
+        hard_loss_hit=hold>=float(profile["hard_hold_sec"]) and gross_points<0 and (abs(gross_points)>=float(profile["hard_loss_points"]) or pnl_pct<=float(profile["hard_loss_pct"]))
+        if hard_loss_hit:
+            logger.info("TRI_WAVE_V2_DAY_HARD_ADVERSE | index=%s | side=%s | day=%s | hold=%.2f | pnl_pct=%.2f | gross_points=%.2f | hard_hold=%.2f | hard_points=%.2f | hard_pct=%.2f",index,side,profile["label"],hold,pnl_pct,gross_points,profile["hard_hold_sec"],profile["hard_loss_points"],profile["hard_loss_pct"])
+            return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason=f"TRI_WAVE_V2_EXIT:DAY_HARD_ADVERSE:{profile['label']}",confidence=0.98,diagnostics={"expiry_day_profile":profile})
+        profit_lock_hit=hold>=float(profile["profit_hold_sec"]) and net_rupees>=self.MIN_NET_PROFIT_EXIT and peak_pnl_pct>=float(profile["profit_arm_pct"]) and giveback>=float(profile["profit_giveback_pct"])
+        if profit_lock_hit:
+            logger.info("TRI_WAVE_V2_DAY_PROFIT_LOCK | index=%s | side=%s | day=%s | hold=%.2f | pnl_pct=%.2f | peak_pnl_pct=%.2f | giveback=%.2f | net_rupees=%.2f",index,side,profile["label"],hold,pnl_pct,peak_pnl_pct,giveback,net_rupees)
+            return TriWaveV2Signal(action=f"EXIT_{side}",side=side,reason=f"TRI_WAVE_V2_EXIT:DAY_PROFIT_LOCK:{profile['label']}",confidence=0.92,diagnostics={"expiry_day_profile":profile})
+        return None
 
     def _field_values(self,s,field,window=30):
         rows=list(s.feature_ticks); vals=[float(r.get(field,0.0) or 0.0) for r in rows[-window:]]; return vals
@@ -119,6 +163,8 @@ class TriWaveV2Brain:
             if ce.stats.get("last_5_delta",0.0)<0: return False,"CE_LAST5_NEGATIVE"
             ce_edge=ce.stats.get("dynamic_edge",0.0); pe_edge=pe.stats.get("dynamic_edge",0.0)
             if not (ce_edge>0 or ce_edge>=pe_edge): return False,"CE_EDGE_NOT_POSITIVE_OR_IMPROVING"
+            day_ok,day_reason,_=self._day_entry_filter(index,"CE",ce,now)
+            if not day_ok: return False,day_reason
             fut_supports_ce=(fut.stats.get("last_5_delta",0.0)>=0 or fut.stats.get("velocity",0.0)>=0 or fut.phase in {"RECOVERY","EXPANSION"})
             if not fut_supports_ce and fut.phase in {"PULLBACK","REVERSAL"}: return False,"FUT_FLOW_AGAINST_CE"
             if self.verbose_logs:
@@ -129,6 +175,8 @@ class TriWaveV2Brain:
         if pe.stats.get("last_5_delta",0.0)<0: return False,"PE_LAST5_NEGATIVE"
         pe_edge=pe.stats.get("dynamic_edge",0.0); ce_edge=ce.stats.get("dynamic_edge",0.0)
         if not (pe_edge>0 or pe_edge>=ce_edge): return False,"PE_EDGE_NOT_POSITIVE_OR_IMPROVING"
+        day_ok,day_reason,_=self._day_entry_filter(index,"PE",pe,now)
+        if not day_ok: return False,day_reason
         fut_supports_pe=(fut.stats.get("last_5_delta",0.0)<=0 or fut.stats.get("velocity",0.0)<=0 or fut.phase in {"PULLBACK","REVERSAL","EXHAUSTION"})
         if not fut_supports_pe and fut.phase in {"RECOVERY","EXPANSION"}: return False,"FUT_FLOW_AGAINST_PE"
         if self.verbose_logs:
@@ -208,6 +256,8 @@ class TriWaveV2Brain:
             side=active_position.get("side"); tgt=ce if side=="CE" else pe; p=self.pos[index]; entry=active_position.get("entry",p.entry_price or tgt.last_ltp); pnl=((tgt.last_ltp-entry)/max(entry,1e-9))*100.0; hold=now-float(active_position.get("entry_ts",p.entry_ts or now)); p.best_price=max(p.best_price,tgt.last_ltp); p.peak_pnl_pct=max(p.peak_pnl_pct,pnl)
             gross_points=tgt.last_ltp-entry; gross_rupees=gross_points*self.LOT_SIZE; net_rupees=gross_rupees-self.ROUND_TRIP_FEE
             profit_enough=(net_rupees>=self.MIN_NET_PROFIT_EXIT or gross_points>=self.MIN_GROSS_POINTS_FOR_PROFIT_EXIT)
+            day_signal=self._day_exit_signal(index=index,side=side,now=now,hold=hold,pnl_pct=pnl,gross_points=gross_points,net_rupees=net_rupees,peak_pnl_pct=p.peak_pnl_pct)
+            if day_signal: return day_signal
             fast_adverse_allowed=hold>=self.FAST_ADVERSE_MIN_HOLD_SEC and pnl<=self.FAST_ADVERSE_PCT and tgt.last_ltp<entry
             if hold<self.MIN_BREATHING_HOLD_SEC:
                 target_support=tgt.stats.get("dynamic_support_score",0.0); target_risk=tgt.stats.get("dynamic_risk_score",0.0); target_edge=tgt.stats.get("dynamic_edge",0.0)
