@@ -2026,12 +2026,33 @@ class TradingRuntimeCoordinator:
 
         if self.static_daily_option_pairs:
             self._last_pair_resubscribe_ts[index] = now
-            self._set_tri_wave_data_quarantine(index, "STATIC_PAIR_STALE_DATA", self.pair_stale_entry_quarantine_sec)
+            # Static means keep the selected contracts for the session. It must
+            # not prevent repairing the transport carrying those contracts.
+            self._set_tri_wave_data_quarantine(index, "PAIR_STALE_RECOVERY", self.pair_stale_entry_quarantine_sec)
             logger.warning(
-                "TRI_WAVE_PAIR_STALE_STATIC_NO_RESUBSCRIBE | index=%s | subscriptions=%s | note=static_daily_option_pairs_enabled",
+                "TRI_WAVE_PAIR_STALE_STATIC_RECOVERY | index=%s | action=reconnect_same_option_pair | subscriptions=%s | note=no_reselection",
                 index,
                 subscriptions,
             )
+            try:
+                if self.option_quote_stream is None:
+                    logger.error(
+                        "TRI_WAVE_PAIR_STALE_STATIC_RECOVERY_FAILED | index=%s | reason=option_stream_missing",
+                        index,
+                    )
+                    return
+                if not hasattr(self.option_quote_stream, "reconnect_for_subscriptions"):
+                    logger.error(
+                        "TRI_WAVE_PAIR_STALE_STATIC_RECOVERY_FAILED | index=%s | reason=reconnect_not_supported",
+                        index,
+                    )
+                    return
+                self.option_quote_stream.reconnect_for_subscriptions(
+                    subscriptions,
+                    reason=f"static_pair_stale:{index}",
+                )
+            except Exception:
+                logger.exception("TRI_WAVE_PAIR_STALE_STATIC_RECOVERY_FAILED | index=%s", index)
             return
 
         verify_remaining = self._premium_rebuild_verify_remaining(now)
