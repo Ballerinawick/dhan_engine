@@ -143,6 +143,7 @@ class FutureQuoteStream:
         exchange_segment: str,
         on_quote: Callable[[int, str, float, object], None],
         debug: bool = False,
+        shard_count: Optional[int] = None,
     ):
         self.exchange_segment = exchange_segment
         self._token = token
@@ -152,7 +153,12 @@ class FutureQuoteStream:
         self._started = False
         self._client: Optional[DhanLiveMarketFeedWS] = None
         self._clients: List[DhanLiveMarketFeedWS] = []
-        self._option_shard_count = max(1, min(int(os.getenv("OPTION_QUOTE_WS_SHARDS", "1") or 1), 4))
+        configured_shards = (
+            int(os.getenv("OPTION_QUOTE_WS_SHARDS", "1") or 1)
+            if shard_count is None
+            else int(shard_count)
+        )
+        self._option_shard_count = max(1, min(configured_shards, 4))
 
     def start(self) -> None:
         self._started = True

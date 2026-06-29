@@ -56,6 +56,7 @@ class InstrumentMaster:
         self._opt_cache = {}
         self._fut_cache = {}
         self._index_cache = {}
+        self._equity_cache = {}
 
     # ---------------------------------------------------
     # Logging
@@ -165,6 +166,36 @@ class InstrumentMaster:
 
     def get_fut_exchange_segment(self) -> str:
         return "NSE_FNO"
+
+    def get_equity(self, symbol: str):
+        """Resolve one exact NSE cash-equity instrument."""
+        ticker = str(symbol).upper().strip()
+        if not ticker:
+            raise ValueError("Equity symbol is required")
+        if ticker in self._equity_cache:
+            return dict(self._equity_cache[ticker])
+
+        df = self.df
+        equities = df[
+            (df["SEM_EXM_EXCH_ID"] == "NSE")
+            & (df["SEM_SEGMENT"] == "E")
+            & (df["SEM_TRADING_SYMBOL"].astype(str).str.upper() == ticker)
+        ].copy()
+        if equities.empty:
+            raise LookupError(f"No exact NSE equity instrument found for {ticker}")
+
+        instrument_names = equities["SEM_INSTRUMENT_NAME"].astype(str).str.upper()
+        preferred = equities[instrument_names.isin({"EQUITY", "EQ"})]
+        row = (preferred if not preferred.empty else equities).iloc[0]
+        resolved = {
+            "security_id": int(float(row["SEM_SMST_SECURITY_ID"])),
+            "symbol": ticker,
+            "trading_symbol": str(row["SEM_TRADING_SYMBOL"]),
+            "exchange_segment": "NSE_EQ",
+        }
+        self._equity_cache[ticker] = dict(resolved)
+        self._log(f"NSE EQUITY selected: {ticker} secid={resolved['security_id']}")
+        return resolved
 
     # ---------------------------------------------------
     # ✅ Nearest option expiry (UPDATED RULES)
