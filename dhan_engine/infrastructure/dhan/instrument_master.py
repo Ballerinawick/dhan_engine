@@ -211,16 +211,20 @@ class InstrumentMaster:
             return dict(self._commodity_cache[root])
 
         df = self.df
-        futures = df[
+        base = df[
             (df["SEM_EXM_EXCH_ID"].astype(str).str.upper() == "MCX")
             & (df["SEM_SEGMENT"].astype(str).str.upper() == "M")
             & (df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == "FUTCOM")
-            & (
-                df["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.startswith(f"{root}-", na=False)
-                | (df["SM_SYMBOL_NAME"].astype(str).str.upper() == root)
-                | df["SEM_CUSTOM_SYMBOL"].astype(str).str.upper().str.startswith(root, na=False)
-            )
         ].copy()
+        trading_symbols = base["SEM_TRADING_SYMBOL"].astype(str).str.upper()
+        symbol_names = (
+            base["SM_SYMBOL_NAME"].astype(str).str.upper()
+            if "SM_SYMBOL_NAME" in base.columns
+            else pd.Series(False, index=base.index)
+        )
+        exact_trading = base[trading_symbols.str.startswith(f"{root}-", na=False)].copy()
+        exact_symbol = base[symbol_names == root].copy()
+        futures = exact_trading if not exact_trading.empty else exact_symbol
         futures = futures.dropna(subset=["SEM_EXPIRY_DATE", "SEM_SMST_SECURITY_ID"])
         now = pd.Timestamp.now()
         active = futures[futures["SEM_EXPIRY_DATE"] >= now].copy()
