@@ -72,6 +72,14 @@ class CommodityInstrumentResolutionTests(unittest.TestCase):
             [
                 {
                     "SEM_EXM_EXCH_ID": "MCX", "SEM_SEGMENT": "M",
+                    "SEM_SMST_SECURITY_ID": "510463", "SEM_INSTRUMENT_NAME": "FUTCOM",
+                    "SEM_TRADING_SYMBOL": "GOLDTEN-30Jun2026-FUT", "SEM_CUSTOM_SYMBOL": "GOLDTEN JUN FUT",
+                    "SEM_OPTION_TYPE": "NA", "SEM_STRIKE_PRICE": "0",
+                    "SEM_LOT_UNITS": "1", "SEM_EXPIRY_DATE": "2026-06-30",
+                    "SM_SYMBOL_NAME": "GOLDTEN",
+                },
+                {
+                    "SEM_EXM_EXCH_ID": "MCX", "SEM_SEGMENT": "M",
                     "SEM_SMST_SECURITY_ID": "445003", "SEM_INSTRUMENT_NAME": "FUTCOM",
                     "SEM_TRADING_SYMBOL": "GOLD-05Dec2026-FUT", "SEM_CUSTOM_SYMBOL": "GOLD DEC FUT",
                     "SEM_OPTION_TYPE": "NA", "SEM_STRIKE_PRICE": "0",
