@@ -1935,11 +1935,13 @@ class TradingRuntimeCoordinator:
             new_stream = self._make_option_quote_stream()
             self.option_quote_stream = new_stream
             self._option_streams_started = True
-            new_stream.start()
             if hasattr(new_stream, "replace_subscriptions"):
                 new_stream.replace_subscriptions(subscriptions, reason=f"premium_rebuild:{reason}")
             else:
                 new_stream.subscribe(subscriptions)
+            # Register the complete desired set before the websocket thread can
+            # open, so its first on_open always sends every current contract.
+            new_stream.start()
         except Exception:
             logger.exception("PREMIUM_STREAM_REBUILD_FAILED | trigger_index=%s | reason=%s", trigger_index, reason)
             self.option_quote_stream = old_stream
@@ -1976,8 +1978,15 @@ class TradingRuntimeCoordinator:
             pe_age=self._option_ltp_age(pair.pe_id, now),
             max_age_sec=max(self.entry_pair_fresh_ltp_max_age_sec, self.premium_rebuild_verify_sec),
         )
-        if freshness.is_fresh:
+        ce_tick_ts = float(self.option_ltp_last_ts_by_secid.get(int(pair.ce_id or 0), 0.0) or 0.0)
+        pe_tick_ts = float(self.option_ltp_last_ts_by_secid.get(int(pair.pe_id or 0), 0.0) or 0.0)
+        has_post_rebuild_ticks = (
+            ce_tick_ts >= float(self.last_premium_stream_rebuild_ts or 0.0)
+            and pe_tick_ts >= float(self.last_premium_stream_rebuild_ts or 0.0)
+        )
+        if freshness.is_fresh and has_post_rebuild_ticks:
             self.premium_rebuild_pending_until.pop(index, None)
+            self.premium_stale_attempt_ts[index].clear()
             self._clear_tri_wave_data_quarantine(index, "PREMIUM_STREAM")
             logger.warning(
                 "PREMIUM_STREAM_REBUILD_VERIFIED | index=%s | ce_age=%s | pe_age=%s | generation=%s",
@@ -2024,8 +2033,32 @@ class TradingRuntimeCoordinator:
         if not subscriptions:
             return
 
+        verify_remaining = self._premium_rebuild_verify_remaining(now)
+        if verify_remaining > 0:
+            self._replace_tri_wave_data_quarantine(index, "PREMIUM_STREAM_REBUILD_VERIFY", verify_remaining)
+            logger.warning(
+                "PREMIUM_STREAM_RECOVERY_SKIPPED | index=%s | reason=rebuild_in_progress_or_verify | generation=%s | verify_remaining=%.1f | subscriptions=%s",
+                index,
+                self.premium_rebuild_generation,
+                verify_remaining,
+                subscriptions,
+            )
+            return
+
         if self.static_daily_option_pairs:
             self._last_pair_resubscribe_ts[index] = now
+            if self._should_rebuild_premium_stream(index, now):
+                logger.warning(
+                    "TRI_WAVE_PAIR_STALE_STATIC_ESCALATION | index=%s | action=rebuild_option_stream | subscriptions=%s | note=same_contracts",
+                    index,
+                    subscriptions,
+                )
+                self._rebuild_option_quote_stream(
+                    index,
+                    reason=f"static_pair_repeated_stale:{index}",
+                    now=now,
+                )
+                return
             # Static means keep the selected contracts for the session. It must
             # not prevent repairing the transport carrying those contracts.
             self._set_tri_wave_data_quarantine(index, "PAIR_STALE_RECOVERY", self.pair_stale_entry_quarantine_sec)
@@ -2053,18 +2086,6 @@ class TradingRuntimeCoordinator:
                 )
             except Exception:
                 logger.exception("TRI_WAVE_PAIR_STALE_STATIC_RECOVERY_FAILED | index=%s", index)
-            return
-
-        verify_remaining = self._premium_rebuild_verify_remaining(now)
-        if verify_remaining > 0:
-            self._replace_tri_wave_data_quarantine(index, "PREMIUM_STREAM_REBUILD_VERIFY", verify_remaining)
-            logger.warning(
-                "PREMIUM_STREAM_RECOVERY_SKIPPED | index=%s | reason=rebuild_in_progress_or_verify | generation=%s | verify_remaining=%.1f | subscriptions=%s",
-                index,
-                self.premium_rebuild_generation,
-                verify_remaining,
-                subscriptions,
-            )
             return
 
         self._last_pair_resubscribe_ts[index] = now
