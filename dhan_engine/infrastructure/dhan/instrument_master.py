@@ -57,6 +57,7 @@ class InstrumentMaster:
         self._fut_cache = {}
         self._index_cache = {}
         self._equity_cache = {}
+        self._commodity_cache = {}
 
     # ---------------------------------------------------
     # Logging
@@ -195,6 +196,52 @@ class InstrumentMaster:
         }
         self._equity_cache[ticker] = dict(resolved)
         self._log(f"NSE EQUITY selected: {ticker} secid={resolved['security_id']}")
+        return resolved
+
+    def get_nearest_commodity_future(self, symbol: str):
+        """Resolve the nearest active MCX commodity future for a root symbol.
+
+        Examples: GOLD, CRUDEOIL, NATURALGAS. The Dhan instrument master stores
+        these as FUTCOM rows such as GOLD-05Dec2025-FUT.
+        """
+        root = str(symbol).upper().strip()
+        if not root:
+            raise ValueError("Commodity symbol is required")
+        if root in self._commodity_cache:
+            return dict(self._commodity_cache[root])
+
+        df = self.df
+        futures = df[
+            (df["SEM_EXM_EXCH_ID"].astype(str).str.upper() == "MCX")
+            & (df["SEM_SEGMENT"].astype(str).str.upper() == "M")
+            & (df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == "FUTCOM")
+            & (
+                df["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.startswith(f"{root}-", na=False)
+                | (df["SM_SYMBOL_NAME"].astype(str).str.upper() == root)
+                | df["SEM_CUSTOM_SYMBOL"].astype(str).str.upper().str.startswith(root, na=False)
+            )
+        ].copy()
+        futures = futures.dropna(subset=["SEM_EXPIRY_DATE", "SEM_SMST_SECURITY_ID"])
+        now = pd.Timestamp.now()
+        active = futures[futures["SEM_EXPIRY_DATE"] >= now].copy()
+        if active.empty:
+            raise LookupError(f"No active MCX commodity future found for {root}")
+
+        row = active.sort_values("SEM_EXPIRY_DATE").iloc[0]
+        resolved = {
+            "security_id": int(float(row["SEM_SMST_SECURITY_ID"])),
+            "symbol": root,
+            "trading_symbol": str(row["SEM_TRADING_SYMBOL"]),
+            "custom_symbol": str(row["SEM_CUSTOM_SYMBOL"]),
+            "expiry": row["SEM_EXPIRY_DATE"],
+            "lot_size": int(float(row["SEM_LOT_UNITS"])) if "SEM_LOT_UNITS" in row else 1,
+            "exchange_segment": "MCX_COMM",
+        }
+        self._commodity_cache[root] = dict(resolved)
+        self._log(
+            f"MCX COMMODITY FUT selected: {root} {resolved['trading_symbol']} "
+            f"secid={resolved['security_id']}"
+        )
         return resolved
 
     # ---------------------------------------------------
