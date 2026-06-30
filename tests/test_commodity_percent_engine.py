@@ -68,6 +68,32 @@ class CommodityPercentEngineTests(unittest.TestCase):
         self.assertEqual(signal.reason, "COMMODITY_SCALP_MOMENTUM_ALIGNMENT")
         self.assertLess(signal.score, 72.0)
 
+    def test_pullback_reclaim_allows_weak_ret5_with_confirmed_structure(self):
+        engine = PercentNormalizedCommodityEngine(min_samples=8)
+        signal = None
+        features = {
+            "intraday_return_pct": 0.25,
+            "ltp_vs_avg_pct": 0.06,
+            "day_position": 0.65,
+            "depth_imbalance_5": 0.50,
+            "market_queue_imbalance": 0.30,
+            "spread_pct": 0.03,
+            "clean_trade_score": 0.85,
+            "spoof_risk": 0.02,
+            "top_depth_imbalance": 0.30,
+            "recovery_score": 0.40,
+            "exhaustion_score": 0.05,
+        }
+        prices = [72000.0, 72010.0, 72020.0, 72030.0, 72040.0, 72055.0, 72048.0, 72044.0, 72042.0, 72046.0]
+        for index, price in enumerate(prices):
+            signal = engine.on_tick("GOLD", price, features, 100.0 + index, in_position=False)
+        signal = engine.on_tick("GOLD", 72049.0, features, 110.0, in_position=False)
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.action, "ENTRY")
+        self.assertEqual(signal.reason, "COMMODITY_SCALP_PULLBACK_RECLAIM")
+        self.assertLess(signal.features["return_5s_pct"], signal.features["profile_ret5_min"])
+
     def test_symbols_keep_independent_histories(self):
         engine = PercentNormalizedCommodityEngine(min_samples=3)
         engine.on_tick("GOLD", 72000.0, self._strong_features(72000.0), 1.0, in_position=False)

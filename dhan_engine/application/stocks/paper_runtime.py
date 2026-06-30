@@ -50,6 +50,10 @@ class StockPaperSettings:
     trail_giveback_pct: float
     max_hold_sec: float
     entry_cooldown_sec: float
+    score_exit_min_hold_sec: float
+    score_exit_confirmations: int
+    score_exit_fee_guard_sec: float
+    score_exit_min_adverse_fee_ratio: float
     stale_tick_sec: float
     max_daily_loss: float
     max_daily_trades: int
@@ -81,6 +85,10 @@ class StockPaperSettings:
             trail_giveback_pct=float(os.getenv("STOCK_PAPER_TRAIL_GIVEBACK_PCT", "0.25") or 0.25),
             max_hold_sec=float(os.getenv("STOCK_PAPER_MAX_HOLD_SEC", "900") or 900),
             entry_cooldown_sec=float(os.getenv("STOCK_PAPER_ENTRY_COOLDOWN_SEC", "90") or 90),
+            score_exit_min_hold_sec=float(os.getenv("STOCK_SCORE_EXIT_MIN_HOLD_SEC", "25") or 25),
+            score_exit_confirmations=max(1, int(os.getenv("STOCK_SCORE_EXIT_CONFIRMATIONS", "2") or 2)),
+            score_exit_fee_guard_sec=float(os.getenv("STOCK_SCORE_EXIT_FEE_GUARD_SEC", "90") or 90),
+            score_exit_min_adverse_fee_ratio=float(os.getenv("STOCK_SCORE_EXIT_MIN_ADVERSE_FEE_RATIO", "0.75") or 0.75),
             stale_tick_sec=float(os.getenv("STOCK_PAPER_STALE_TICK_SEC", "10") or 10),
             max_daily_loss=float(os.getenv("STOCK_PAPER_MAX_DAILY_LOSS", "3000") or 3000),
             max_daily_trades=int(os.getenv("STOCK_PAPER_MAX_DAILY_TRADES", "20") or 20),
@@ -111,6 +119,8 @@ class StockPaperRuntime:
         self.last_score_log_ts: Dict[str, float] = defaultdict(float)
         self.last_ghost_log_ts: Dict[str, float] = defaultdict(float)
         self.last_exit_ts: Dict[str, float] = defaultdict(float)
+        self.score_exit_weak_count: Dict[int, int] = defaultdict(int)
+        self.last_score_exit_guard_log_ts: Dict[int, float] = defaultdict(float)
         self.last_health_ts = 0.0
         self.daily_trades = 0
         self.daily_date = datetime.now(IST).date()
@@ -165,17 +175,88 @@ class StockPaperRuntime:
         pnl_pct = ((signal.ltp - position.entry) / position.entry) * 100.0
         peak_pct = ((position.peak_ltp - position.entry) / position.entry) * 100.0
         drawdown_pct = ((position.peak_ltp - signal.ltp) / position.peak_ltp) * 100.0
+        hold_sec = now - float(position.entry_ts)
         if pnl_pct <= -abs(self.settings.stop_loss_pct):
+            self.score_exit_weak_count[int(position.secid)] = 0
             return "STOCK_PERCENT_STOP_LOSS"
         if pnl_pct >= self.settings.take_profit_pct:
+            self.score_exit_weak_count[int(position.secid)] = 0
             return "STOCK_PERCENT_TAKE_PROFIT"
         if peak_pct >= self.settings.trail_arm_pct and drawdown_pct >= self.settings.trail_giveback_pct:
+            self.score_exit_weak_count[int(position.secid)] = 0
             return "STOCK_PERCENT_TRAIL"
-        if now - position.entry_ts >= self.settings.max_hold_sec:
+        if hold_sec >= self.settings.max_hold_sec:
+            self.score_exit_weak_count[int(position.secid)] = 0
             return "STOCK_PERCENT_MAX_HOLD"
         if signal.action == "EXIT":
-            return signal.reason
+            if signal.reason != "PERCENT_SCORE_BREAKDOWN":
+                return signal.reason
+            return self._score_breakdown_exit_reason(position, signal, hold_sec, pnl_pct, now)
+        self.score_exit_weak_count[int(position.secid)] = 0
         return None
+
+    def _score_breakdown_exit_reason(self, position, signal, hold_sec: float, pnl_pct: float, now: float) -> str | None:
+        secid = int(position.secid)
+        if hold_sec < self.settings.score_exit_min_hold_sec:
+            self._log_score_exit_guard(
+                position,
+                "MIN_HOLD",
+                hold_sec=hold_sec,
+                pnl_pct=pnl_pct,
+                score=signal.score,
+                required=self.settings.score_exit_min_hold_sec,
+            )
+            return None
+
+        self.score_exit_weak_count[secid] += 1
+        weak_count = int(self.score_exit_weak_count[secid])
+        if weak_count < self.settings.score_exit_confirmations:
+            self._log_score_exit_guard(
+                position,
+                "WAIT_CONFIRMATION",
+                hold_sec=hold_sec,
+                pnl_pct=pnl_pct,
+                score=signal.score,
+                weak_count=weak_count,
+                required=self.settings.score_exit_confirmations,
+            )
+            return None
+
+        gross_pnl = (float(signal.ltp) - float(position.entry)) * int(position.qty)
+        fee_guard = abs(gross_pnl) < (self.settings.round_trip_fee * self.settings.score_exit_min_adverse_fee_ratio)
+        still_inside_discovery = hold_sec < self.settings.score_exit_fee_guard_sec
+        not_real_risk_yet = pnl_pct > -(abs(self.settings.stop_loss_pct) * 0.70)
+        if gross_pnl < 0 and fee_guard and still_inside_discovery and not_real_risk_yet:
+            self._log_score_exit_guard(
+                position,
+                "FEE_GUARD",
+                hold_sec=hold_sec,
+                pnl_pct=pnl_pct,
+                score=signal.score,
+                gross_pnl=gross_pnl,
+                fee=self.settings.round_trip_fee,
+                weak_count=weak_count,
+            )
+            return None
+
+        self.score_exit_weak_count[secid] = 0
+        return "PERCENT_SCORE_BREAKDOWN_CONFIRMED"
+
+    def _log_score_exit_guard(self, position, reason: str, **fields) -> None:
+        now = time.time()
+        secid = int(position.secid)
+        if now - self.last_score_exit_guard_log_ts[secid] < self.settings.heartbeat_sec:
+            return
+        self.last_score_exit_guard_log_ts[secid] = now
+        details = " | ".join(f"{key}={value:.2f}" if isinstance(value, float) else f"{key}={value}" for key, value in fields.items())
+        logger.info(
+            "STOCK_SCORE_EXIT_GUARD | symbol=%s | secid=%s | reason=%s%s%s",
+            position.symbol,
+            secid,
+            reason,
+            " | " if details else "",
+            details,
+        )
 
     def on_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
         now = time.time()

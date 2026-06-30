@@ -1221,6 +1221,23 @@ class TradingRuntimeCoordinator:
             " | " if details else "",
             details,
         )
+        self._log_tri_wave_route_blocked(index, f"BUY_{side}", reason, **fields)
+
+    def _log_tri_wave_route_blocked(self, index: str, action: str, reason: str, **fields) -> None:
+        now = time.time()
+        key = f"{index}:{action}:{reason}"
+        if now - self._last_entry_quality_log_ts[key] < 10:
+            return
+        self._last_entry_quality_log_ts[key] = now
+        details = " | ".join(f"{name}={value}" for name, value in fields.items())
+        logger.info(
+            "TRI_WAVE_ROUTE_BLOCKED | index=%s | action=%s | reason=%s%s%s",
+            index,
+            action,
+            reason,
+            " | " if details else "",
+            details,
+        )
 
     def _try_tri_wave_scale_in(self, pair: PairRuntimeState, side: str, secid: Optional[int], ltp: float, signal, raw: dict, tri_meta: dict) -> bool:
         if not self.scale_in_enabled or not secid or secid not in self.paper_trader.positions:
@@ -1317,6 +1334,15 @@ class TradingRuntimeCoordinator:
                     logger.info("TRI_WAVE_TRADE_STATE_RESET | index=%s | side=%s | entry=%.2f", pair.index, "CE", float(ltp))
                 logger.info("TRI_WAVE_ENTRY_COMMITTED | %s | ltp=%.2f | reason=%s", tag, float(ltp), signal.reason)
                 self._record_tri_wave_portfolio_snapshot(pair.index)
+            else:
+                self._log_tri_wave_route_blocked(
+                    pair.index,
+                    action,
+                    "PAPER_ENTRY_REJECTED",
+                    secid=secid,
+                    ltp=round(float(ltp), 2),
+                    open_positions=len(self.paper_trader.positions),
+                )
             return bool(accepted)
 
         if action == "BUY_PE":
@@ -1337,6 +1363,15 @@ class TradingRuntimeCoordinator:
                     logger.info("TRI_WAVE_TRADE_STATE_RESET | index=%s | side=%s | entry=%.2f", pair.index, "PE", float(ltp))
                 logger.info("TRI_WAVE_ENTRY_COMMITTED | %s | ltp=%.2f | reason=%s", tag, float(ltp), signal.reason)
                 self._record_tri_wave_portfolio_snapshot(pair.index)
+            else:
+                self._log_tri_wave_route_blocked(
+                    pair.index,
+                    action,
+                    "PAPER_ENTRY_REJECTED",
+                    secid=secid,
+                    ltp=round(float(ltp), 2),
+                    open_positions=len(self.paper_trader.positions),
+                )
             return bool(accepted)
 
         if action == "EXIT_CE":
@@ -1513,6 +1548,13 @@ class TradingRuntimeCoordinator:
                 "TRI_WAVE_DAILY_GUARD_BLOCK | index=%s | reason=%s | net_pnl_after_fees=%.2f | opened_today=%s",
                 index, guard_reason, current_pnl, opened_today
             )
+            self._log_tri_wave_route_blocked(
+                index,
+                action,
+                guard_reason,
+                net_pnl_after_fees=round(current_pnl, 2),
+                opened_today=opened_today,
+            )
             return True
 
         fees_paid = float(getattr(self.paper_trader, "fees_paid_today", 0.0) or getattr(self.paper_trader, "fees_paid", 0.0) or 0.0)
@@ -1520,6 +1562,14 @@ class TradingRuntimeCoordinator:
             logger.info(
                 "TRI_WAVE_V2_FEE_GUARD_BLOCK | fees_paid=%.2f | opened_today=%s | net_pnl_after_fees=%.2f",
                 fees_paid, opened_today, current_pnl
+            )
+            self._log_tri_wave_route_blocked(
+                index,
+                action,
+                "FEE_GUARD",
+                fees_paid=round(fees_paid, 2),
+                opened_today=opened_today,
+                net_pnl_after_fees=round(current_pnl, 2),
             )
             return True
 
@@ -1542,6 +1592,15 @@ class TradingRuntimeCoordinator:
                     logger.info(
                         "TRI_WAVE_V2_ENTRY_COOLDOWN_BLOCK | index=%s | elapsed=%.2f | required=%.2f | last_exit_reason=%s | last_net_pnl=%.2f",
                         index, elapsed, required, last_reason, last_net
+                    )
+                    self._log_tri_wave_route_blocked(
+                        index,
+                        action,
+                        "ENTRY_COOLDOWN",
+                        elapsed=round(elapsed, 2),
+                        required=round(required, 2),
+                        last_exit_reason=last_reason,
+                        last_net_pnl=round(last_net, 2),
                     )
                 return True
         return False
