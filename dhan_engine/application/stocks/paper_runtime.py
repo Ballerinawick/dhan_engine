@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -137,6 +138,8 @@ class StockPaperRuntime:
         self.last_exit_ts: Dict[str, float] = defaultdict(float)
         self.score_exit_weak_count: Dict[int, int] = defaultdict(int)
         self.last_score_exit_guard_log_ts: Dict[int, float] = defaultdict(float)
+        self.first_tick_logged_symbols: set[str] = set()
+        self.first_tick_log_enabled = os.getenv("STOCK_FIRST_TICK_LOG_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
         self.last_health_ts = 0.0
         self.daily_trades = 0
         self.daily_date = datetime.now(IST).date()
@@ -324,12 +327,51 @@ class StockPaperRuntime:
             details,
         )
 
+    @staticmethod
+    def _json_safe(value):
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, dict):
+            return {str(key): StockPaperRuntime._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [StockPaperRuntime._json_safe(item) for item in value]
+        return str(value)
+
+    def _log_first_full_tick(self, *, symbol: str, secid: int, tag: str, ltp: float, depth) -> None:
+        if not self.first_tick_log_enabled or symbol in self.first_tick_logged_symbols:
+            return
+        self.first_tick_logged_symbols.add(symbol)
+        payload = {
+            "segment": "stocks",
+            "symbol": symbol,
+            "secid": int(secid),
+            "tag": str(tag),
+            "ltp": float(ltp),
+            "depth": {
+                "bid_price": list(getattr(depth, "bid_price", []) or []),
+                "bid_qty": list(getattr(depth, "bid_qty", []) or []),
+                "ask_price": list(getattr(depth, "ask_price", []) or []),
+                "ask_qty": list(getattr(depth, "ask_qty", []) or []),
+                "ts": float(getattr(depth, "ts", time.time()) or time.time()),
+            },
+            "features": dict(getattr(depth, "features", None) or {}),
+            "raw": dict(getattr(depth, "raw", None) or {}),
+            "diag": dict(getattr(depth, "diag", None) or {}),
+        }
+        logger.info(
+            "STOCK_FIRST_FULL_TICK | symbol=%s | secid=%s | payload=%s",
+            symbol,
+            int(secid),
+            json.dumps(self._json_safe(payload), sort_keys=True, separators=(",", ":")),
+        )
+
     def on_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
         now = time.time()
         instrument = self.instrument_by_secid.get(int(secid))
         if instrument is None or float(ltp) <= 0:
             return
         symbol = str(instrument["symbol"])
+        self._log_first_full_tick(symbol=symbol, secid=int(secid), tag=str(tag), ltp=float(ltp), depth=depth)
         self._reset_day_if_needed(now)
         self.last_tick_ts[symbol] = now
         self.portfolio.mark(secid, ltp, now)
