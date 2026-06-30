@@ -49,10 +49,12 @@ class StockPercentEngineTests(unittest.TestCase):
         signal = None
         features = {
             "intraday_return_pct": 0.05,
-            "ltp_vs_avg_pct": -0.05,
+            "ltp_vs_avg_pct": 0.03,
             "day_position": 0.55,
             "depth_imbalance_5": 0.20,
-            "market_queue_imbalance": 0.12,
+            "top_depth_imbalance": 0.18,
+            "market_queue_imbalance": 0.16,
+            "pressure_score": 0.10,
             "spread_pct": 0.03,
             "clean_trade_score": 0.70,
             "spoof_risk": 0.05,
@@ -65,6 +67,31 @@ class StockPercentEngineTests(unittest.TestCase):
         self.assertEqual(signal.action, "ENTRY")
         self.assertEqual(signal.reason, "STOCK_SCALP_MOMENTUM_ALIGNMENT")
         self.assertLess(signal.score, 72.0)
+
+    def test_support_watch_without_reclaim_blocks_reliance_style_tick(self):
+        engine = PercentNormalizedStockEngine(min_samples=3)
+        signal = None
+        features = {
+            "intraday_return_pct": -1.071,
+            "ltp_vs_avg_pct": -0.226,
+            "day_position": 0.1716,
+            "depth_imbalance_5": 0.593,
+            "top_depth_imbalance": -0.906,
+            "market_queue_imbalance": -0.103,
+            "pressure_score": -0.101,
+            "spread_pct": 0.0077,
+            "clean_trade_score": 0.951,
+            "spoof_risk": 0.0,
+            "buy_sell_qty_ratio": 0.814,
+        }
+        for index in range(8):
+            signal = engine.on_tick("RELIANCE", 1292.9 + (index * 0.02), features, 100.0 + index, in_position=False)
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.action, "HOLD")
+        self.assertEqual(signal.reason, "SUPPORT_WATCH_NO_RECLAIM")
+        self.assertEqual(signal.features["support_watch"], 1.0)
+        self.assertEqual(signal.features["long_entry_ready"], 0.0)
 
     def test_symbols_keep_independent_histories(self):
         engine = PercentNormalizedStockEngine(min_samples=3)
