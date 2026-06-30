@@ -1,11 +1,16 @@
 import os
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
 
 import pandas as pd
 
+sys.modules.setdefault("websocket", SimpleNamespace(WebSocketApp=object))
+sys.modules.setdefault("requests", SimpleNamespace(Session=object, get=lambda *_, **__: None, post=lambda *_, **__: None))
+
 from dhan_engine.application.commodities.paper_runtime import CommodityPaperRuntime
+from dhan_engine.domain.commodities.tick_state import CommodityLiveTickStore
 from dhan_engine.domain.commodities.percent_engine import PercentNormalizedCommodityEngine
 from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
 from dhan_engine.simulations.commodity_paper_portfolio import CommodityPaperPortfolio, CommodityPaperPosition
@@ -121,6 +126,60 @@ class CommodityPercentEngineTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertEqual(signal.action, "HOLD")
         self.assertIn(signal.reason, {"CLEAN_TRADE_WEAK", "SCORE_BELOW_PROFILE"})
+
+    def test_crude_first_tick_is_breakout_watch_not_ready_entry(self):
+        store = CommodityLiveTickStore(max_spread_pct=0.22)
+        state = store.update(
+            "CRUDEOIL",
+            6730.0,
+            {
+                "intraday_return_pct": 0.38782816229116945,
+                "ltp_vs_avg_pct": 0.8112836736650346,
+                "day_position": 1.0,
+                "depth_imbalance_5": 0.072,
+                "market_queue_imbalance": 0.38746438746438744,
+                "spread_pct": 0.029717682020802376,
+                "clean_trade_score": 0.8142644873699851,
+                "spoof_risk": 0.0,
+                "top_depth_imbalance": 0.0,
+                "pressure_score": 0.06516376068376067,
+                "recovery_score": 0.06516376068376067,
+                "exhaustion_score": 0.13500000000000004,
+                "buy_sell_qty_ratio": 2.2651162790697676,
+            },
+            100.0,
+        )
+
+        self.assertTrue(state.breakout_watch)
+        self.assertFalse(state.long_entry_ready)
+        self.assertGreaterEqual(state.breakout_score, 50.0)
+        self.assertEqual(state.market_state_code, 2.0)
+
+    def test_crude_confirmed_momentum_becomes_live_entry_ready(self):
+        store = CommodityLiveTickStore(max_spread_pct=0.22)
+        state = None
+        features = {
+            "intraday_return_pct": 0.45,
+            "ltp_vs_avg_pct": 0.20,
+            "day_position": 0.86,
+            "depth_imbalance_5": 0.34,
+            "market_queue_imbalance": 0.30,
+            "spread_pct": 0.03,
+            "clean_trade_score": 0.82,
+            "spoof_risk": 0.02,
+            "top_depth_imbalance": 0.22,
+            "pressure_score": 0.20,
+            "recovery_score": 0.35,
+            "exhaustion_score": 0.04,
+            "buy_sell_qty_ratio": 1.80,
+        }
+        for index in range(8):
+            state = store.update("CRUDEOIL", 6730.0 + index, features, 100.0 + index)
+
+        self.assertIsNotNone(state)
+        self.assertTrue(state.long_entry_ready)
+        self.assertGreaterEqual(state.entry_quality_score, 56.0)
+        self.assertLessEqual(state.trap_risk_score, 45.0)
 
 
 class CommodityPaperPortfolioTests(unittest.TestCase):

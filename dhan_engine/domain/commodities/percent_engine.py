@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Deque, Dict, Optional
 
 from dhan_engine.domain.intelligence.scalp_swing_brain import evaluate_long_opportunity
+from dhan_engine.domain.commodities.tick_state import CommodityLiveTickStore
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -125,6 +126,7 @@ class PercentNormalizedCommodityEngine:
         self.min_samples = max(int(min_samples), 3)
         self.max_spread_pct = float(max_spread_pct)
         self.history: Dict[str, Deque[dict]] = defaultdict(lambda: deque(maxlen=max_samples))
+        self.live_store = CommodityLiveTickStore(max_samples=max_samples, max_spread_pct=max_spread_pct)
 
     @staticmethod
     def _profile(symbol: str) -> Dict[str, float]:
@@ -154,6 +156,7 @@ class PercentNormalizedCommodityEngine:
         samples = self.history[root]
         previous = float(samples[-1]["ltp"]) if samples else price
         samples.append({"ts": float(ts), "ltp": price})
+        live_state = self.live_store.update(root, price, features, ts)
 
         return_1tick = _pct_change(price, previous)
         return_5s = _pct_change(price, self._price_at_or_before(samples, ts - 5.0))
@@ -260,11 +263,14 @@ class PercentNormalizedCommodityEngine:
             "sample_count": float(len(samples)),
         }
         normalized.update(brain.as_features())
+        normalized.update(live_state.as_features())
 
         if len(samples) < self.min_samples:
             return CommodityPercentSignal(root, "HOLD", score, price, "WARMUP", normalized)
         if spread_pct > effective_max_spread:
             return CommodityPercentSignal(root, "HOLD", score, price, "SPREAD_TOO_WIDE", normalized)
+        if in_position and live_state.exit_ready:
+            return CommodityPercentSignal(root, "EXIT", score, price, "COMMODITY_EXIT_PRESSURE_CONFIRMED", normalized)
         if in_position and score <= self.exit_score:
             return CommodityPercentSignal(root, "EXIT", score, price, "COMMODITY_SCORE_BREAKDOWN", normalized)
         if in_position:
@@ -277,6 +283,8 @@ class PercentNormalizedCommodityEngine:
             ("DAY_POSITION_EXTENDED", day_position <= float(profile["max_day_position"])),
             ("ORDERFLOW_WEAK", orderflow >= float(profile["min_orderflow"])),
             ("SMART_RISK_HIGH", brain.risk_score <= 68.0),
+            ("COMMODITY_TRAP_RISK_HIGH", live_state.trap_risk_score <= 68.0),
+            ("COMMODITY_LIVE_TICK_NOT_READY", live_state.long_entry_ready),
         ]
         for reason, passed in shared_checks:
             if not passed:
