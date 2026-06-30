@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Deque, Dict, Optional
 
 from dhan_engine.domain.intelligence.scalp_swing_brain import evaluate_long_opportunity
+from dhan_engine.domain.stocks.tick_state import StockLiveTickStore
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -73,6 +74,7 @@ class PercentNormalizedStockEngine:
         self.min_samples = max(int(min_samples), 3)
         self.max_spread_pct = float(max_spread_pct)
         self.history: Dict[str, Deque[dict]] = defaultdict(lambda: deque(maxlen=max_samples))
+        self.live_store = StockLiveTickStore(max_samples=max_samples, max_spread_pct=max_spread_pct)
 
     @staticmethod
     def _profile(symbol: str) -> Dict[str, float]:
@@ -99,6 +101,7 @@ class PercentNormalizedStockEngine:
         ticker = str(symbol).upper().strip()
         price = float(ltp)
         features = dict(raw_features or {})
+        live_state = self.live_store.update(ticker, price, features, ts)
         samples = self.history[ticker]
         previous = float(samples[-1]["ltp"]) if samples else price
         samples.append({"ts": float(ts), "ltp": price})
@@ -171,6 +174,7 @@ class PercentNormalizedStockEngine:
             "score": score,
             "sample_count": float(len(samples)),
         }
+        normalized.update(live_state.as_features())
         normalized.update(brain.as_features())
 
         if len(samples) < self.min_samples:
@@ -189,6 +193,8 @@ class PercentNormalizedStockEngine:
             ("ORDERFLOW_WEAK", orderflow >= float(profile["min_orderflow"])),
             ("LIQUIDITY_WEAK", liquidity >= float(profile["min_liquidity"])),
             ("SMART_RISK_HIGH", brain.risk_score <= 68.0),
+            ("SUPPORT_WATCH_NO_RECLAIM", not live_state.support_watch),
+            ("LIVE_TICK_NOT_READY", live_state.long_entry_ready),
             ("DAY_POSITION_LOW", day_position >= float(profile["min_day_position"])),
             ("DAY_POSITION_EXTENDED", day_position <= float(profile["max_day_position"])),
         ]
