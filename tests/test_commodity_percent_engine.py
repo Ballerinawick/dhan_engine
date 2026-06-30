@@ -1,12 +1,14 @@
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import pandas as pd
 
+from dhan_engine.application.commodities.paper_runtime import CommodityPaperRuntime
 from dhan_engine.domain.commodities.percent_engine import PercentNormalizedCommodityEngine
 from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
-from dhan_engine.simulations.commodity_paper_portfolio import CommodityPaperPortfolio
+from dhan_engine.simulations.commodity_paper_portfolio import CommodityPaperPortfolio, CommodityPaperPosition
 
 
 class CommodityPercentEngineTests(unittest.TestCase):
@@ -136,6 +138,56 @@ class CommodityPaperPortfolioTests(unittest.TestCase):
         self.assertIsNotNone(trade)
         self.assertAlmostEqual(trade["net_pnl"], 270.0)
         self.assertEqual(len(portfolio.positions), 1)
+
+    def test_adaptive_exit_cuts_naturalgas_fee_dead_trade_before_max_hold(self):
+        runtime = CommodityPaperRuntime.__new__(CommodityPaperRuntime)
+        runtime.settings = SimpleNamespace(
+            stop_loss_pct=0.22,
+            take_profit_pct=0.45,
+            trail_arm_pct=0.25,
+            trail_giveback_pct=0.16,
+            max_hold_sec=900.0,
+            round_trip_fee=60.0,
+            adaptive_exit_enabled=True,
+            profit_lock_min_hold_sec=120.0,
+            profit_lock_min_fee_multiple=1.50,
+            profit_lock_giveback_fee_multiple=0.75,
+            dead_trade_sec=300.0,
+            dead_trade_fee_ratio=0.90,
+            dead_trade_max_score=46.0,
+            dead_trade_min_net_fee_multiple=0.50,
+        )
+        position = CommodityPaperPosition(
+            secid=1,
+            symbol="NATURALGAS",
+            trading_symbol="NATURALGAS-24Dec2026-FUT",
+            qty=246,
+            entry=303.70,
+            entry_ts=100.0,
+            last_ltp=303.70,
+            last_tick_ts=360.0,
+            peak_ltp=303.72,
+            entry_score=68.0,
+        )
+        signal = SimpleNamespace(
+            action="HOLD",
+            reason="POSITION_HELD",
+            ltp=303.70,
+            score=43.0,
+            features={
+                "orderflow_score": 45.0,
+                "scalp_confidence": 44.0,
+                "exhaustion_pct": 20.0,
+                "return_5s_pct": -0.01,
+                "return_30s_pct": -0.02,
+                "return_120s_pct": -0.01,
+            },
+        )
+
+        self.assertEqual(
+            runtime._position_exit_reason(position, signal, 350.0),
+            "COMMODITY_ADAPTIVE_DEAD_SCALP_EXIT",
+        )
 
 
 class CommodityInstrumentResolutionTests(unittest.TestCase):

@@ -132,6 +132,92 @@ class StockPaperPortfolioTests(unittest.TestCase):
             "PERCENT_SCORE_BREAKDOWN_CONFIRMED",
         )
 
+    def test_adaptive_exit_locks_profit_after_fee_aware_giveback(self):
+        runtime = StockPaperRuntime.__new__(StockPaperRuntime)
+        runtime.settings = SimpleNamespace(
+            stop_loss_pct=0.35,
+            take_profit_pct=0.80,
+            trail_arm_pct=0.80,
+            trail_giveback_pct=0.50,
+            max_hold_sec=900.0,
+            round_trip_fee=40.0,
+            adaptive_exit_enabled=True,
+            profit_lock_min_hold_sec=90.0,
+            profit_lock_min_fee_multiple=1.60,
+            profit_lock_giveback_fee_multiple=0.80,
+            dead_trade_sec=360.0,
+            dead_trade_fee_ratio=0.85,
+            dead_trade_max_score=45.0,
+            dead_trade_min_net_fee_multiple=0.50,
+        )
+        runtime.score_exit_weak_count = defaultdict(int)
+        position = StockPaperPosition(
+            secid=1,
+            symbol="SBIN",
+            qty=72,
+            entry=1000.0,
+            entry_ts=100.0,
+            last_ltp=1001.0,
+            last_tick_ts=200.0,
+            peak_ltp=1001.8,
+            entry_score=60.0,
+        )
+        signal = SimpleNamespace(
+            action="HOLD",
+            reason="POSITION_HELD",
+            ltp=1001.0,
+            score=52.0,
+            features={"orderflow_score": 55.0, "scalp_confidence": 56.0, "return_5s_pct": 0.01, "return_30s_pct": 0.03},
+        )
+
+        self.assertEqual(
+            runtime._position_exit_reason(position, signal, 220.0),
+            "STOCK_ADAPTIVE_PROFIT_LOCK",
+        )
+
+    def test_adaptive_exit_cuts_dead_stock_scalp_before_max_hold(self):
+        runtime = StockPaperRuntime.__new__(StockPaperRuntime)
+        runtime.settings = SimpleNamespace(
+            stop_loss_pct=0.35,
+            take_profit_pct=0.80,
+            trail_arm_pct=0.40,
+            trail_giveback_pct=0.25,
+            max_hold_sec=900.0,
+            round_trip_fee=40.0,
+            adaptive_exit_enabled=True,
+            dead_trade_sec=360.0,
+            dead_trade_fee_ratio=0.85,
+            dead_trade_max_score=45.0,
+            dead_trade_min_net_fee_multiple=0.50,
+            profit_lock_min_hold_sec=90.0,
+            profit_lock_min_fee_multiple=1.60,
+            profit_lock_giveback_fee_multiple=0.80,
+        )
+        runtime.score_exit_weak_count = defaultdict(int)
+        position = StockPaperPosition(
+            secid=1,
+            symbol="SBIN",
+            qty=72,
+            entry=1000.0,
+            entry_ts=100.0,
+            last_ltp=999.90,
+            last_tick_ts=500.0,
+            peak_ltp=1000.10,
+            entry_score=60.0,
+        )
+        signal = SimpleNamespace(
+            action="HOLD",
+            reason="POSITION_HELD",
+            ltp=999.90,
+            score=42.0,
+            features={"orderflow_score": 44.0, "scalp_confidence": 40.0, "return_5s_pct": -0.01, "return_30s_pct": -0.02},
+        )
+
+        self.assertEqual(
+            runtime._position_exit_reason(position, signal, 470.0),
+            "STOCK_ADAPTIVE_DEAD_SCALP_EXIT",
+        )
+
 
 class EquityInstrumentResolutionTests(unittest.TestCase):
     def test_exact_nse_equity_resolution(self):

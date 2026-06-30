@@ -59,6 +59,14 @@ class CommodityPaperSettings:
     trail_arm_pct: float
     trail_giveback_pct: float
     max_hold_sec: float
+    adaptive_exit_enabled: bool
+    profit_lock_min_hold_sec: float
+    profit_lock_min_fee_multiple: float
+    profit_lock_giveback_fee_multiple: float
+    dead_trade_sec: float
+    dead_trade_fee_ratio: float
+    dead_trade_max_score: float
+    dead_trade_min_net_fee_multiple: float
     entry_cooldown_sec: float
     stale_tick_sec: float
     max_daily_loss: float
@@ -91,6 +99,14 @@ class CommodityPaperSettings:
             trail_arm_pct=float(os.getenv("COMMODITY_PAPER_TRAIL_ARM_PCT", "0.25") or 0.25),
             trail_giveback_pct=float(os.getenv("COMMODITY_PAPER_TRAIL_GIVEBACK_PCT", "0.16") or 0.16),
             max_hold_sec=float(os.getenv("COMMODITY_PAPER_MAX_HOLD_SEC", "900") or 900),
+            adaptive_exit_enabled=os.getenv("COMMODITY_ADAPTIVE_EXIT_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"},
+            profit_lock_min_hold_sec=float(os.getenv("COMMODITY_PROFIT_LOCK_MIN_HOLD_SEC", "120") or 120),
+            profit_lock_min_fee_multiple=float(os.getenv("COMMODITY_PROFIT_LOCK_MIN_FEE_MULTIPLE", "1.50") or 1.50),
+            profit_lock_giveback_fee_multiple=float(os.getenv("COMMODITY_PROFIT_LOCK_GIVEBACK_FEE_MULTIPLE", "0.75") or 0.75),
+            dead_trade_sec=float(os.getenv("COMMODITY_DEAD_TRADE_SEC", "300") or 300),
+            dead_trade_fee_ratio=float(os.getenv("COMMODITY_DEAD_TRADE_FEE_RATIO", "0.90") or 0.90),
+            dead_trade_max_score=float(os.getenv("COMMODITY_DEAD_TRADE_MAX_SCORE", "46") or 46),
+            dead_trade_min_net_fee_multiple=float(os.getenv("COMMODITY_DEAD_TRADE_MIN_NET_FEE_MULTIPLE", "0.50") or 0.50),
             entry_cooldown_sec=float(os.getenv("COMMODITY_PAPER_ENTRY_COOLDOWN_SEC", "60") or 60),
             stale_tick_sec=float(os.getenv("COMMODITY_PAPER_STALE_TICK_SEC", "12") or 12),
             max_daily_loss=float(os.getenv("COMMODITY_PAPER_MAX_DAILY_LOSS", "3000") or 3000),
@@ -200,10 +216,64 @@ class CommodityPaperRuntime:
             return "COMMODITY_PERCENT_TAKE_PROFIT"
         if peak_pct >= self.settings.trail_arm_pct and drawdown_pct >= self.settings.trail_giveback_pct:
             return "COMMODITY_PERCENT_TRAIL"
+        adaptive_reason = self._adaptive_exit_reason(position, signal, now - float(position.entry_ts))
+        if adaptive_reason:
+            return adaptive_reason
         if now - position.entry_ts >= self.settings.max_hold_sec:
             return "COMMODITY_PERCENT_MAX_HOLD"
         if signal.action == "EXIT":
             return signal.reason
+        return None
+
+    def _adaptive_exit_reason(self, position, signal, hold_sec: float) -> str | None:
+        if not getattr(self.settings, "adaptive_exit_enabled", True):
+            return None
+
+        qty = max(int(position.qty), 1)
+        current_gross = (float(signal.ltp) - float(position.entry)) * qty
+        peak_gross = (float(position.peak_ltp) - float(position.entry)) * qty
+        giveback_gross = max(0.0, peak_gross - current_gross)
+        fee = max(float(getattr(self.settings, "round_trip_fee", 0.0) or 0.0), 0.0)
+        net_after_fee = current_gross - fee
+        features = getattr(signal, "features", {}) or {}
+        score = float(getattr(signal, "score", 0.0) or 0.0)
+        ret5 = float(features.get("return_5s_pct", 0.0) or 0.0)
+        ret30 = float(features.get("return_30s_pct", 0.0) or 0.0)
+        ret120 = float(features.get("return_120s_pct", 0.0) or 0.0)
+        orderflow = float(features.get("orderflow_score", 50.0) or 50.0)
+        scalp_conf = float(features.get("scalp_confidence", 0.0) or 0.0)
+        exhaustion = float(features.get("exhaustion_pct", 0.0) or 0.0)
+        symbol = str(getattr(position, "symbol", "") or "").upper()
+        dead_trade_sec = float(getattr(self.settings, "dead_trade_sec", 300.0) or 300.0)
+        if symbol == "NATURALGAS":
+            dead_trade_sec = min(dead_trade_sec, 240.0)
+
+        if (
+            hold_sec >= float(getattr(self.settings, "profit_lock_min_hold_sec", 120.0) or 120.0)
+            and fee > 0
+            and peak_gross >= fee * float(getattr(self.settings, "profit_lock_min_fee_multiple", 1.50) or 1.50)
+            and giveback_gross >= fee * float(getattr(self.settings, "profit_lock_giveback_fee_multiple", 0.75) or 0.75)
+            and net_after_fee > 0
+        ):
+            return "COMMODITY_ADAPTIVE_PROFIT_LOCK"
+
+        weak_edge = (
+            score <= float(getattr(self.settings, "dead_trade_max_score", 46.0) or 46.0)
+            or scalp_conf < 48.0
+            or exhaustion >= 55.0
+        )
+        flow_faded = orderflow < 48.0 or (ret5 <= 0.0 and ret30 <= 0.0 and ret120 <= 0.0)
+        dead_zone = abs(current_gross) <= fee * float(getattr(self.settings, "dead_trade_fee_ratio", 0.90) or 0.90)
+        real_loss_after_fee = net_after_fee <= -(fee * float(getattr(self.settings, "dead_trade_min_net_fee_multiple", 0.50) or 0.50))
+        if (
+            hold_sec >= dead_trade_sec
+            and fee > 0
+            and weak_edge
+            and flow_faded
+            and (dead_zone or real_loss_after_fee)
+        ):
+            return "COMMODITY_ADAPTIVE_DEAD_SCALP_EXIT"
+
         return None
 
     def on_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
@@ -376,6 +446,17 @@ class CommodityPaperRuntime:
                     signal.features.get("exit_plan_code", 0.0),
                     signal.reason,
                 )
+            else:
+                logger.info(
+                    "COMMODITY_ENTRY_REJECTED | symbol=%s | contract=%s | secid=%s | reason=PORTFOLIO_REJECTED | cash=%.2f | open_positions=%s | max_positions=%s | ltp=%.2f",
+                    symbol,
+                    instrument["trading_symbol"],
+                    secid,
+                    self.portfolio.cash,
+                    len(self.portfolio.positions),
+                    self.settings.max_positions,
+                    float(ltp),
+                )
         elif signal.action == "ENTRY":
             logger.info(
                 "COMMODITY_ENTRY_REJECTED | symbol=%s | contract=%s | reason=RUNTIME_GUARD | market_open=%s | trades_today=%s | open_positions=%s | stale_age=%.1fs | cooldown_left=%.1fs",
@@ -396,6 +477,10 @@ class CommodityPaperRuntime:
             f"{symbol}:{(now - ts):.1f}s" for symbol, ts in sorted(self.last_tick_ts.items())
         ) or "waiting"
         stale = [symbol for symbol, ts in self.last_tick_ts.items() if now - ts > self.settings.stale_tick_sec]
+        unrealized = self.portfolio.unrealized_pnl()
+        realized = self.portfolio.realized_pnl
+        daily_realized = realized - self.daily_realized_start
+        net_pnl = realized + unrealized
         logger.info(
             "COMMODITY_FEED_HEALTH | symbols=%s | tick_ages=%s | stale=%s | open_positions=%s | cash=%.2f | equity=%.2f | realized=%+.2f | unrealized=%+.2f | trades_today=%s",
             ",".join(self.settings.symbols),
@@ -404,9 +489,29 @@ class CommodityPaperRuntime:
             len(self.portfolio.positions),
             self.portfolio.cash,
             self.portfolio.equity(),
-            self.portfolio.realized_pnl,
-            self.portfolio.unrealized_pnl(),
+            realized,
+            unrealized,
             self.daily_trades,
+        )
+        self.trade_summary_sink.record_portfolio(
+            "commodities",
+            {
+                "symbols": list(self.settings.symbols),
+                "capital": self.settings.capital,
+                "cash": self.portfolio.cash,
+                "equity": self.portfolio.equity(),
+                "realized_pnl": realized,
+                "unrealized_pnl": unrealized,
+                "net_pnl": net_pnl,
+                "daily_realized_pnl": daily_realized,
+                "daily_unrealized_pnl": unrealized,
+                "daily_net_pnl": daily_realized + unrealized,
+                "open_positions": len(self.portfolio.positions),
+                "trades_today": self.daily_trades,
+                "closed_trades": self.portfolio.closed_trades,
+                "runtime": "commodity_percent_paper",
+                "strategy": "percent_normalized_v1",
+            },
         )
 
     def run(self) -> None:
