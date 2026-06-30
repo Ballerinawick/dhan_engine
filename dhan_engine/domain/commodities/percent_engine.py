@@ -4,6 +4,8 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Deque, Dict, Optional
 
+from dhan_engine.domain.intelligence.scalp_swing_brain import evaluate_long_opportunity
+
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, float(value)))
@@ -190,6 +192,24 @@ class PercentNormalizedCommodityEngine:
             + (0.04 * clean_trade)
             - (0.04 * spoof_risk)
         )
+        brain = evaluate_long_opportunity(
+            base_score=score,
+            return_1tick=return_1tick,
+            return_5s=return_5s,
+            return_30s=return_30s,
+            return_120s=return_120s,
+            ltp_vs_avg=ltp_vs_avg,
+            day_position=day_position,
+            orderflow=orderflow,
+            liquidity=liquidity,
+            clean_trade=clean_trade,
+            spoof_risk=spoof_risk,
+            spread_pct=spread_pct,
+            max_spread_pct=effective_max_spread,
+            profile=profile,
+            exhaustion=exhaustion_score,
+            recovery=recovery_score,
+        )
         normalized = {
             "return_1tick_pct": return_1tick,
             "return_5s_pct": return_5s,
@@ -224,6 +244,7 @@ class PercentNormalizedCommodityEngine:
             "score": score,
             "sample_count": float(len(samples)),
         }
+        normalized.update(brain.as_features())
 
         if len(samples) < self.min_samples:
             return CommodityPercentSignal(root, "HOLD", score, price, "WARMUP", normalized)
@@ -240,13 +261,15 @@ class PercentNormalizedCommodityEngine:
             ("DAY_POSITION_LOW", day_position >= float(profile["min_day_position"])),
             ("DAY_POSITION_EXTENDED", day_position <= float(profile["max_day_position"])),
             ("ORDERFLOW_WEAK", orderflow >= float(profile["min_orderflow"])),
+            ("SMART_RISK_HIGH", brain.risk_score <= 68.0),
         ]
         for reason, passed in shared_checks:
             if not passed:
                 return CommodityPercentSignal(root, "HOLD", score, price, reason, normalized)
 
         swing_checks = [
-            ("SWING_SCORE_BELOW_PROFILE", score >= effective_swing_score),
+            ("SWING_SCORE_BELOW_PROFILE", brain.swing_confidence >= effective_swing_score),
+            ("SWING_RAW_SCORE_BELOW_PROFILE", score >= effective_swing_score),
             ("SWING_RET30_WEAK", return_30s >= float(profile["swing_ret30"])),
             ("SWING_RET120_WEAK", return_120s >= float(profile["swing_ret120"])),
             ("SWING_VWAP_BIAS_WEAK", ltp_vs_avg >= max(0.0, float(profile["vwap"]))),
@@ -256,7 +279,7 @@ class PercentNormalizedCommodityEngine:
             return CommodityPercentSignal(root, "ENTRY", score, price, "COMMODITY_SWING_MOMENTUM_ALIGNMENT", normalized)
 
         scalp_checks = [
-            ("SCALP_SCORE_BELOW_PROFILE", score >= effective_scalp_score),
+            ("SCALP_SCORE_BELOW_PROFILE", brain.scalp_confidence >= effective_scalp_score),
             ("SCALP_RET5_WEAK", return_5s >= float(profile["ret5"])),
             ("SCALP_RET30_WEAK", return_30s >= float(profile["ret30"])),
             ("SCALP_RET120_WEAK", return_120s >= float(profile["ret120"])),

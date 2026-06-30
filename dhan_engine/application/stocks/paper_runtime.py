@@ -108,6 +108,7 @@ class StockPaperRuntime:
         self.secid_by_symbol: Dict[str, int] = {}
         self.last_tick_ts: Dict[str, float] = defaultdict(float)
         self.last_score_log_ts: Dict[str, float] = defaultdict(float)
+        self.last_ghost_log_ts: Dict[str, float] = defaultdict(float)
         self.last_exit_ts: Dict[str, float] = defaultdict(float)
         self.last_health_ts = 0.0
         self.daily_trades = 0
@@ -195,11 +196,35 @@ class StockPaperRuntime:
         if now - self.last_score_log_ts[symbol] >= self.settings.heartbeat_sec:
             self.last_score_log_ts[symbol] = now
             logger.info(
-                "STOCK_PERCENT_STATE | symbol=%s | ltp=%.2f | score=%.1f | ret5=%.3f%% | ret30=%.3f%% | vwap=%.3f%% | spread=%.3f%% | action=%s | reason=%s",
+                "STOCK_PERCENT_STATE | symbol=%s | ltp=%.2f | score=%.1f | opp=%.1f | risk=%.1f | scalp=%.1f | swing=%.1f | regime=%.0f | exit_plan=%.0f | ret5=%.3f%% | ret30=%.3f%% | vwap=%.3f%% | spread=%.3f%% | action=%s | reason=%s",
                 symbol, float(ltp), signal.score,
+                signal.features.get("opportunity_score", 0.0),
+                signal.features.get("risk_score", 0.0),
+                signal.features.get("scalp_confidence", 0.0),
+                signal.features.get("swing_confidence", 0.0),
+                signal.features.get("regime_code", 0.0),
+                signal.features.get("exit_plan_code", 0.0),
                 signal.features["return_5s_pct"], signal.features["return_30s_pct"],
                 signal.features["ltp_vs_avg_pct"], signal.features["spread_pct"],
                 signal.action, signal.reason,
+            )
+
+        if (
+            signal.action == "HOLD"
+            and signal.features.get("ghost_candidate", 0.0) >= 1.0
+            and now - self.last_ghost_log_ts[symbol] >= self.settings.heartbeat_sec
+        ):
+            self.last_ghost_log_ts[symbol] = now
+            logger.info(
+                "STOCK_GHOST_OPPORTUNITY | symbol=%s | ltp=%.2f | opp=%.1f | risk=%.1f | scalp=%.1f | swing=%.1f | regime=%.0f | blocked_by=%s",
+                symbol,
+                float(ltp),
+                signal.features.get("opportunity_score", 0.0),
+                signal.features.get("risk_score", 0.0),
+                signal.features.get("scalp_confidence", 0.0),
+                signal.features.get("swing_confidence", 0.0),
+                signal.features.get("regime_code", 0.0),
+                signal.reason,
             )
 
         if position is not None:
@@ -221,8 +246,17 @@ class StockPaperRuntime:
                 self.daily_trades += 1
                 position = self.portfolio.positions[int(secid)]
                 logger.info(
-                    "STOCK_ENTRY_COMMITTED | symbol=%s | secid=%s | qty=%s | entry=%.2f | score=%.1f | reason=%s",
-                    symbol, secid, position.qty, float(ltp), signal.score, signal.reason,
+                    "STOCK_ENTRY_COMMITTED | symbol=%s | secid=%s | qty=%s | entry=%.2f | score=%.1f | opp=%.1f | risk=%.1f | mode=%.0f | exit_plan=%.0f | reason=%s",
+                    symbol,
+                    secid,
+                    position.qty,
+                    float(ltp),
+                    signal.score,
+                    signal.features.get("opportunity_score", 0.0),
+                    signal.features.get("risk_score", 0.0),
+                    signal.features.get("entry_mode", 0.0),
+                    signal.features.get("exit_plan_code", 0.0),
+                    signal.reason,
                 )
 
     def _health(self, now: float) -> None:

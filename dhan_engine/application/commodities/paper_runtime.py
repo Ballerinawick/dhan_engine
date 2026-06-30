@@ -123,6 +123,7 @@ class CommodityPaperRuntime:
         self.last_tick_ts: Dict[str, float] = defaultdict(float)
         self.last_score_log_ts: Dict[str, float] = defaultdict(float)
         self.last_audit_log_ts: Dict[str, float] = defaultdict(float)
+        self.last_ghost_log_ts: Dict[str, float] = defaultdict(float)
         self.last_exit_ts: Dict[str, float] = defaultdict(float)
         self.last_health_ts = 0.0
         self.daily_trades = 0
@@ -225,11 +226,17 @@ class CommodityPaperRuntime:
         if now - self.last_score_log_ts[symbol] >= self.settings.heartbeat_sec:
             self.last_score_log_ts[symbol] = now
             logger.info(
-                "COMMODITY_PERCENT_STATE | symbol=%s | contract=%s | ltp=%.2f | score=%.1f | ret5=%.3f%% | ret30=%.3f%% | ret120=%.3f%% | vwap=%.3f%% | spread=%.3f%% | action=%s | reason=%s",
+                "COMMODITY_PERCENT_STATE | symbol=%s | contract=%s | ltp=%.2f | score=%.1f | opp=%.1f | risk=%.1f | scalp=%.1f | swing=%.1f | regime=%.0f | exit_plan=%.0f | ret5=%.3f%% | ret30=%.3f%% | ret120=%.3f%% | vwap=%.3f%% | spread=%.3f%% | action=%s | reason=%s",
                 symbol,
                 instrument["trading_symbol"],
                 float(ltp),
                 signal.score,
+                signal.features.get("opportunity_score", 0.0),
+                signal.features.get("risk_score", 0.0),
+                signal.features.get("scalp_confidence", 0.0),
+                signal.features.get("swing_confidence", 0.0),
+                signal.features.get("regime_code", 0.0),
+                signal.features.get("exit_plan_code", 0.0),
                 signal.features["return_5s_pct"],
                 signal.features["return_30s_pct"],
                 signal.features["return_120s_pct"],
@@ -239,10 +246,29 @@ class CommodityPaperRuntime:
                 signal.reason,
             )
 
+        if (
+            signal.action == "HOLD"
+            and signal.features.get("ghost_candidate", 0.0) >= 1.0
+            and now - self.last_ghost_log_ts[symbol] >= self.settings.heartbeat_sec
+        ):
+            self.last_ghost_log_ts[symbol] = now
+            logger.info(
+                "COMMODITY_GHOST_OPPORTUNITY | symbol=%s | contract=%s | ltp=%.2f | opp=%.1f | risk=%.1f | scalp=%.1f | swing=%.1f | regime=%.0f | blocked_by=%s",
+                symbol,
+                instrument["trading_symbol"],
+                float(ltp),
+                signal.features.get("opportunity_score", 0.0),
+                signal.features.get("risk_score", 0.0),
+                signal.features.get("scalp_confidence", 0.0),
+                signal.features.get("swing_confidence", 0.0),
+                signal.features.get("regime_code", 0.0),
+                signal.reason,
+            )
+
         if now - self.last_audit_log_ts[symbol] >= self.settings.tick_audit_sec:
             self.last_audit_log_ts[symbol] = now
             logger.info(
-                "COMMODITY_TICK_AUDIT | symbol=%s | contract=%s | ltp=%.2f | open=%.2f | prev_close=%.2f | high=%.2f | low=%.2f | day_pos=%.1f%% | avg=%.2f | vwap_bias=%.3f%% | bid=%.2f | ask=%.2f | spread=%.3f%% | bid_qty5=%s | ask_qty5=%s | depth_imb=%.1f%% | top_imb=%.1f%% | buy_qty=%s | sell_qty=%s | queue_imb=%.1f%% | volume=%s | vol_chg=%+.0f | oi=%s | oi_chg=%+.0f | clean=%.1f%% | spoof=%.1f%% | recovery=%.1f%% | exhaustion=%.1f%% | orderflow=%.1f | liquidity=%.1f | score=%.1f | action=%s | reason=%s",
+                "COMMODITY_TICK_AUDIT | symbol=%s | contract=%s | ltp=%.2f | open=%.2f | prev_close=%.2f | high=%.2f | low=%.2f | day_pos=%.1f%% | avg=%.2f | vwap_bias=%.3f%% | bid=%.2f | ask=%.2f | spread=%.3f%% | bid_qty5=%s | ask_qty5=%s | depth_imb=%.1f%% | top_imb=%.1f%% | buy_qty=%s | sell_qty=%s | queue_imb=%.1f%% | volume=%s | vol_chg=%+.0f | oi=%s | oi_chg=%+.0f | clean=%.1f%% | spoof=%.1f%% | recovery=%.1f%% | exhaustion=%.1f%% | orderflow=%.1f | liquidity=%.1f | opp=%.1f | risk=%.1f | scalp=%.1f | swing=%.1f | regime=%.0f | exit_plan=%.0f | score=%.1f | action=%s | reason=%s",
                 symbol,
                 instrument["trading_symbol"],
                 float(ltp),
@@ -273,6 +299,12 @@ class CommodityPaperRuntime:
                 signal.features["exhaustion_pct"],
                 signal.features["orderflow_score"],
                 signal.features["liquidity_score"],
+                signal.features.get("opportunity_score", 0.0),
+                signal.features.get("risk_score", 0.0),
+                signal.features.get("scalp_confidence", 0.0),
+                signal.features.get("swing_confidence", 0.0),
+                signal.features.get("regime_code", 0.0),
+                signal.features.get("exit_plan_code", 0.0),
                 signal.score,
                 signal.action,
                 signal.reason,
@@ -311,13 +343,17 @@ class CommodityPaperRuntime:
                 self.daily_trades += 1
                 position = self.portfolio.positions[int(secid)]
                 logger.info(
-                    "COMMODITY_ENTRY_COMMITTED | symbol=%s | contract=%s | secid=%s | qty=%s | entry=%.2f | score=%.1f | reason=%s",
+                    "COMMODITY_ENTRY_COMMITTED | symbol=%s | contract=%s | secid=%s | qty=%s | entry=%.2f | score=%.1f | opp=%.1f | risk=%.1f | mode=%.0f | exit_plan=%.0f | reason=%s",
                     symbol,
                     instrument["trading_symbol"],
                     secid,
                     position.qty,
                     float(ltp),
                     signal.score,
+                    signal.features.get("opportunity_score", 0.0),
+                    signal.features.get("risk_score", 0.0),
+                    signal.features.get("entry_mode", 0.0),
+                    signal.features.get("exit_plan_code", 0.0),
                     signal.reason,
                 )
         elif signal.action == "ENTRY":
