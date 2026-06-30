@@ -1,12 +1,19 @@
 import os
+import sys
 import tempfile
 import unittest
+from collections import defaultdict
+from types import SimpleNamespace
 
 import pandas as pd
 
+sys.modules.setdefault("websocket", SimpleNamespace(WebSocketApp=object))
+sys.modules.setdefault("requests", SimpleNamespace(Session=object, get=lambda *_, **__: None, post=lambda *_, **__: None))
+
+from dhan_engine.application.stocks.paper_runtime import StockPaperRuntime
 from dhan_engine.domain.stocks.percent_engine import PercentNormalizedStockEngine
 from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
-from dhan_engine.simulations.stock_paper_portfolio import StockPaperPortfolio
+from dhan_engine.simulations.stock_paper_portfolio import StockPaperPortfolio, StockPaperPosition
 
 
 class StockPercentEngineTests(unittest.TestCase):
@@ -83,6 +90,47 @@ class StockPaperPortfolioTests(unittest.TestCase):
         self.assertIsNotNone(trade)
         self.assertAlmostEqual(trade["net_pnl"], 460.0)
         self.assertEqual(len(portfolio.positions), 1)
+
+    def test_score_breakdown_exit_requires_hold_confirmation_and_fee_edge(self):
+        runtime = StockPaperRuntime.__new__(StockPaperRuntime)
+        runtime.settings = SimpleNamespace(
+            stop_loss_pct=0.35,
+            take_profit_pct=0.80,
+            trail_arm_pct=0.40,
+            trail_giveback_pct=0.25,
+            max_hold_sec=900.0,
+            score_exit_min_hold_sec=25.0,
+            score_exit_confirmations=2,
+            score_exit_fee_guard_sec=90.0,
+            score_exit_min_adverse_fee_ratio=0.75,
+            round_trip_fee=40.0,
+            heartbeat_sec=0.0,
+        )
+        runtime.score_exit_weak_count = defaultdict(int)
+        runtime.last_score_exit_guard_log_ts = defaultdict(float)
+        position = StockPaperPosition(
+            secid=1,
+            symbol="HDFCBANK",
+            qty=94,
+            entry=796.00,
+            entry_ts=100.0,
+            last_ltp=795.95,
+            last_tick_ts=108.0,
+            peak_ltp=796.00,
+            entry_score=45.0,
+        )
+        early_signal = SimpleNamespace(action="EXIT", reason="PERCENT_SCORE_BREAKDOWN", ltp=795.95, score=35.0)
+        self.assertIsNone(runtime._position_exit_reason(position, early_signal, 108.0))
+
+        position.entry_ts = 70.0
+        self.assertIsNone(runtime._position_exit_reason(position, early_signal, 108.0))
+        self.assertIsNone(runtime._position_exit_reason(position, early_signal, 109.0))
+
+        real_adverse_signal = SimpleNamespace(action="EXIT", reason="PERCENT_SCORE_BREAKDOWN", ltp=795.50, score=34.0)
+        self.assertEqual(
+            runtime._position_exit_reason(position, real_adverse_signal, 110.0),
+            "PERCENT_SCORE_BREAKDOWN_CONFIRMED",
+        )
 
 
 class EquityInstrumentResolutionTests(unittest.TestCase):

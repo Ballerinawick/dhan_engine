@@ -43,6 +43,9 @@ COMMODITY_PROFILES = {
         "min_day_position": 18.0,
         "max_day_position": 96.0,
         "min_orderflow": 35.0,
+        "reclaim_ret5": -0.010,
+        "reclaim_ret30": 0.000,
+        "reclaim_ret120": -0.010,
     },
     "CRUDEOIL": {
         "scalp_score": 58.0,
@@ -59,22 +62,28 @@ COMMODITY_PROFILES = {
         "min_day_position": 25.0,
         "max_day_position": 97.0,
         "min_orderflow": 40.0,
+        "reclaim_ret5": -0.012,
+        "reclaim_ret30": 0.005,
+        "reclaim_ret120": -0.010,
     },
     "NATURALGAS": {
-        "scalp_score": 59.0,
+        "scalp_score": 58.0,
         "swing_score": 74.0,
-        "ret5": 0.020,
+        "ret5": 0.015,
         "ret30": -0.020,
         "swing_ret30": 0.080,
         "ret120": -0.020,
         "swing_ret120": 0.050,
         "vwap": -0.050,
         "max_spread": 0.080,
-        "clean": 45.0,
+        "clean": 42.0,
         "spoof": 60.0,
         "min_day_position": 22.0,
-        "max_day_position": 94.0,
-        "min_orderflow": 45.0,
+        "max_day_position": 96.0,
+        "min_orderflow": 42.0,
+        "reclaim_ret5": -0.020,
+        "reclaim_ret30": 0.010,
+        "reclaim_ret120": -0.015,
     },
 }
 
@@ -93,6 +102,9 @@ DEFAULT_PROFILE = {
     "min_day_position": 20.0,
     "max_day_position": 96.0,
     "min_orderflow": 40.0,
+    "reclaim_ret5": -0.010,
+    "reclaim_ret30": 0.000,
+    "reclaim_ret120": -0.010,
 }
 
 
@@ -236,6 +248,9 @@ class PercentNormalizedCommodityEngine:
             "profile_ret5_min": float(profile["ret5"]),
             "profile_ret30_min": float(profile["ret30"]),
             "profile_ret120_min": float(profile["ret120"]),
+            "profile_reclaim_ret5_min": float(profile["reclaim_ret5"]),
+            "profile_reclaim_ret30_min": float(profile["reclaim_ret30"]),
+            "profile_reclaim_ret120_min": float(profile["reclaim_ret120"]),
             "profile_swing_ret30_min": float(profile["swing_ret30"]),
             "profile_swing_ret120_min": float(profile["swing_ret120"]),
             "profile_vwap_min": float(profile["vwap"]),
@@ -289,6 +304,19 @@ class PercentNormalizedCommodityEngine:
         if all(passed for _, passed in scalp_checks):
             normalized["entry_mode"] = 1.0
             return CommodityPercentSignal(root, "ENTRY", score, price, "COMMODITY_SCALP_MOMENTUM_ALIGNMENT", normalized)
+
+        reclaim_checks = [
+            ("RECLAIM_SCORE_BELOW_PROFILE", brain.scalp_confidence >= effective_scalp_score),
+            ("RECLAIM_RET5_TOO_WEAK", return_5s >= float(profile["reclaim_ret5"])),
+            ("RECLAIM_RET30_WEAK", return_30s >= float(profile["reclaim_ret30"])),
+            ("RECLAIM_RET120_WEAK", return_120s >= float(profile["reclaim_ret120"])),
+            ("RECLAIM_VWAP_BIAS_WEAK", ltp_vs_avg >= float(profile["vwap"])),
+            ("RECLAIM_TICK_NOT_POSITIVE", return_1tick >= 0.0),
+            ("RECLAIM_EXHAUSTION_HIGH", exhaustion_score <= 55.0),
+        ]
+        if all(passed for _, passed in reclaim_checks):
+            normalized["entry_mode"] = 1.5
+            return CommodityPercentSignal(root, "ENTRY", score, price, "COMMODITY_SCALP_PULLBACK_RECLAIM", normalized)
 
         for reason, passed in scalp_checks + swing_checks:
             if not passed:
