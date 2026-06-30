@@ -191,6 +191,7 @@ class TradingRuntimeCoordinator:
         self.pair_stale_resubscribe_cooldown_sec = float(os.getenv("PAIR_STALE_RESUBSCRIBE_COOLDOWN_SEC", "45") or 45)
         self.static_daily_option_pairs = str(os.getenv("OPTION_STATIC_DAILY_PAIRS", "1")).strip().lower() in {"1", "true", "yes", "on"}
         self.option_reselection_enabled = str(os.getenv("OPTION_RESELECTION_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        self.option_selection_retry_sec = float(os.getenv("OPTION_SELECTION_RETRY_SEC", "20") or 20)
         self.premium_rebuild_enabled = str(os.getenv("PREMIUM_STREAM_REBUILD_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
         self.premium_rebuild_attempt_threshold = int(os.getenv("PREMIUM_STREAM_REBUILD_ATTEMPT_THRESHOLD", "2") or 2)
         self.premium_rebuild_window_sec = float(os.getenv("PREMIUM_STREAM_REBUILD_WINDOW_SEC", "300") or 300)
@@ -213,6 +214,7 @@ class TradingRuntimeCoordinator:
             "last_update": 0.0,
         }
         self.last_reselection_ts = 0.0
+        self.last_initial_selection_retry_ts = 0.0
         self.reselection_cooldown_sec = 30
         self.last_selected_underlying: Dict[str, float] = {}
         self.reselection_move_threshold = {
@@ -579,6 +581,26 @@ class TradingRuntimeCoordinator:
             self.option_quote_stream.subscribe(all_subscriptions)
         self.option_depth_stream.subscribe(all_subscriptions)
 
+    def _retry_missing_option_selection_if_needed(self, trigger_index: str) -> None:
+        if not self.market_open():
+            return
+        missing_indexes = [
+            index for index, pair in self.pairs.items()
+            if not (pair.ce_id and pair.pe_id) and float(pair.underlying_ltp or 0.0) > 0.0
+        ]
+        if not missing_indexes:
+            return
+        now = time.time()
+        if now - self.last_initial_selection_retry_ts < self.option_selection_retry_sec:
+            return
+        self.last_initial_selection_retry_ts = now
+        logger.info(
+            "TRI_WAVE_OPTION_SELECTION_RETRY | trigger=%s | missing=%s | reason=missing_option_pair_after_future_live",
+            trigger_index,
+            ",".join(missing_indexes),
+        )
+        self._select_and_subscribe_option_pairs()
+
     def on_future_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
         self._handle_ws_connected()
         with self._lock:
@@ -629,6 +651,7 @@ class TradingRuntimeCoordinator:
                 )
             if self._all_underlyings_ready():
                 self._future_ready.set()
+            self._retry_missing_option_selection_if_needed(index)
             self._reselect_option_pair_if_needed(index)
 
     def _should_reselect_options(self, index: str, underlying_ltp: float) -> bool:

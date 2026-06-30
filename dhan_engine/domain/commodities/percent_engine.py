@@ -27,10 +27,13 @@ class CommodityPercentSignal:
 
 COMMODITY_PROFILES = {
     "GOLD": {
-        "entry_score": 70.0,
+        "scalp_score": 58.0,
+        "swing_score": 70.0,
         "ret5": 0.015,
-        "ret30": 0.025,
+        "ret30": -0.010,
+        "swing_ret30": 0.025,
         "ret120": -0.020,
+        "swing_ret120": 0.030,
         "vwap": -0.080,
         "max_spread": 0.060,
         "clean": 40.0,
@@ -40,11 +43,14 @@ COMMODITY_PROFILES = {
         "min_orderflow": 35.0,
     },
     "CRUDEOIL": {
-        "entry_score": 72.0,
-        "ret5": 0.040,
-        "ret30": 0.040,
+        "scalp_score": 58.0,
+        "swing_score": 72.0,
+        "ret5": 0.015,
+        "ret30": -0.015,
+        "swing_ret30": 0.040,
         "ret120": -0.020,
-        "vwap": 0.050,
+        "swing_ret120": 0.030,
+        "vwap": -0.050,
         "max_spread": 0.060,
         "clean": 35.0,
         "spoof": 70.0,
@@ -53,10 +59,13 @@ COMMODITY_PROFILES = {
         "min_orderflow": 40.0,
     },
     "NATURALGAS": {
-        "entry_score": 74.0,
-        "ret5": 0.060,
-        "ret30": 0.080,
-        "ret120": 0.000,
+        "scalp_score": 59.0,
+        "swing_score": 74.0,
+        "ret5": 0.020,
+        "ret30": -0.020,
+        "swing_ret30": 0.080,
+        "ret120": -0.020,
+        "swing_ret120": 0.050,
         "vwap": -0.050,
         "max_spread": 0.080,
         "clean": 45.0,
@@ -68,10 +77,13 @@ COMMODITY_PROFILES = {
 }
 
 DEFAULT_PROFILE = {
-    "entry_score": 72.0,
-    "ret5": 0.040,
-    "ret30": 0.060,
+    "scalp_score": 59.0,
+    "swing_score": 72.0,
+    "ret5": 0.020,
+    "ret30": -0.010,
+    "swing_ret30": 0.060,
     "ret120": -0.020,
+    "swing_ret120": 0.040,
     "vwap": 0.000,
     "max_spread": 0.080,
     "clean": 40.0,
@@ -162,7 +174,8 @@ class PercentNormalizedCommodityEngine:
         )
         liquidity = _clamp(100.0 - ((spread_pct / max(self.max_spread_pct, 1e-9)) * 100.0))
         profile = self._profile(root)
-        effective_entry_score = max(float(self.entry_score), float(profile["entry_score"]))
+        effective_scalp_score = float(profile["scalp_score"])
+        effective_swing_score = max(float(self.entry_score), float(profile["swing_score"]))
         effective_max_spread = min(float(self.max_spread_pct), float(profile["max_spread"]))
 
         score = _clamp(
@@ -197,11 +210,14 @@ class PercentNormalizedCommodityEngine:
             "oi_change_tick": oi_change_tick,
             "orderflow_score": orderflow,
             "liquidity_score": liquidity,
-            "effective_entry_score": effective_entry_score,
+            "effective_scalp_score": effective_scalp_score,
+            "effective_swing_score": effective_swing_score,
             "effective_max_spread_pct": effective_max_spread,
             "profile_ret5_min": float(profile["ret5"]),
             "profile_ret30_min": float(profile["ret30"]),
             "profile_ret120_min": float(profile["ret120"]),
+            "profile_swing_ret30_min": float(profile["swing_ret30"]),
+            "profile_swing_ret120_min": float(profile["swing_ret120"]),
             "profile_vwap_min": float(profile["vwap"]),
             "profile_clean_min": float(profile["clean"]),
             "profile_spoof_max": float(profile["spoof"]),
@@ -218,20 +234,40 @@ class PercentNormalizedCommodityEngine:
         if in_position:
             return CommodityPercentSignal(root, "HOLD", score, price, "POSITION_HELD", normalized)
 
-        entry_checks = [
-            ("SCORE_BELOW_PROFILE", score >= effective_entry_score),
-            ("RET5_WEAK", return_5s >= float(profile["ret5"])),
-            ("RET30_WEAK", return_30s >= float(profile["ret30"])),
-            ("RET120_WEAK", return_120s >= float(profile["ret120"])),
-            ("VWAP_BIAS_WEAK", ltp_vs_avg >= float(profile["vwap"])),
+        shared_checks = [
             ("CLEAN_TRADE_WEAK", clean_trade >= float(profile["clean"])),
             ("SPOOF_RISK_HIGH", spoof_risk <= float(profile["spoof"])),
             ("DAY_POSITION_LOW", day_position >= float(profile["min_day_position"])),
             ("DAY_POSITION_EXTENDED", day_position <= float(profile["max_day_position"])),
             ("ORDERFLOW_WEAK", orderflow >= float(profile["min_orderflow"])),
         ]
-        for reason, passed in entry_checks:
+        for reason, passed in shared_checks:
             if not passed:
                 return CommodityPercentSignal(root, "HOLD", score, price, reason, normalized)
 
-        return CommodityPercentSignal(root, "ENTRY", score, price, "COMMODITY_PROFILED_MOMENTUM_ALIGNMENT", normalized)
+        swing_checks = [
+            ("SWING_SCORE_BELOW_PROFILE", score >= effective_swing_score),
+            ("SWING_RET30_WEAK", return_30s >= float(profile["swing_ret30"])),
+            ("SWING_RET120_WEAK", return_120s >= float(profile["swing_ret120"])),
+            ("SWING_VWAP_BIAS_WEAK", ltp_vs_avg >= max(0.0, float(profile["vwap"]))),
+        ]
+        if all(passed for _, passed in swing_checks):
+            normalized["entry_mode"] = 2.0
+            return CommodityPercentSignal(root, "ENTRY", score, price, "COMMODITY_SWING_MOMENTUM_ALIGNMENT", normalized)
+
+        scalp_checks = [
+            ("SCALP_SCORE_BELOW_PROFILE", score >= effective_scalp_score),
+            ("SCALP_RET5_WEAK", return_5s >= float(profile["ret5"])),
+            ("SCALP_RET30_WEAK", return_30s >= float(profile["ret30"])),
+            ("SCALP_RET120_WEAK", return_120s >= float(profile["ret120"])),
+            ("SCALP_VWAP_BIAS_WEAK", ltp_vs_avg >= float(profile["vwap"])),
+            ("SCALP_TICK_NOT_POSITIVE", return_1tick >= 0.0),
+        ]
+        if all(passed for _, passed in scalp_checks):
+            normalized["entry_mode"] = 1.0
+            return CommodityPercentSignal(root, "ENTRY", score, price, "COMMODITY_SCALP_MOMENTUM_ALIGNMENT", normalized)
+
+        for reason, passed in scalp_checks + swing_checks:
+            if not passed:
+                return CommodityPercentSignal(root, "HOLD", score, price, reason, normalized)
+        return CommodityPercentSignal(root, "HOLD", score, price, "NO_CONFIRMED_EDGE", normalized)
