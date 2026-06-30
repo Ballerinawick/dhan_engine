@@ -64,6 +64,7 @@ class PaperTradeManager:
         self.current_day = datetime.now(self.IST).date()
         self.opened_today = 0
         self.closed_today = 0
+        self.daily_realized_start = 0.0
         self.last_trade_summary = None
         self.trade_summary_sink = get_trade_summary_sink()
         self.enable_parsed_logs = False   # 🔥 toggle for debug logs
@@ -87,6 +88,7 @@ class PaperTradeManager:
             self.current_day = today
             self.opened_today = 0
             self.closed_today = 0
+            self.daily_realized_start = self.realized_pnl
 
     def has_open_position(self):
         return len(self.positions) > 0

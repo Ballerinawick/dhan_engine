@@ -32,10 +32,15 @@ class TradeSummarySink:
             os.getenv("TRADE_SUMMARY_MONGO_COLLECTION", "trade_summaries").strip()
             or "trade_summaries"
         )
+        self.portfolio_collection_name = (
+            os.getenv("PORTFOLIO_MONGO_COLLECTION", "portfolio_daily").strip()
+            or "portfolio_daily"
+        )
         self.enabled = bool(self.uri) and _truthy(os.getenv("TRADE_SUMMARY_MONGO_ENABLED"), True)
         self.timeout_ms = int(os.getenv("TRADE_SUMMARY_MONGO_TIMEOUT_MS", "2500") or 2500)
         self._client: Any = None
         self._collection: Any = None
+        self._portfolio_collection: Any = None
 
     def _get_collection(self) -> Any | None:
         if not self.enabled:
@@ -71,20 +76,25 @@ class TradeSummarySink:
             )
             return None
 
-    def record(self, section: str, payload: Mapping[str, Any]) -> bool:
-        collection = self._get_collection()
-        if collection is None:
-            return False
+    def _get_portfolio_collection(self) -> Any | None:
+        if not self.enabled:
+            return None
+        if self._portfolio_collection is not None:
+            return self._portfolio_collection
+        trade_collection = self._get_collection()
+        if trade_collection is None or self._client is None:
+            return None
+        self._portfolio_collection = self._client[self.db_name][self.portfolio_collection_name]
+        return self._portfolio_collection
 
-        now_utc = datetime.now(timezone.utc)
+    def _common_fields(self, document: dict[str, Any], now_utc: datetime | None = None) -> dict[str, Any]:
+        now_utc = now_utc or datetime.now(timezone.utc)
         now_ist = now_utc.astimezone(IST)
-        document = dict(payload)
         document.update(
             {
-                "section": str(section),
                 "paper": bool(document.get("paper", True)),
-                "created_at_utc": now_utc,
-                "created_at_ist": now_ist.isoformat(),
+                "updated_at_utc": now_utc,
+                "updated_at_ist": now_ist.isoformat(),
                 "trade_date_ist": now_ist.date().isoformat(),
                 "service": os.getenv("DHAN_SERVICE", "").strip(),
                 "deployment_id": (
@@ -94,6 +104,19 @@ class TradeSummarySink:
                 ),
             }
         )
+        return document
+
+    def record(self, section: str, payload: Mapping[str, Any]) -> bool:
+        collection = self._get_collection()
+        if collection is None:
+            return False
+
+        now_utc = datetime.now(timezone.utc)
+        document = dict(payload)
+        document["section"] = str(section)
+        document = self._common_fields(document, now_utc)
+        document["created_at_utc"] = now_utc
+        document["created_at_ist"] = document["updated_at_ist"]
 
         try:
             collection.insert_one(document)
@@ -107,6 +130,48 @@ class TradeSummarySink:
         except Exception as exc:
             logger.warning(
                 "TRADE_SUMMARY_MONGO_STORE_FAILED | section=%s | error=%s",
+                section,
+                exc,
+            )
+            return False
+
+    def record_portfolio(self, section: str, payload: Mapping[str, Any]) -> bool:
+        collection = self._get_portfolio_collection()
+        if collection is None:
+            return False
+
+        now_utc = datetime.now(timezone.utc)
+        document = dict(payload)
+        document["section"] = str(section)
+        document = self._common_fields(document, now_utc)
+        query = {
+            "section": document["section"],
+            "trade_date_ist": document["trade_date_ist"],
+            "paper": document["paper"],
+            "service": document.get("service", ""),
+            "deployment_id": document.get("deployment_id", ""),
+        }
+
+        try:
+            collection.update_one(
+                query,
+                {
+                    "$set": document,
+                    "$setOnInsert": {"created_at_utc": now_utc, "created_at_ist": document["updated_at_ist"]},
+                },
+                upsert=True,
+            )
+            logger.info(
+                "PORTFOLIO_MONGO_STORED | section=%s | daily_net_pnl=%s | net_pnl=%s | open_positions=%s",
+                section,
+                document.get("daily_net_pnl"),
+                document.get("net_pnl"),
+                document.get("open_positions"),
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "PORTFOLIO_MONGO_STORE_FAILED | section=%s | error=%s",
                 section,
                 exc,
             )

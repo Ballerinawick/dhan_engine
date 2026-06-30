@@ -54,6 +54,14 @@ class StockPaperSettings:
     score_exit_confirmations: int
     score_exit_fee_guard_sec: float
     score_exit_min_adverse_fee_ratio: float
+    adaptive_exit_enabled: bool
+    profit_lock_min_hold_sec: float
+    profit_lock_min_fee_multiple: float
+    profit_lock_giveback_fee_multiple: float
+    dead_trade_sec: float
+    dead_trade_fee_ratio: float
+    dead_trade_max_score: float
+    dead_trade_min_net_fee_multiple: float
     stale_tick_sec: float
     max_daily_loss: float
     max_daily_trades: int
@@ -89,6 +97,14 @@ class StockPaperSettings:
             score_exit_confirmations=max(1, int(os.getenv("STOCK_SCORE_EXIT_CONFIRMATIONS", "2") or 2)),
             score_exit_fee_guard_sec=float(os.getenv("STOCK_SCORE_EXIT_FEE_GUARD_SEC", "90") or 90),
             score_exit_min_adverse_fee_ratio=float(os.getenv("STOCK_SCORE_EXIT_MIN_ADVERSE_FEE_RATIO", "0.75") or 0.75),
+            adaptive_exit_enabled=os.getenv("STOCK_ADAPTIVE_EXIT_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"},
+            profit_lock_min_hold_sec=float(os.getenv("STOCK_PROFIT_LOCK_MIN_HOLD_SEC", "90") or 90),
+            profit_lock_min_fee_multiple=float(os.getenv("STOCK_PROFIT_LOCK_MIN_FEE_MULTIPLE", "1.60") or 1.60),
+            profit_lock_giveback_fee_multiple=float(os.getenv("STOCK_PROFIT_LOCK_GIVEBACK_FEE_MULTIPLE", "0.80") or 0.80),
+            dead_trade_sec=float(os.getenv("STOCK_DEAD_TRADE_SEC", "360") or 360),
+            dead_trade_fee_ratio=float(os.getenv("STOCK_DEAD_TRADE_FEE_RATIO", "0.85") or 0.85),
+            dead_trade_max_score=float(os.getenv("STOCK_DEAD_TRADE_MAX_SCORE", "45") or 45),
+            dead_trade_min_net_fee_multiple=float(os.getenv("STOCK_DEAD_TRADE_MIN_NET_FEE_MULTIPLE", "0.50") or 0.50),
             stale_tick_sec=float(os.getenv("STOCK_PAPER_STALE_TICK_SEC", "10") or 10),
             max_daily_loss=float(os.getenv("STOCK_PAPER_MAX_DAILY_LOSS", "3000") or 3000),
             max_daily_trades=int(os.getenv("STOCK_PAPER_MAX_DAILY_TRADES", "20") or 20),
@@ -185,6 +201,10 @@ class StockPaperRuntime:
         if peak_pct >= self.settings.trail_arm_pct and drawdown_pct >= self.settings.trail_giveback_pct:
             self.score_exit_weak_count[int(position.secid)] = 0
             return "STOCK_PERCENT_TRAIL"
+        adaptive_reason = self._adaptive_exit_reason(position, signal, hold_sec)
+        if adaptive_reason:
+            self.score_exit_weak_count[int(position.secid)] = 0
+            return adaptive_reason
         if hold_sec >= self.settings.max_hold_sec:
             self.score_exit_weak_count[int(position.secid)] = 0
             return "STOCK_PERCENT_MAX_HOLD"
@@ -241,6 +261,52 @@ class StockPaperRuntime:
 
         self.score_exit_weak_count[secid] = 0
         return "PERCENT_SCORE_BREAKDOWN_CONFIRMED"
+
+    def _adaptive_exit_reason(self, position, signal, hold_sec: float) -> str | None:
+        if not getattr(self.settings, "adaptive_exit_enabled", True):
+            return None
+
+        qty = max(int(position.qty), 1)
+        current_gross = (float(signal.ltp) - float(position.entry)) * qty
+        peak_gross = (float(position.peak_ltp) - float(position.entry)) * qty
+        giveback_gross = max(0.0, peak_gross - current_gross)
+        fee = max(float(getattr(self.settings, "round_trip_fee", 0.0) or 0.0), 0.0)
+        net_after_fee = current_gross - fee
+        features = getattr(signal, "features", {}) or {}
+        score = float(getattr(signal, "score", 0.0) or 0.0)
+        ret5 = float(features.get("return_5s_pct", 0.0) or 0.0)
+        ret30 = float(features.get("return_30s_pct", 0.0) or 0.0)
+        orderflow = float(features.get("orderflow_score", 50.0) or 50.0)
+        scalp_conf = float(features.get("scalp_confidence", 0.0) or 0.0)
+        exit_plan = float(features.get("exit_plan_code", 0.0) or 0.0)
+
+        if (
+            hold_sec >= float(getattr(self.settings, "profit_lock_min_hold_sec", 90.0) or 90.0)
+            and fee > 0
+            and peak_gross >= fee * float(getattr(self.settings, "profit_lock_min_fee_multiple", 1.60) or 1.60)
+            and giveback_gross >= fee * float(getattr(self.settings, "profit_lock_giveback_fee_multiple", 0.80) or 0.80)
+            and net_after_fee > 0
+        ):
+            return "STOCK_ADAPTIVE_PROFIT_LOCK"
+
+        weak_edge = (
+            score <= float(getattr(self.settings, "dead_trade_max_score", 45.0) or 45.0)
+            or scalp_conf < 45.0
+            or exit_plan >= 1.0
+        )
+        flow_faded = orderflow < 48.0 or (ret5 <= 0.0 and ret30 <= 0.0)
+        dead_zone = abs(current_gross) <= fee * float(getattr(self.settings, "dead_trade_fee_ratio", 0.85) or 0.85)
+        real_loss_after_fee = net_after_fee <= -(fee * float(getattr(self.settings, "dead_trade_min_net_fee_multiple", 0.50) or 0.50))
+        if (
+            hold_sec >= float(getattr(self.settings, "dead_trade_sec", 360.0) or 360.0)
+            and fee > 0
+            and weak_edge
+            and flow_faded
+            and (dead_zone or real_loss_after_fee)
+        ):
+            return "STOCK_ADAPTIVE_DEAD_SCALP_EXIT"
+
+        return None
 
     def _log_score_exit_guard(self, position, reason: str, **fields) -> None:
         now = time.time()
@@ -358,6 +424,16 @@ class StockPaperRuntime:
                     signal.features.get("exit_plan_code", 0.0),
                     signal.reason,
                 )
+            else:
+                logger.info(
+                    "STOCK_ENTRY_REJECTED | symbol=%s | secid=%s | reason=PORTFOLIO_REJECTED | cash=%.2f | open_positions=%s | max_positions=%s | ltp=%.2f",
+                    symbol,
+                    secid,
+                    self.portfolio.cash,
+                    len(self.portfolio.positions),
+                    self.settings.max_positions,
+                    float(ltp),
+                )
 
     def _health(self, now: float) -> None:
         if now - self.last_health_ts < self.settings.heartbeat_sec:
@@ -367,11 +443,35 @@ class StockPaperRuntime:
             f"{symbol}:{(now - ts):.1f}s" for symbol, ts in sorted(self.last_tick_ts.items())
         ) or "waiting"
         stale = [symbol for symbol, ts in self.last_tick_ts.items() if now - ts > self.settings.stale_tick_sec]
+        unrealized = self.portfolio.unrealized_pnl()
+        realized = self.portfolio.realized_pnl
+        daily_realized = realized - self.daily_realized_start
+        net_pnl = realized + unrealized
         logger.info(
             "STOCK_FEED_HEALTH | symbols=%s | tick_ages=%s | stale=%s | open_positions=%s | cash=%.2f | equity=%.2f | realized=%+.2f | unrealized=%+.2f | trades_today=%s",
             ",".join(self.settings.symbols), ages, ",".join(stale) or "none",
             len(self.portfolio.positions), self.portfolio.cash, self.portfolio.equity(),
-            self.portfolio.realized_pnl, self.portfolio.unrealized_pnl(), self.daily_trades,
+            realized, unrealized, self.daily_trades,
+        )
+        self.trade_summary_sink.record_portfolio(
+            "stocks",
+            {
+                "symbols": list(self.settings.symbols),
+                "capital": self.settings.capital,
+                "cash": self.portfolio.cash,
+                "equity": self.portfolio.equity(),
+                "realized_pnl": realized,
+                "unrealized_pnl": unrealized,
+                "net_pnl": net_pnl,
+                "daily_realized_pnl": daily_realized,
+                "daily_unrealized_pnl": unrealized,
+                "daily_net_pnl": daily_realized + unrealized,
+                "open_positions": len(self.portfolio.positions),
+                "trades_today": self.daily_trades,
+                "closed_trades": self.portfolio.closed_trades,
+                "runtime": "stock_percent_paper",
+                "strategy": "percent_normalized_v1",
+            },
         )
 
     def run(self) -> None:

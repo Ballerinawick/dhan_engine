@@ -1475,6 +1475,7 @@ class TradingRuntimeCoordinator:
                     "strategy_owner": pos.get("strategy_owner"),
                 })
             realized = float(getattr(self.paper_trader, "realized_pnl", 0.0) or 0.0)
+            daily_realized = realized - float(getattr(self.paper_trader, "daily_realized_start", 0.0) or 0.0)
             snapshot = {
                 "index": index,
                 "capital": getattr(self.paper_trader, "capital", None),
@@ -1483,6 +1484,9 @@ class TradingRuntimeCoordinator:
                 "realized_pnl": getattr(self.paper_trader, "realized_pnl", None),
                 "unrealized_pnl": unrealized,
                 "net_pnl": realized + unrealized,
+                "daily_realized_pnl": daily_realized,
+                "daily_unrealized_pnl": unrealized,
+                "daily_net_pnl": daily_realized + unrealized,
                 "premium_deployed": premium_deployed,
                 "fees_paid": getattr(self.paper_trader, "fees_paid_today", getattr(self.paper_trader, "fees_paid", None)),
                 "total_fees": getattr(self.paper_trader, "total_fees", None),
@@ -1490,8 +1494,11 @@ class TradingRuntimeCoordinator:
                 "closed_today": getattr(self.paper_trader, "closed_today", None),
                 "open_positions": len(getattr(self.paper_trader, "positions", {}) or {}),
                 "positions": positions,
+                "runtime": "tri_wave_paper",
+                "strategy": "tri_wave_v2",
             }
             self.tri_wave_recorder.record_portfolio(snapshot)
+            self.paper_trader.trade_summary_sink.record_portfolio("index", snapshot)
         except Exception:
             logger.exception("TRI_WAVE_RECORDER_PORTFOLIO_ERROR | index=%s", index)
 
@@ -1713,6 +1720,14 @@ class TradingRuntimeCoordinator:
                 state = "missing=" + ",".join(missing)
             elif stale_sides:
                 state = "stale_ltp=" + ",".join(stale_sides)
+                logger.warning(
+                    "TRI_WAVE_NO_ENTRY_STALE_RECOVERY_TRIGGER | index=%s | stale_sides=%s | ce_ltp_age=%s | pe_ltp_age=%s",
+                    index,
+                    ",".join(stale_sides),
+                    self._fmt_age(ce_age),
+                    self._fmt_age(pe_age),
+                )
+                self._recover_stale_option_pair(index, pair, now_ts)
             else:
                 state = "waiting_for_signal"
 
