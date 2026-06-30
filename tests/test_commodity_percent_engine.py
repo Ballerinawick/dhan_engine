@@ -43,6 +43,31 @@ class CommodityPercentEngineTests(unittest.TestCase):
         self.assertEqual(signal.action, "ENTRY")
         self.assertGreaterEqual(signal.score, 68.0)
 
+    def test_clean_commodity_scalp_can_enter_below_old_profile_threshold(self):
+        engine = PercentNormalizedCommodityEngine(min_samples=8)
+        signal = None
+        features = {
+            "intraday_return_pct": 0.05,
+            "ltp_vs_avg_pct": 0.02,
+            "day_position": 0.58,
+            "depth_imbalance_5": 0.28,
+            "market_queue_imbalance": 0.20,
+            "spread_pct": 0.03,
+            "clean_trade_score": 0.78,
+            "spoof_risk": 0.0,
+            "top_depth_imbalance": 0.15,
+            "recovery_score": 0.20,
+            "exhaustion_score": 0.02,
+        }
+        for index in range(18):
+            price = 6700.0 * (1.0 + (index * 0.00008))
+            signal = engine.on_tick("CRUDEOIL", price, features, 100.0 + index, in_position=False)
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.action, "ENTRY")
+        self.assertEqual(signal.reason, "COMMODITY_SCALP_MOMENTUM_ALIGNMENT")
+        self.assertLess(signal.score, 72.0)
+
     def test_symbols_keep_independent_histories(self):
         engine = PercentNormalizedCommodityEngine(min_samples=3)
         engine.on_tick("GOLD", 72000.0, self._strong_features(72000.0), 1.0, in_position=False)

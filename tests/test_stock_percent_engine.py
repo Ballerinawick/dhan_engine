@@ -37,6 +37,28 @@ class StockPercentEngineTests(unittest.TestCase):
         self.assertEqual(signal.action, "ENTRY")
         self.assertGreaterEqual(signal.score, 72.0)
 
+    def test_clean_scalp_structure_can_enter_below_old_swing_threshold(self):
+        engine = PercentNormalizedStockEngine(min_samples=8)
+        signal = None
+        features = {
+            "intraday_return_pct": 0.05,
+            "ltp_vs_avg_pct": -0.05,
+            "day_position": 0.55,
+            "depth_imbalance_5": 0.20,
+            "market_queue_imbalance": 0.12,
+            "spread_pct": 0.03,
+            "clean_trade_score": 0.70,
+            "spoof_risk": 0.05,
+        }
+        for index in range(18):
+            price = 1000.0 * (1.0 + (index * 0.00008))
+            signal = engine.on_tick("SBIN", price, features, 100.0 + index, in_position=False)
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.action, "ENTRY")
+        self.assertEqual(signal.reason, "STOCK_SCALP_MOMENTUM_ALIGNMENT")
+        self.assertLess(signal.score, 72.0)
+
     def test_symbols_keep_independent_histories(self):
         engine = PercentNormalizedStockEngine(min_samples=3)
         engine.on_tick("SBIN", 800.0, self._strong_features(800.0), 1.0, in_position=False)
