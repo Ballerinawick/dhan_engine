@@ -63,6 +63,7 @@ class CommodityPaperSettings:
     max_daily_loss: float
     max_daily_trades: int
     heartbeat_sec: float
+    tick_audit_sec: float
     market_start: dtime
     market_end: dtime
 
@@ -94,6 +95,7 @@ class CommodityPaperSettings:
             max_daily_loss=float(os.getenv("COMMODITY_PAPER_MAX_DAILY_LOSS", "3000") or 3000),
             max_daily_trades=int(os.getenv("COMMODITY_PAPER_MAX_DAILY_TRADES", "20") or 20),
             heartbeat_sec=float(os.getenv("COMMODITY_PAPER_HEARTBEAT_SEC", "10") or 10),
+            tick_audit_sec=float(os.getenv("COMMODITY_TICK_AUDIT_SEC", "15") or 15),
             market_start=_env_time("COMMODITY_MARKET_START", "09:00"),
             market_end=_env_time("COMMODITY_MARKET_END", "23:25"),
         )
@@ -120,6 +122,7 @@ class CommodityPaperRuntime:
         self.secid_by_symbol: Dict[str, int] = {}
         self.last_tick_ts: Dict[str, float] = defaultdict(float)
         self.last_score_log_ts: Dict[str, float] = defaultdict(float)
+        self.last_audit_log_ts: Dict[str, float] = defaultdict(float)
         self.last_exit_ts: Dict[str, float] = defaultdict(float)
         self.last_health_ts = 0.0
         self.daily_trades = 0
@@ -133,6 +136,13 @@ class CommodityPaperRuntime:
             debug=False,
             shard_count=1,
         )
+
+    @staticmethod
+    def _feature(features: dict, key: str, default: float = 0.0) -> float:
+        try:
+            return float(features.get(key, default) or default)
+        except Exception:
+            return float(default)
 
     def _register_instruments(self) -> list[tuple[int, str]]:
         subscriptions = []
@@ -203,10 +213,11 @@ class CommodityPaperRuntime:
         self.last_tick_ts[symbol] = now
         self.portfolio.mark(secid, ltp, now)
         position = self.portfolio.positions.get(int(secid))
+        raw_features = dict(getattr(depth, "features", None) or {})
         signal = self.engine.on_tick(
             symbol,
             float(ltp),
-            getattr(depth, "features", None),
+            raw_features,
             now,
             in_position=position is not None,
         )
@@ -224,6 +235,45 @@ class CommodityPaperRuntime:
                 signal.features["return_120s_pct"],
                 signal.features["ltp_vs_avg_pct"],
                 signal.features["spread_pct"],
+                signal.action,
+                signal.reason,
+            )
+
+        if now - self.last_audit_log_ts[symbol] >= self.settings.tick_audit_sec:
+            self.last_audit_log_ts[symbol] = now
+            logger.info(
+                "COMMODITY_TICK_AUDIT | symbol=%s | contract=%s | ltp=%.2f | open=%.2f | prev_close=%.2f | high=%.2f | low=%.2f | day_pos=%.1f%% | avg=%.2f | vwap_bias=%.3f%% | bid=%.2f | ask=%.2f | spread=%.3f%% | bid_qty5=%s | ask_qty5=%s | depth_imb=%.1f%% | top_imb=%.1f%% | buy_qty=%s | sell_qty=%s | queue_imb=%.1f%% | volume=%s | vol_chg=%+.0f | oi=%s | oi_chg=%+.0f | clean=%.1f%% | spoof=%.1f%% | recovery=%.1f%% | exhaustion=%.1f%% | orderflow=%.1f | liquidity=%.1f | score=%.1f | action=%s | reason=%s",
+                symbol,
+                instrument["trading_symbol"],
+                float(ltp),
+                self._feature(raw_features, "open_price"),
+                self._feature(raw_features, "prev_close"),
+                self._feature(raw_features, "day_high"),
+                self._feature(raw_features, "day_low"),
+                signal.features["day_position_pct"],
+                self._feature(raw_features, "avg_price"),
+                signal.features["ltp_vs_avg_pct"],
+                self._feature(raw_features, "best_bid"),
+                self._feature(raw_features, "best_ask"),
+                signal.features["spread_pct"],
+                int(self._feature(raw_features, "bid_qty_5")),
+                int(self._feature(raw_features, "ask_qty_5")),
+                signal.features["depth_imbalance_pct"],
+                signal.features["top_depth_imbalance_pct"],
+                int(self._feature(raw_features, "total_buy_quantity")),
+                int(self._feature(raw_features, "total_sell_quantity")),
+                signal.features["market_imbalance_pct"],
+                int(self._feature(raw_features, "volume")),
+                signal.features["volume_change_tick"],
+                int(self._feature(raw_features, "oi")),
+                signal.features["oi_change_tick"],
+                signal.features["clean_trade_pct"],
+                signal.features["spoof_risk_pct"],
+                signal.features["recovery_pct"],
+                signal.features["exhaustion_pct"],
+                signal.features["orderflow_score"],
+                signal.features["liquidity_score"],
+                signal.score,
                 signal.action,
                 signal.reason,
             )
@@ -270,6 +320,17 @@ class CommodityPaperRuntime:
                     signal.score,
                     signal.reason,
                 )
+        elif signal.action == "ENTRY":
+            logger.info(
+                "COMMODITY_ENTRY_REJECTED | symbol=%s | contract=%s | reason=RUNTIME_GUARD | market_open=%s | trades_today=%s | open_positions=%s | stale_age=%.1fs | cooldown_left=%.1fs",
+                symbol,
+                instrument["trading_symbol"],
+                self._market_open(now),
+                self.daily_trades,
+                len(self.portfolio.positions),
+                now - float(self.last_tick_ts.get(symbol, 0.0) or 0.0),
+                max(0.0, self.settings.entry_cooldown_sec - (now - float(self.last_exit_ts.get(symbol, 0.0) or 0.0))),
+            )
 
     def _health(self, now: float) -> None:
         if now - self.last_health_ts < self.settings.heartbeat_sec:

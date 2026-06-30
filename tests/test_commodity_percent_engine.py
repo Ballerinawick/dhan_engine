@@ -21,6 +21,9 @@ class CommodityPercentEngineTests(unittest.TestCase):
             "spread_pct": 0.04,
             "clean_trade_score": 0.75,
             "spoof_risk": 0.10,
+            "top_depth_imbalance": 0.35,
+            "recovery_score": 0.45,
+            "exhaustion_score": 0.05,
             "ltp": ltp,
         }
 
@@ -47,6 +50,24 @@ class CommodityPercentEngineTests(unittest.TestCase):
         engine.on_tick("CRUDEOIL", 6500.0, self._strong_features(6500.0), 2.0, in_position=False)
         self.assertEqual(len(engine.history["GOLD"]), 2)
         self.assertEqual(len(engine.history["CRUDEOIL"]), 1)
+
+    def test_rejection_reason_names_first_failed_gate(self):
+        engine = PercentNormalizedCommodityEngine(min_samples=3)
+        signal = None
+        weak = dict(self._strong_features(6700.0))
+        weak["clean_trade_score"] = 0.10
+        for index in range(12):
+            price = 6700.0 * (1.0 + (index * 0.00020))
+            signal = engine.on_tick(
+                "CRUDEOIL",
+                price,
+                weak,
+                100.0 + index,
+                in_position=False,
+            )
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.action, "HOLD")
+        self.assertIn(signal.reason, {"CLEAN_TRADE_WEAK", "SCORE_BELOW_PROFILE"})
 
 
 class CommodityPaperPortfolioTests(unittest.TestCase):

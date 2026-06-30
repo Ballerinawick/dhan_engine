@@ -25,6 +25,63 @@ class CommodityPercentSignal:
     features: Dict[str, float]
 
 
+COMMODITY_PROFILES = {
+    "GOLD": {
+        "entry_score": 70.0,
+        "ret5": 0.015,
+        "ret30": 0.025,
+        "ret120": -0.020,
+        "vwap": -0.080,
+        "max_spread": 0.060,
+        "clean": 40.0,
+        "spoof": 65.0,
+        "min_day_position": 18.0,
+        "max_day_position": 96.0,
+        "min_orderflow": 35.0,
+    },
+    "CRUDEOIL": {
+        "entry_score": 72.0,
+        "ret5": 0.040,
+        "ret30": 0.040,
+        "ret120": -0.020,
+        "vwap": 0.050,
+        "max_spread": 0.060,
+        "clean": 35.0,
+        "spoof": 70.0,
+        "min_day_position": 25.0,
+        "max_day_position": 97.0,
+        "min_orderflow": 40.0,
+    },
+    "NATURALGAS": {
+        "entry_score": 74.0,
+        "ret5": 0.060,
+        "ret30": 0.080,
+        "ret120": 0.000,
+        "vwap": -0.050,
+        "max_spread": 0.080,
+        "clean": 45.0,
+        "spoof": 60.0,
+        "min_day_position": 22.0,
+        "max_day_position": 94.0,
+        "min_orderflow": 45.0,
+    },
+}
+
+DEFAULT_PROFILE = {
+    "entry_score": 72.0,
+    "ret5": 0.040,
+    "ret30": 0.060,
+    "ret120": -0.020,
+    "vwap": 0.000,
+    "max_spread": 0.080,
+    "clean": 40.0,
+    "spoof": 65.0,
+    "min_day_position": 20.0,
+    "max_day_position": 96.0,
+    "min_orderflow": 40.0,
+}
+
+
 class PercentNormalizedCommodityEngine:
     """Price-independent long-only MCX commodity paper signal engine."""
 
@@ -42,6 +99,12 @@ class PercentNormalizedCommodityEngine:
         self.min_samples = max(int(min_samples), 3)
         self.max_spread_pct = float(max_spread_pct)
         self.history: Dict[str, Deque[dict]] = defaultdict(lambda: deque(maxlen=max_samples))
+
+    @staticmethod
+    def _profile(symbol: str) -> Dict[str, float]:
+        profile = dict(DEFAULT_PROFILE)
+        profile.update(COMMODITY_PROFILES.get(str(symbol).upper().strip(), {}))
+        return profile
 
     @staticmethod
     def _price_at_or_before(history: Deque[dict], target_ts: float) -> float:
@@ -78,14 +141,29 @@ class PercentNormalizedCommodityEngine:
         spread_pct = max(float(features.get("spread_pct", 0.0) or 0.0), 0.0)
         clean_trade = _clamp(float(features.get("clean_trade_score", 0.50) or 0.50) * 100.0)
         spoof_risk = _clamp(float(features.get("spoof_risk", 0.0) or 0.0) * 100.0)
+        top_depth_imbalance = max(-1.0, min(1.0, float(features.get("top_depth_imbalance", 0.0) or 0.0)))
+        recovery_score = _clamp(float(features.get("recovery_score", 0.0) or 0.0) * 100.0)
+        exhaustion_score = _clamp(float(features.get("exhaustion_score", 0.0) or 0.0) * 100.0)
+        volume_change_tick = float(features.get("volume_change_tick", 0.0) or 0.0)
+        oi_change_tick = float(features.get("oi_change_tick", 0.0) or 0.0)
 
         fast_momentum = _clamp(50.0 + (return_5s * 190.0))
         slow_momentum = _clamp(50.0 + (return_30s * 120.0))
         session_momentum = _clamp(50.0 + (return_120s * 70.0))
         intraday_trend = _clamp(50.0 + (intraday_return * 30.0))
         vwap_bias = _clamp(50.0 + (ltp_vs_avg * 70.0))
-        orderflow = _clamp(50.0 + (depth_imbalance * 28.0) + (market_imbalance * 18.0))
+        orderflow = _clamp(
+            50.0
+            + (depth_imbalance * 24.0)
+            + (top_depth_imbalance * 12.0)
+            + (market_imbalance * 16.0)
+            + (recovery_score * 0.08)
+            - (exhaustion_score * 0.08)
+        )
         liquidity = _clamp(100.0 - ((spread_pct / max(self.max_spread_pct, 1e-9)) * 100.0))
+        profile = self._profile(root)
+        effective_entry_score = max(float(self.entry_score), float(profile["entry_score"]))
+        effective_max_spread = min(float(self.max_spread_pct), float(profile["max_spread"]))
 
         score = _clamp(
             (0.22 * fast_momentum)
@@ -108,28 +186,52 @@ class PercentNormalizedCommodityEngine:
             "ltp_vs_avg_pct": ltp_vs_avg,
             "day_position_pct": day_position,
             "depth_imbalance_pct": depth_imbalance * 100.0,
+            "top_depth_imbalance_pct": top_depth_imbalance * 100.0,
             "market_imbalance_pct": market_imbalance * 100.0,
             "spread_pct": spread_pct,
             "clean_trade_pct": clean_trade,
             "spoof_risk_pct": spoof_risk,
+            "recovery_pct": recovery_score,
+            "exhaustion_pct": exhaustion_score,
+            "volume_change_tick": volume_change_tick,
+            "oi_change_tick": oi_change_tick,
+            "orderflow_score": orderflow,
+            "liquidity_score": liquidity,
+            "effective_entry_score": effective_entry_score,
+            "effective_max_spread_pct": effective_max_spread,
+            "profile_ret5_min": float(profile["ret5"]),
+            "profile_ret30_min": float(profile["ret30"]),
+            "profile_ret120_min": float(profile["ret120"]),
+            "profile_vwap_min": float(profile["vwap"]),
+            "profile_clean_min": float(profile["clean"]),
+            "profile_spoof_max": float(profile["spoof"]),
             "score": score,
             "sample_count": float(len(samples)),
         }
 
         if len(samples) < self.min_samples:
             return CommodityPercentSignal(root, "HOLD", score, price, "WARMUP", normalized)
-        if spread_pct > self.max_spread_pct:
+        if spread_pct > effective_max_spread:
             return CommodityPercentSignal(root, "HOLD", score, price, "SPREAD_TOO_WIDE", normalized)
         if in_position and score <= self.exit_score:
             return CommodityPercentSignal(root, "EXIT", score, price, "COMMODITY_SCORE_BREAKDOWN", normalized)
-        if (
-            not in_position
-            and score >= self.entry_score
-            and return_5s >= 0.03
-            and return_30s >= 0.06
-            and ltp_vs_avg >= -0.02
-            and clean_trade >= 30.0
-            and spoof_risk <= 75.0
-        ):
-            return CommodityPercentSignal(root, "ENTRY", score, price, "COMMODITY_MOMENTUM_ALIGNMENT", normalized)
-        return CommodityPercentSignal(root, "HOLD", score, price, "NO_CONFIRMED_EDGE", normalized)
+        if in_position:
+            return CommodityPercentSignal(root, "HOLD", score, price, "POSITION_HELD", normalized)
+
+        entry_checks = [
+            ("SCORE_BELOW_PROFILE", score >= effective_entry_score),
+            ("RET5_WEAK", return_5s >= float(profile["ret5"])),
+            ("RET30_WEAK", return_30s >= float(profile["ret30"])),
+            ("RET120_WEAK", return_120s >= float(profile["ret120"])),
+            ("VWAP_BIAS_WEAK", ltp_vs_avg >= float(profile["vwap"])),
+            ("CLEAN_TRADE_WEAK", clean_trade >= float(profile["clean"])),
+            ("SPOOF_RISK_HIGH", spoof_risk <= float(profile["spoof"])),
+            ("DAY_POSITION_LOW", day_position >= float(profile["min_day_position"])),
+            ("DAY_POSITION_EXTENDED", day_position <= float(profile["max_day_position"])),
+            ("ORDERFLOW_WEAK", orderflow >= float(profile["min_orderflow"])),
+        ]
+        for reason, passed in entry_checks:
+            if not passed:
+                return CommodityPercentSignal(root, "HOLD", score, price, reason, normalized)
+
+        return CommodityPercentSignal(root, "ENTRY", score, price, "COMMODITY_PROFILED_MOMENTUM_ALIGNMENT", normalized)
