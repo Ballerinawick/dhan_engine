@@ -4,6 +4,8 @@ from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from dhan_engine.infrastructure.mongo.trade_summary_sink import get_trade_summary_sink
+
 
 class PaperTradeManager:
     """
@@ -63,6 +65,7 @@ class PaperTradeManager:
         self.opened_today = 0
         self.closed_today = 0
         self.last_trade_summary = None
+        self.trade_summary_sink = get_trade_summary_sink()
         self.enable_parsed_logs = False   # 🔥 toggle for debug logs
 
     # --------------------------------------------------
@@ -334,6 +337,15 @@ class PaperTradeManager:
             f"Hold:{self._fmt_duration(hold_sec)} | "
             f"EntryTime:{self.last_trade_summary['entry_time']} | ExitTime:{self.last_trade_summary['exit_time']} | "
             f"EntryReason:{pos.get('entry_reason')} | ExitReason:{reason}"
+        )
+        self.trade_summary_sink.record(
+            "index",
+            {
+                **self.last_trade_summary,
+                "index": idx,
+                "runtime": "tri_wave_paper",
+                "strategy": "tri_wave_v2",
+            },
         )
         self.debug_position_snapshot()
         self._log_consolidated()

@@ -4,3 +4,4 @@ requests
 python-dotenv
 dhanhq==2.0.2
 websockets
+pymongo
