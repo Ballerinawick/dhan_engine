@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from dhan_engine.application.market_data import FutureQuoteStream
 from dhan_engine.domain.commodities.percent_engine import PercentNormalizedCommodityEngine
 from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
+from dhan_engine.infrastructure.mongo.trade_summary_sink import get_trade_summary_sink
 from dhan_engine.simulations.commodity_paper_portfolio import CommodityPaperPortfolio
 
 
@@ -128,6 +129,7 @@ class CommodityPaperRuntime:
         self.daily_trades = 0
         self.daily_date = datetime.now(IST).date()
         self.daily_realized_start = 0.0
+        self.trade_summary_sink = get_trade_summary_sink()
         self.stream = FutureQuoteStream(
             client_id=settings.client_id,
             token=settings.access_token,
@@ -284,6 +286,24 @@ class CommodityPaperRuntime:
                 trade = self.portfolio.exit(secid, ltp, reason, now)
                 self.last_exit_ts[symbol] = now
                 if trade:
+                    self.trade_summary_sink.record(
+                        "commodities",
+                        {
+                            "symbol": symbol,
+                            "trading_symbol": trade["trading_symbol"],
+                            "secid": int(secid),
+                            "qty": int(trade["qty"]),
+                            "entry": float(trade["entry"]),
+                            "exit": float(trade["exit"]),
+                            "gross_pnl": float(trade["gross_pnl"]),
+                            "fee": float(trade["fee"]),
+                            "net_pnl": float(trade["net_pnl"]),
+                            "hold_sec": float(trade["hold_sec"]),
+                            "exit_reason": trade["reason"],
+                            "runtime": "commodity_percent_paper",
+                            "strategy": "commodity_percent_normalized_v1",
+                        },
+                    )
                     logger.info(
                         "COMMODITY_TRADE_SUMMARY | %s | Contract:%s | Qty:%s | Entry:%.2f | Exit:%.2f | GrossPnL:%+.2f | Fee:%.2f | NetPnL:%+.2f | Hold:%.1fs | ExitReason:%s",
                         symbol,
