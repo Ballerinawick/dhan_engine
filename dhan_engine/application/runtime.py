@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import threading
@@ -250,6 +251,8 @@ class TradingRuntimeCoordinator:
         self._feed_health_queue_growth = defaultdict(int)
         self._engine_tick_age_ms_by_secid: Dict[int, float] = {}
         self._last_stale_entry_block_log_mono = defaultdict(float)
+        self.first_tick_log_enabled = os.getenv("TRIWAVE_FIRST_TICK_LOG_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self._first_index_tick_logged = set()
 
         self.metrics = {
             "exit_reason_counts": defaultdict(int),
@@ -601,6 +604,42 @@ class TradingRuntimeCoordinator:
         )
         self._select_and_subscribe_option_pairs()
 
+    @staticmethod
+    def _json_safe(value):
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, dict):
+            return {str(key): TradingRuntimeCoordinator._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [TradingRuntimeCoordinator._json_safe(item) for item in value]
+        return str(value)
+
+    def _log_first_index_tick(self, *, stream: str, index: str, side: Optional[str], secid: int, tag: str, ltp: float, payload: dict) -> None:
+        if not self.first_tick_log_enabled:
+            return
+        key = f"{stream}:{index}:{side or 'NA'}:{int(secid)}"
+        if key in self._first_index_tick_logged:
+            return
+        self._first_index_tick_logged.add(key)
+        merged = {
+            "segment": "index",
+            "stream": stream,
+            "index": index,
+            "side": side,
+            "secid": int(secid),
+            "tag": str(tag),
+            "ltp": float(ltp),
+        }
+        merged.update(dict(payload or {}))
+        logger.info(
+            "TRI_WAVE_FIRST_FULL_TICK | stream=%s | index=%s | side=%s | secid=%s | payload=%s",
+            stream,
+            index,
+            side or "NA",
+            int(secid),
+            json.dumps(self._json_safe(merged), sort_keys=True, separators=(",", ":")),
+        )
+
     def on_future_quote(self, secid: int, tag: str, ltp: float, depth) -> None:
         self._handle_ws_connected()
         with self._lock:
@@ -624,6 +663,26 @@ class TradingRuntimeCoordinator:
             raw_full = getattr(depth, "raw", None) or {}
             self.latest_full_features_by_secid[int(secid)] = dict(features)
             self.latest_full_raw_by_secid[int(secid)] = dict(raw_full)
+            self._log_first_index_tick(
+                stream="FUTURE_FULL",
+                index=index,
+                side=None,
+                secid=int(secid),
+                tag=str(tag),
+                ltp=float(ltp),
+                payload={
+                    "depth": {
+                        "bid_price": list(getattr(depth, "bid_price", []) or []),
+                        "bid_qty": list(getattr(depth, "bid_qty", []) or []),
+                        "ask_price": list(getattr(depth, "ask_price", []) or []),
+                        "ask_qty": list(getattr(depth, "ask_qty", []) or []),
+                        "ts": float(getattr(depth, "ts", time.time()) or time.time()),
+                    },
+                    "features": dict(features),
+                    "raw": dict(raw_full),
+                    "diag": dict(getattr(depth, "diag", None) or {}),
+                },
+            )
             if self.TRI_WAVE_V2_ONLY_MODE:
                 self.tri_wave_recorder.record_tick(index=index, stream="FUT", secid=int(secid), ltp=float(ltp), features=dict(features or self.pairs[index].underlying_quote or {}))
 
@@ -867,6 +926,21 @@ class TradingRuntimeCoordinator:
             merged["_diag"] = dict(diag)
             side = "CE" if int(secid) == pair.ce_id else "PE" if int(secid) == pair.pe_id else None
             if side:
+                self._log_first_index_tick(
+                    stream="OPTION_FULL",
+                    index=index,
+                    side=side,
+                    secid=int(secid),
+                    tag=str(tag),
+                    ltp=float(ltp),
+                    payload={
+                        "features": dict(features),
+                        "raw": dict(raw_full),
+                        "merged": dict(merged),
+                        "diag": dict(diag),
+                    },
+                )
+            if side:
                 feed_key = self._feed_key(index, side, int(secid))
                 self._bump_feed_counter(feed_key, "raw_ticks")
                 self._bump_feed_counter(feed_key, "parsed_ticks")
@@ -967,6 +1041,20 @@ class TradingRuntimeCoordinator:
                 ) else "DEPTH_ONLY"
             if self.TRI_WAVE_V2_ONLY_MODE and side:
                 self.tri_wave_recorder.record_tick(index=index, stream=side, secid=int(secid), ltp=float(merged.get("ltp", 0.0) or 0.0), features=dict(merged))
+            self._log_first_index_tick(
+                stream="OPTION_DEPTH_MERGED",
+                index=index,
+                side=side,
+                secid=int(secid),
+                tag=str(tag),
+                ltp=float(merged.get("ltp", 0.0) or 0.0),
+                payload={
+                    "raw_depth": dict(raw),
+                    "latest_full_features": dict(full or {}),
+                    "merged": dict(merged),
+                    "diag": dict(merged.get("_diag", {}) or {}),
+                },
+            )
             pair.update_option_depth(secid, merged)
             self._process_option_update(index, pair, secid, tag, merged)
 
