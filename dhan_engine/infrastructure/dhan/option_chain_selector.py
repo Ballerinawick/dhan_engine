@@ -250,6 +250,49 @@ class OptionChainSelector:
             "cache_age": time.time() - cache_ts if cache_ts else None,
         }
 
+    def select_atm_pair(self, index: str) -> dict | None:
+        """Select same-strike nearest-expiry ATM CE and PE for paired experiments."""
+        index = str(index).upper().strip()
+        data = self.fetch_chain(index)
+        if not data or not data.get("oc"):
+            return None
+        underlying_ltp = float(data.get("last_price", 0.0) or 0.0)
+        if underlying_ltp <= 0:
+            return None
+        step = int(self.strike_step_map[index])
+        atm = int(round(underlying_ltp / step) * step)
+        oc = data["oc"]
+        node = oc.get(str(atm)) or oc.get(f"{float(atm):.1f}")
+        if node is None:
+            for strike_key, candidate in oc.items():
+                try:
+                    if float(strike_key) == float(atm):
+                        node = candidate
+                        break
+                except (TypeError, ValueError):
+                    continue
+        if not node or not node.get("ce") or not node.get("pe"):
+            return None
+        expiry = self.im.get_nearest_option_expiry(index, prefer_weekly=True)
+        ce_secid = int(self.im.find_option_security_id(index, expiry, atm, "CE"))
+        pe_secid = int(self.im.find_option_security_id(index, expiry, atm, "PE"))
+        opts = self.im._get_optidx_df(index)
+        rows = opts[
+            (opts["SEM_EXPIRY_DATE"].dt.date == expiry.date())
+            & (opts["SEM_STRIKE_PRICE"] == float(atm))
+        ]
+        lot_size = int(float(rows.iloc[0]["SEM_LOT_UNITS"])) if not rows.empty else 1
+        return {
+            "index": index,
+            "strike": float(atm),
+            "expiry": expiry.strftime("%Y-%m-%d"),
+            "underlying_ltp": underlying_ltp,
+            "ce_secid": ce_secid,
+            "pe_secid": pe_secid,
+            "lot_size": lot_size,
+            "selection_source": "OPTION_CHAIN_ATM_PAIR",
+        }
+
     # --------------------------------------------------
     # Scoring with explanation (unchanged)
     # --------------------------------------------------

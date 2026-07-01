@@ -14,6 +14,9 @@ def main() -> None:
         "commodity": "commodity",
         "commodities": "commodity",
         "mcx": "commodity",
+        "timed-straddle": "timed_straddle",
+        "timed_straddle": "timed_straddle",
+        "straddle-experiment": "timed_straddle",
     }
     selected = aliases.get(service)
     if selected is None:
@@ -29,6 +32,11 @@ def main() -> None:
         from dhan_engine.interfaces.cli.run_commodity_paper import main as run_commodity
 
         run_commodity()
+        return
+    if selected == "timed_straddle":
+        from dhan_engine.interfaces.cli.run_timed_straddle import main as run_timed_straddle
+
+        run_timed_straddle()
         return
 
     from dhan_engine.interfaces.cli.run_ws import main as run_index

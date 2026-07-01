@@ -22,17 +22,22 @@ def _truthy(value: str | None, default: bool) -> bool:
 class TradeSummarySink:
     """Best-effort MongoDB writer for completed paper trade summaries."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        collection_name: str | None = None,
+        portfolio_collection_name: str | None = None,
+    ) -> None:
         self.uri = (
             os.getenv("TRADE_SUMMARY_MONGO_URI", "").strip()
             or os.getenv("MONGODB_URI", "").strip()
         )
         self.db_name = os.getenv("TRADE_SUMMARY_MONGO_DB", "dhan_engine").strip() or "dhan_engine"
-        self.collection_name = (
+        self.collection_name = collection_name or (
             os.getenv("TRADE_SUMMARY_MONGO_COLLECTION", "trade_summaries").strip()
             or "trade_summaries"
         )
-        self.portfolio_collection_name = (
+        self.portfolio_collection_name = portfolio_collection_name or (
             os.getenv("PORTFOLIO_MONGO_COLLECTION", "portfolio_daily").strip()
             or "portfolio_daily"
         )
