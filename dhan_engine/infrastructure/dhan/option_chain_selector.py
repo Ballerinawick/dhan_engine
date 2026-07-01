@@ -293,6 +293,70 @@ class OptionChainSelector:
             "selection_source": "OPTION_CHAIN_ATM_PAIR",
         }
 
+    def select_atm_reverse_iron_fly(self, index: str, wing_steps: int = 1) -> dict | None:
+        """Select ATM long straddle plus equidistant short CE/PE wings."""
+        index = str(index).upper().strip()
+        data = self.fetch_chain(index)
+        if not data or not data.get("oc"):
+            return None
+        underlying_ltp = float(data.get("last_price", 0.0) or 0.0)
+        if underlying_ltp <= 0:
+            return None
+        step = int(self.strike_step_map[index])
+        wing_steps = max(1, int(wing_steps))
+        atm = int(round(underlying_ltp / step) * step)
+        upper = atm + (step * wing_steps)
+        lower = atm - (step * wing_steps)
+        oc = data["oc"]
+
+        def _node(strike: int) -> dict | None:
+            direct = oc.get(str(strike)) or oc.get(f"{float(strike):.1f}")
+            if direct is not None:
+                return direct
+            for strike_key, candidate in oc.items():
+                try:
+                    if float(strike_key) == float(strike):
+                        return candidate
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        atm_node = _node(atm)
+        upper_node = _node(upper)
+        lower_node = _node(lower)
+        if not atm_node or not upper_node or not lower_node:
+            return None
+        if not atm_node.get("ce") or not atm_node.get("pe"):
+            return None
+        if not upper_node.get("ce") or not lower_node.get("pe"):
+            return None
+
+        expiry = self.im.get_nearest_option_expiry(index, prefer_weekly=True)
+        ids = {
+            "long_ce_secid": int(self.im.find_option_security_id(index, expiry, atm, "CE")),
+            "long_pe_secid": int(self.im.find_option_security_id(index, expiry, atm, "PE")),
+            "short_ce_secid": int(self.im.find_option_security_id(index, expiry, upper, "CE")),
+            "short_pe_secid": int(self.im.find_option_security_id(index, expiry, lower, "PE")),
+        }
+        opts = self.im._get_optidx_df(index)
+        rows = opts[
+            (opts["SEM_EXPIRY_DATE"].dt.date == expiry.date())
+            & (opts["SEM_STRIKE_PRICE"] == float(atm))
+        ]
+        lot_size = int(float(rows.iloc[0]["SEM_LOT_UNITS"])) if not rows.empty else 1
+        return {
+            "index": index,
+            "strike": float(atm),
+            "upper_strike": float(upper),
+            "lower_strike": float(lower),
+            "wing_width": float(step * wing_steps),
+            "expiry": expiry.strftime("%Y-%m-%d"),
+            "underlying_ltp": underlying_ltp,
+            "lot_size": lot_size,
+            "selection_source": "OPTION_CHAIN_REVERSE_IRON_FLY",
+            **ids,
+        }
+
     # --------------------------------------------------
     # Scoring with explanation (unchanged)
     # --------------------------------------------------
