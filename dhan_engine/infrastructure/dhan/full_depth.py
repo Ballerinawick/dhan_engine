@@ -8,13 +8,17 @@ from typing import Dict, List, Optional, Tuple
 import websocket
 
 
-depth_feed_wss = "wss://depth-api-feed.dhan.co/twentydepth"
+TWENTY_DEPTH_WSS = "wss://depth-api-feed.dhan.co/twentydepth"
+TWO_HUNDRED_DEPTH_WSS = "wss://full-depth-api.dhan.co/twohundreddepth"
 
 
 class FullDepth:
-    def __init__(self, client_id, access_token):
+    def __init__(self, client_id, access_token, levels: int = 20):
         self.client_id = str(client_id)
         self.access_token = str(access_token)
+        if int(levels) not in (20, 200):
+            raise ValueError("levels must be 20 or 200")
+        self.levels = int(levels)
 
         self._subscribed: List[Tuple[str, str]] = []
         self._sub_keys = set()
@@ -52,8 +56,9 @@ class FullDepth:
         return segment_map.get(seg_text, seg_text)
 
     def _url(self) -> str:
+        endpoint = TWO_HUNDRED_DEPTH_WSS if self.levels == 200 else TWENTY_DEPTH_WSS
         return (
-            f"{depth_feed_wss}?token={self.access_token}"
+            f"{endpoint}?token={self.access_token}"
             f"&clientId={self.client_id}&authType=2"
         )
 
@@ -133,6 +138,10 @@ class FullDepth:
                 self._sub_keys.add(key)
                 self._subscribed.append(key)
                 new_items.append(key)
+                if self.levels == 200 and len(self._subscribed) > 1:
+                    self._subscribed.pop()
+                    self._sub_keys.remove(key)
+                    raise ValueError("Dhan 200-depth permits exactly one instrument per websocket")
             total_subscribed = len(self._subscribed)
             total_unique = len(self._sub_keys)
         if duplicate_count:
@@ -222,7 +231,9 @@ class FullDepth:
             self._send_subscription_now(self._subscribed)
 
     def _on_message(self, ws, message):
-        self._last_message_ts = time.time()
+        received_ts = time.time()
+        received_mono = time.monotonic()
+        self._last_message_ts = received_ts
 
         if isinstance(message, str):
             text = message.strip()
@@ -239,12 +250,14 @@ class FullDepth:
             self._first_binary_logged = True
             print(f"DEPTH WS FIRST_BINARY size={len(message)}")
 
-        packets = self._parse_binary_message(message)
+        packets = self._parse_binary_message(message, expected_levels=self.levels)
         if not packets:
             print(f"WARNING DEPTH binary frame parsed empty | size={len(message)}")
             return
 
         for packet in packets:
+            packet["received_ts"] = received_ts
+            packet["received_mono"] = received_mono
             self._push_async(packet)
 
     def _on_error(self, ws, error):
@@ -294,17 +307,27 @@ class FullDepth:
             f"unique_subscribed_instrument_keys={total_unique}"
         )
 
-        payload = {
-            "RequestCode": 23,
-            "InstrumentCount": len(instruments),
-            "InstrumentList": [
+        if self.levels == 200:
+            if len(instruments) != 1:
+                raise ValueError("Dhan 200-depth subscription requires one instrument")
+            seg, secid = instruments[0]
+            payload = {
+                "RequestCode": 23,
+                "ExchangeSegment": self._normalize_exchange_segment(seg),
+                "SecurityId": str(secid),
+            }
+        else:
+            payload = {
+                "RequestCode": 23,
+                "InstrumentCount": len(instruments),
+                "InstrumentList": [
                 {
                     "ExchangeSegment": self._normalize_exchange_segment(seg),
                     "SecurityId": str(secid),
                 }
                 for seg, secid in instruments
-            ],
-        }
+                ],
+            }
 
         print("DEPTH_SUB_PAYLOAD", json.dumps(payload, separators=(",", ":")))
 
@@ -321,7 +344,7 @@ class FullDepth:
                 return False
 
     @staticmethod
-    def _parse_binary_message(data: bytes) -> List[Dict]:
+    def _parse_binary_message(data: bytes, expected_levels: int = 20) -> List[Dict]:
         packets: List[Dict] = []
         offset = 0
         total = len(data)
@@ -334,7 +357,7 @@ class FullDepth:
                 break
 
             packet = data[offset: offset + packet_len]
-            decoded = FullDepth._parse_packet(packet)
+            decoded = FullDepth._parse_packet(packet, expected_levels=expected_levels)
             if decoded:
                 packets.append(decoded)
 
@@ -343,21 +366,25 @@ class FullDepth:
         return packets
 
     @staticmethod
-    def _parse_packet(packet: bytes) -> Optional[Dict]:
+    def _parse_packet(packet: bytes, expected_levels: int = 20) -> Optional[Dict]:
         if len(packet) < 12 + 16:
             return None
 
-        _, msg_code, exchange_segment, security_id, _ = struct.unpack_from(
+        _, msg_code, exchange_segment, security_id, header_value = struct.unpack_from(
             "<HBBiI", packet, 0
         )
 
         if msg_code not in (41, 51):
             return None
 
+        available_rows = (len(packet) - 12) // 16
+        row_count = int(header_value) if expected_levels == 200 else available_rows
+        if row_count <= 0 or row_count > available_rows:
+            return None
         levels = []
         offset = 12
 
-        while offset + 16 <= len(packet):
+        while len(levels) < row_count and offset + 16 <= len(packet):
             price, qty, orders = struct.unpack_from("<dII", packet, offset)
             levels.append(
                 {
@@ -373,4 +400,5 @@ class FullDepth:
             "exchange_segment": int(exchange_segment),
             "security_id": int(security_id),
             "levels": levels,
+            "level_count": len(levels),
         }

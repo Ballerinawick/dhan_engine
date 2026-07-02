@@ -17,6 +17,8 @@ def main() -> None:
         "timed-straddle": "timed_straddle",
         "timed_straddle": "timed_straddle",
         "straddle-experiment": "timed_straddle",
+        "depth-research": "depth_research",
+        "full-depth": "depth_research",
     }
     selected = aliases.get(service)
     if selected is None:
@@ -37,6 +39,11 @@ def main() -> None:
         from dhan_engine.interfaces.cli.run_timed_straddle import main as run_timed_straddle
 
         run_timed_straddle()
+        return
+    if selected == "depth_research":
+        from dhan_engine.interfaces.cli.run_full_depth_research import main as run_depth_research
+
+        run_depth_research()
         return
 
     from dhan_engine.interfaces.cli.run_ws import main as run_index
