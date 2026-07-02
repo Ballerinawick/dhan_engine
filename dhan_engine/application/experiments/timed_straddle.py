@@ -44,6 +44,8 @@ class TimedStraddleSettings:
     round_trip_cost: float = 160.0
     quote_stale_sec: float = 3.0
     max_cycles: int = 74
+    max_consecutive_losses: int = 3
+    daily_loss_limit: float = 1000.0
     heartbeat_sec: float = 10.0
     market_start: dtime = dtime(9, 15)
     entry_cutoff: dtime = dtime(15, 25)
@@ -71,6 +73,8 @@ class TimedStraddleSettings:
             round_trip_cost=max(0.0, _env_float("TIMED_STRADDLE_ROUND_TRIP_COST", 160.0)),
             quote_stale_sec=max(0.5, _env_float("TIMED_STRADDLE_QUOTE_STALE_SEC", 3.0)),
             max_cycles=max(1, _env_int("TIMED_STRADDLE_MAX_CYCLES", 74)),
+            max_consecutive_losses=max(1, _env_int("TIMED_STRADDLE_MAX_CONSECUTIVE_LOSSES", 3)),
+            daily_loss_limit=max(0.0, _env_float("TIMED_STRADDLE_DAILY_LOSS_LIMIT", 1000.0)),
             heartbeat_sec=max(1.0, _env_float("TIMED_STRADDLE_HEARTBEAT_SEC", 10.0)),
         )
 
@@ -259,6 +263,9 @@ class TimedStraddleRuntime:
         self.realized_net = 0.0
         self.wins = 0
         self.losses = 0
+        self.consecutive_losses = 0
+        self.risk_halted = False
+        self._risk_halt_logged = False
         self._lock = threading.RLock()
         self._last_heartbeat = 0.0
         self._selection_retry_at = 0.0
@@ -281,6 +288,18 @@ class TimedStraddleRuntime:
 
     def _can_start_cycle(self, now: float) -> bool:
         current = self._now_ist(now).time().replace(tzinfo=None)
+        if self.risk_halted:
+            if not self._risk_halt_logged:
+                self._risk_halt_logged = True
+                logger.error(
+                    "TIMED_STRADDLE_RISK_HALT | realized=%+.2f | consecutive_losses=%s | "
+                    "daily_loss_limit=%.2f | max_consecutive_losses=%s | paper=true",
+                    self.realized_net,
+                    self.consecutive_losses,
+                    self.settings.daily_loss_limit,
+                    self.settings.max_consecutive_losses,
+                )
+            return False
         return (
             self.settings.market_start <= current < self.settings.entry_cutoff
             and self.cycle_count < self.settings.max_cycles
@@ -365,6 +384,18 @@ class TimedStraddleRuntime:
                     self.realized_net += float(summary["net_pnl"])
                     self.wins += int(summary["net_pnl"] > 0)
                     self.losses += int(summary["net_pnl"] <= 0)
+                    if summary["net_pnl"] > 0:
+                        self.consecutive_losses = 0
+                    else:
+                        self.consecutive_losses += 1
+                    if (
+                        self.consecutive_losses >= self.settings.max_consecutive_losses
+                        or (
+                            self.settings.daily_loss_limit > 0
+                            and self.realized_net <= -self.settings.daily_loss_limit
+                        )
+                    ):
+                        self.risk_halted = True
                     self.sink.record("timed_straddle", summary)
                     logger.info(
                         "TIMED_STRADDLE_EXIT | cycle=%s | reason=%s | hold=%.1fs | long_ce=%+.2f | long_pe=%+.2f | short_ce=%+.2f | short_pe=%+.2f | gross=%+.2f | fees=%.2f | net=%+.2f | daily_net=%+.2f",
@@ -422,6 +453,8 @@ class TimedStraddleRuntime:
             "cycles_opened": self.cycle_count,
             "wins": self.wins,
             "losses": self.losses,
+            "consecutive_losses": self.consecutive_losses,
+            "risk_halted": self.risk_halted,
             "daily_net_pnl": self.realized_net + (float(mark["net_pnl"]) if mark else 0.0),
             "daily_realized_pnl": self.realized_net,
             "daily_unrealized_pnl": float(mark["net_pnl"]) if mark else 0.0,
@@ -430,17 +463,19 @@ class TimedStraddleRuntime:
         }
         self.sink.record_portfolio("timed_straddle", payload)
         logger.info(
-            "TIMED_STRADDLE_HEALTH | opened=%s/%s | completed=%s | wins=%s | losses=%s | realized=%+.2f | unrealized=%+.2f | open=%s",
+            "TIMED_STRADDLE_HEALTH | opened=%s/%s | completed=%s | wins=%s | losses=%s | consecutive_losses=%s | risk_halted=%s | realized=%+.2f | unrealized=%+.2f | open=%s",
             self.cycle_count, self.settings.max_cycles, self.wins + self.losses, self.wins, self.losses,
-            self.realized_net, payload["daily_unrealized_pnl"], payload["open_positions"],
+            self.consecutive_losses, self.risk_halted, self.realized_net,
+            payload["daily_unrealized_pnl"], payload["open_positions"],
         )
 
     def run(self) -> None:
         self.quote_stream.start()
         logger.info(
-            "TIMED_STRADDLE_RUNTIME_ACTIVE | strategy=REVERSE_IRON_FLY | index=%s | wing_steps=%s | hold=%.0fs | lots=%s | modeled_cost=%.2f | cutoff=15:25 | force_close=15:30 | max_cycles=%s | paper=true",
+            "TIMED_STRADDLE_RUNTIME_ACTIVE | strategy=REVERSE_IRON_FLY | index=%s | wing_steps=%s | hold=%.0fs | lots=%s | modeled_cost=%.2f | cutoff=15:25 | force_close=15:30 | max_cycles=%s | max_consecutive_losses=%s | daily_loss_limit=%.2f | paper=true",
             self.settings.index, self.settings.wing_steps, self.settings.hold_sec, self.settings.lots,
             self.settings.round_trip_cost, self.settings.max_cycles,
+            self.settings.max_consecutive_losses, self.settings.daily_loss_limit,
         )
         try:
             while True:

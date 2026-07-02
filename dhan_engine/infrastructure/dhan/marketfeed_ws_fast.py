@@ -23,17 +23,8 @@ class FastDhanLiveMarketFeedWS(DhanLiveMarketFeedWS):
         self._max_pending_messages = int(os.getenv("FULLQUOTE_MAX_PENDING_MESSAGES", "500") or 500)
         self._slow_feature_ms = float(os.getenv("FULLQUOTE_FEATURE_SLOW_MS", "50") or 50)
 
-    def close(self) -> None:
-        self._stop.set()
-        with self._message_condition:
-            self._message_condition.notify_all()
-        with self._callback_condition:
-            self._callback_condition.notify_all()
-        try:
-            if self._ws:
-                self._ws.close()
-        except Exception:
-            pass
+    def close(self, wait_timeout: float = 5.0) -> bool:
+        return super().close(wait_timeout=wait_timeout)
 
     def _ensure_worker(self) -> None:
         if not (self._worker_thread and self._worker_thread.is_alive()):

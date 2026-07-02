@@ -7,7 +7,7 @@ from dhan_engine.application.runtime import TradingRuntimeCoordinator
 
 
 class StaticPairRecoveryTests(unittest.TestCase):
-    def test_static_pair_reconnects_same_contracts_without_reselection(self):
+    def test_static_pair_refreshes_all_contracts_without_reselection(self):
         runtime = TradingRuntimeCoordinator.__new__(TradingRuntimeCoordinator)
         runtime.pair_stale_resubscribe_sec = 45.0
         runtime.pair_stale_resubscribe_cooldown_sec = 45.0
@@ -15,21 +15,32 @@ class StaticPairRecoveryTests(unittest.TestCase):
         runtime.static_daily_option_pairs = True
         runtime.pair_stale_entry_quarantine_sec = 120.0
         runtime.option_quote_stream = Mock()
+        runtime.option_quote_stream.refresh_subscriptions.return_value = True
         runtime._set_tri_wave_data_quarantine = Mock()
         runtime._replace_tri_wave_data_quarantine = Mock()
         runtime._premium_rebuild_verify_remaining = Mock(return_value=0.0)
         runtime._should_rebuild_premium_stream = Mock(return_value=False)
         pair = SimpleNamespace(ce_id=79732, pe_id=79733)
+        runtime.pairs = {
+            "NIFTY": pair,
+            "BANKNIFTY": SimpleNamespace(ce_id=75751, pe_id=75662),
+        }
 
         runtime._recover_stale_option_pair("NIFTY", pair, now=100.0)
 
         runtime._set_tri_wave_data_quarantine.assert_called_once_with(
             "NIFTY", "PAIR_STALE_RECOVERY", 120.0
         )
-        runtime.option_quote_stream.reconnect_for_subscriptions.assert_called_once_with(
-            [(79732, "NIFTY_CE"), (79733, "NIFTY_PE")],
+        runtime.option_quote_stream.refresh_subscriptions.assert_called_once_with(
+            [
+                (79732, "NIFTY_CE"),
+                (79733, "NIFTY_PE"),
+                (75751, "BANKNIFTY_CE"),
+                (75662, "BANKNIFTY_PE"),
+            ],
             reason="static_pair_stale:NIFTY",
         )
+        runtime.option_quote_stream.reconnect_for_subscriptions.assert_not_called()
         self.assertEqual(pair.ce_id, 79732)
         self.assertEqual(pair.pe_id, 79733)
 
@@ -46,10 +57,12 @@ class StaticPairRecoveryTests(unittest.TestCase):
         runtime._premium_rebuild_verify_remaining = Mock(return_value=0.0)
         runtime._should_rebuild_premium_stream = Mock(return_value=False)
         pair = SimpleNamespace(ce_id=79732, pe_id=79733)
+        runtime.pairs = {"NIFTY": pair}
 
         runtime._recover_stale_option_pair("NIFTY", pair, now=100.0)
 
         runtime.option_quote_stream.reconnect_for_subscriptions.assert_not_called()
+        runtime.option_quote_stream.refresh_subscriptions.assert_not_called()
         runtime._set_tri_wave_data_quarantine.assert_not_called()
 
     def test_repeated_static_staleness_rebuilds_whole_option_stream(self):
@@ -63,6 +76,7 @@ class StaticPairRecoveryTests(unittest.TestCase):
         runtime._should_rebuild_premium_stream = Mock(return_value=True)
         runtime._rebuild_option_quote_stream = Mock(return_value=True)
         pair = SimpleNamespace(ce_id=79732, pe_id=79733)
+        runtime.pairs = {"NIFTY": pair}
 
         runtime._recover_stale_option_pair("NIFTY", pair, now=100.0)
 
@@ -72,6 +86,29 @@ class StaticPairRecoveryTests(unittest.TestCase):
             now=100.0,
         )
         runtime.option_quote_stream.reconnect_for_subscriptions.assert_not_called()
+
+    def test_failed_in_place_refresh_falls_back_to_reconnect(self):
+        runtime = TradingRuntimeCoordinator.__new__(TradingRuntimeCoordinator)
+        runtime.pair_stale_resubscribe_sec = 45.0
+        runtime.pair_stale_resubscribe_cooldown_sec = 45.0
+        runtime._last_pair_resubscribe_ts = defaultdict(float)
+        runtime.static_daily_option_pairs = True
+        runtime.pair_stale_entry_quarantine_sec = 120.0
+        runtime.option_quote_stream = Mock()
+        runtime.option_quote_stream.refresh_subscriptions.return_value = False
+        runtime._set_tri_wave_data_quarantine = Mock()
+        runtime._replace_tri_wave_data_quarantine = Mock()
+        runtime._premium_rebuild_verify_remaining = Mock(return_value=0.0)
+        runtime._should_rebuild_premium_stream = Mock(return_value=False)
+        pair = SimpleNamespace(ce_id=79732, pe_id=79733)
+        runtime.pairs = {"NIFTY": pair}
+
+        runtime._recover_stale_option_pair("NIFTY", pair, now=100.0)
+
+        runtime.option_quote_stream.reconnect_for_subscriptions.assert_called_once_with(
+            [(79732, "NIFTY_CE"), (79733, "NIFTY_PE")],
+            reason="static_pair_refresh_failed:NIFTY",
+        )
 
     def test_rebuild_verification_requires_ticks_from_new_generation(self):
         runtime = TradingRuntimeCoordinator.__new__(TradingRuntimeCoordinator)
