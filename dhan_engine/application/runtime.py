@@ -193,7 +193,9 @@ class TradingRuntimeCoordinator:
         self.static_daily_option_pairs = str(os.getenv("OPTION_STATIC_DAILY_PAIRS", "1")).strip().lower() in {"1", "true", "yes", "on"}
         self.option_reselection_enabled = str(os.getenv("OPTION_RESELECTION_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
         self.option_selection_retry_sec = float(os.getenv("OPTION_SELECTION_RETRY_SEC", "20") or 20)
-        self.premium_rebuild_enabled = str(os.getenv("PREMIUM_STREAM_REBUILD_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        # In-place subscription refresh is safer than replacing a client while
+        # one of its callback workers may still be busy.
+        self.premium_rebuild_enabled = str(os.getenv("PREMIUM_STREAM_REBUILD_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
         self.premium_rebuild_attempt_threshold = int(os.getenv("PREMIUM_STREAM_REBUILD_ATTEMPT_THRESHOLD", "2") or 2)
         self.premium_rebuild_window_sec = float(os.getenv("PREMIUM_STREAM_REBUILD_WINDOW_SEC", "300") or 300)
         self.premium_rebuild_cooldown_sec = float(os.getenv("PREMIUM_STREAM_REBUILD_COOLDOWN_SEC", "120") or 120)
