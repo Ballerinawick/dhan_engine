@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import struct
 import threading
 import time
@@ -32,6 +33,9 @@ class FullDepth:
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._queue: Optional[asyncio.Queue] = None
+        self._latest_payload_by_key: Dict[object, dict] = {}
+        self._queued_keys = set()
+        self._queue_max_size = max(4, int(os.getenv("DEPTH_QUEUE_MAX_SIZE", "64") or 64))
 
         self._first_binary_logged = False
         self._last_message_ts = 0.0
@@ -67,7 +71,7 @@ class FullDepth:
         if self._loop is None or self._loop.is_closed():
             self._loop = loop
         if self._queue is None:
-            self._queue = asyncio.Queue()
+            self._queue = asyncio.Queue(maxsize=self._queue_max_size)
 
         if self._ws_thread and self._ws_thread.is_alive():
             print(
@@ -168,7 +172,7 @@ class FullDepth:
                 continue
 
             try:
-                item = await asyncio.wait_for(self._queue.get(), timeout=65.0)
+                key = await asyncio.wait_for(self._queue.get(), timeout=65.0)
             except asyncio.TimeoutError:
                 idle_anchor = self._last_message_ts or self._connected_ts
                 idle_for = time.time() - idle_anchor if idle_anchor else 0.0
@@ -183,7 +187,10 @@ class FullDepth:
                 await self.connect()
                 continue
 
-            yield item
+            self._queued_keys.discard(key)
+            item = self._latest_payload_by_key.pop(key, None)
+            if item is not None:
+                yield item
 
     def _run_socket_loop(self):
         while not self._stop_evt.is_set():
@@ -272,7 +279,32 @@ class FullDepth:
         if self._loop is None or self._queue is None or self._loop.is_closed():
             self._dropped_payload_count += 1
             return
-        self._loop.call_soon_threadsafe(self._queue.put_nowait, payload)
+        self._loop.call_soon_threadsafe(self._enqueue_latest, payload)
+
+    def _enqueue_latest(self, payload):
+        """Keep only the latest pending depth update per instrument."""
+        if self._queue is None:
+            self._dropped_payload_count += 1
+            return
+
+        security_id = payload.get("security_id") if isinstance(payload, dict) else None
+        key = ("security", int(security_id)) if security_id is not None else ("control", 0)
+        if key in self._queued_keys:
+            self._latest_payload_by_key[key] = payload
+            self._dropped_payload_count += 1
+        else:
+            if self._queue.full():
+                try:
+                    oldest_key = self._queue.get_nowait()
+                    self._queued_keys.discard(oldest_key)
+                    self._latest_payload_by_key.pop(oldest_key, None)
+                    self._dropped_payload_count += 1
+                except asyncio.QueueEmpty:
+                    pass
+            self._latest_payload_by_key[key] = payload
+            self._queued_keys.add(key)
+            self._queue.put_nowait(key)
+
         try:
             queue_size = int(self._queue.qsize())
         except Exception:
@@ -285,7 +317,7 @@ class FullDepth:
             print(
                 "QUEUE_HEALTH | feed=DEPTH | "
                 f"connection_id={self._connection_id or 'pending'} | queue_size={queue_size} | "
-                f"queue_max_size=unbounded | queue_high_watermark={self._queue_high_watermark} | "
+                f"queue_max_size={self._queue_max_size} | queue_high_watermark={self._queue_high_watermark} | "
                 f"dropped_tick_count={self._dropped_payload_count}"
             )
 
