@@ -167,20 +167,24 @@ class FutureQuoteStream:
         for client in self._clients:
             client.connect()
 
-    def close(self) -> None:
+    def close(self) -> bool:
         self._started = False
+        closed = True
         if self._client is not None:
             try:
-                self._client.close()
+                closed = bool(self._client.close()) and closed
             except Exception:
+                closed = False
                 logger.exception("FULLQUOTE_STREAM_CLOSE_FAILED | client=single")
         for idx, client in enumerate(list(self._clients)):
             try:
-                client.close()
+                closed = bool(client.close()) and closed
             except Exception:
+                closed = False
                 logger.exception("FULLQUOTE_STREAM_CLOSE_FAILED | client=shard_%s", idx)
         self._client = None
         self._clients = []
+        return closed
 
     def subscribe(self, subscriptions: Iterable[Tuple[int, str]]) -> None:
         subscription_list = list(subscriptions)
@@ -251,6 +255,36 @@ class FutureQuoteStream:
 
         self._ensure_single_client()
         self._client.reconnect(reason)
+
+    def refresh_subscriptions(self, subscriptions: Iterable[Tuple[int, str]], reason: str = "runtime_stale") -> bool:
+        subscription_list = list(subscriptions)
+        if not subscription_list:
+            return False
+        instruments = [
+            {
+                "ExchangeSegment": self.exchange_segment,
+                "SecurityId": str(secid),
+                "tag": tag,
+            }
+            for secid, tag in subscription_list
+        ]
+        is_option_stream = any(not str(tag).upper().endswith("_FUT") for _, tag in subscription_list)
+        if is_option_stream and self._option_shard_count > 1:
+            self._ensure_shards()
+            refreshed = True
+            by_shard: Dict[int, List[Dict[str, str]]] = {idx: [] for idx in range(self._option_shard_count)}
+            for item in instruments:
+                by_shard[self._shard_for_tag(str(item.get("tag", "")))].append(item)
+            for shard_idx, shard_instruments in by_shard.items():
+                if shard_instruments:
+                    refreshed = self._clients[shard_idx].refresh_full_subscriptions(
+                        shard_instruments,
+                        reason=f"{reason}:shard_{shard_idx}",
+                    ) and refreshed
+            return refreshed
+
+        self._ensure_single_client()
+        return self._client.refresh_full_subscriptions(instruments, reason=reason)
 
     def _make_client(self) -> DhanLiveMarketFeedWS:
         client = DhanLiveMarketFeedWS(

@@ -8,7 +8,15 @@ from types import SimpleNamespace
 import pandas as pd
 
 sys.modules.setdefault("websocket", SimpleNamespace(WebSocketApp=object))
-sys.modules.setdefault("requests", SimpleNamespace(Session=object, get=lambda *_, **__: None, post=lambda *_, **__: None))
+sys.modules.setdefault(
+    "requests",
+    SimpleNamespace(
+        Session=object,
+        HTTPError=Exception,
+        get=lambda *_, **__: None,
+        post=lambda *_, **__: None,
+    ),
+)
 
 from dhan_engine.application.stocks.paper_runtime import StockPaperRuntime
 from dhan_engine.domain.stocks.percent_engine import PercentNormalizedStockEngine

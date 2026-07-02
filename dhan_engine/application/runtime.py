@@ -2112,9 +2112,16 @@ class TradingRuntimeCoordinator:
         old_stream = self.option_quote_stream
         try:
             if old_stream is not None and hasattr(old_stream, "close"):
-                old_stream.close()
+                old_closed = old_stream.close()
+                if old_closed is False:
+                    logger.error(
+                        "PREMIUM_STREAM_REBUILD_ABORTED | trigger_index=%s | reason=old_stream_not_stopped",
+                        trigger_index,
+                    )
+                    return False
         except Exception:
             logger.exception("PREMIUM_STREAM_OLD_CLOSE_FAILED | trigger_index=%s", trigger_index)
+            return False
 
         try:
             new_stream = self._make_option_quote_stream()
@@ -2244,13 +2251,14 @@ class TradingRuntimeCoordinator:
                     now=now,
                 )
                 return
-            # Static means keep the selected contracts for the session. It must
-            # not prevent repairing the transport carrying those contracts.
+            # First repair Dhan's server-side subscription state in place. This
+            # uses official Full unsubscribe/subscribe request codes 22/21 and
+            # avoids temporarily exceeding the account websocket limit.
             self._set_tri_wave_data_quarantine(index, "PAIR_STALE_RECOVERY", self.pair_stale_entry_quarantine_sec)
             logger.warning(
-                "TRI_WAVE_PAIR_STALE_STATIC_RECOVERY | index=%s | action=reconnect_same_option_pair | subscriptions=%s | note=no_reselection",
+                "TRI_WAVE_PAIR_STALE_STATIC_RECOVERY | index=%s | action=refresh_all_option_subscriptions | subscriptions=%s | note=no_reselection",
                 index,
-                subscriptions,
+                self._current_option_subscriptions(),
             )
             try:
                 if self.option_quote_stream is None:
@@ -2259,6 +2267,19 @@ class TradingRuntimeCoordinator:
                         index,
                     )
                     return
+                all_subscriptions = self._current_option_subscriptions()
+                if hasattr(self.option_quote_stream, "refresh_subscriptions"):
+                    refreshed = self.option_quote_stream.refresh_subscriptions(
+                        all_subscriptions,
+                        reason=f"static_pair_stale:{index}",
+                    )
+                    if refreshed:
+                        logger.warning(
+                            "PREMIUM_SUBSCRIPTION_REFRESH_SENT | index=%s | subscriptions=%s",
+                            index,
+                            all_subscriptions,
+                        )
+                        return
                 if not hasattr(self.option_quote_stream, "reconnect_for_subscriptions"):
                     logger.error(
                         "TRI_WAVE_PAIR_STALE_STATIC_RECOVERY_FAILED | index=%s | reason=reconnect_not_supported",
@@ -2266,8 +2287,8 @@ class TradingRuntimeCoordinator:
                     )
                     return
                 self.option_quote_stream.reconnect_for_subscriptions(
-                    subscriptions,
-                    reason=f"static_pair_stale:{index}",
+                    all_subscriptions,
+                    reason=f"static_pair_refresh_failed:{index}",
                 )
             except Exception:
                 logger.exception("TRI_WAVE_PAIR_STALE_STATIC_RECOVERY_FAILED | index=%s", index)

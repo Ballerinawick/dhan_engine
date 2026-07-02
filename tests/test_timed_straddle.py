@@ -189,6 +189,46 @@ class TimedStraddleRuntimeTests(unittest.TestCase):
         runtime.step(ist_ts(15, 25))
         self.assertEqual(stream.subscriptions, [])
 
+    def test_three_consecutive_losses_halt_new_cycles(self):
+        runtime, _, _, _ = self.make_runtime(
+            round_trip_cost=0,
+            profit_target_net=0,
+            hold_sec=1,
+            max_consecutive_losses=3,
+            daily_loss_limit=10000,
+        )
+        now = ist_ts(10, 0)
+        for cycle in range(3):
+            cycle_start = now + cycle * 10
+            runtime.step(cycle_start)
+            self.feed_structure(runtime, cycle_start + 1, values=(100, 100, 80, 80))
+            runtime.step(cycle_start + 1)
+            self.feed_structure(runtime, cycle_start + 3, values=(95, 95, 85, 85))
+            runtime.step(cycle_start + 3)
+
+        self.assertTrue(runtime.risk_halted)
+        self.assertEqual(runtime.consecutive_losses, 3)
+        runtime.step(now + 40)
+        self.assertEqual(runtime.cycle_count, 3)
+
+    def test_win_resets_consecutive_loss_counter(self):
+        runtime, _, _, _ = self.make_runtime()
+        runtime.consecutive_losses = 2
+        runtime.selection = selection()
+        runtime.book.open(
+            cycle=1,
+            selection=selection(),
+            long_ce=entry_legs()[0],
+            long_pe=entry_legs()[1],
+            short_ce=entry_legs()[2],
+            short_pe=entry_legs()[3],
+            now=ist_ts(10, 0),
+        )
+        now = ist_ts(10, 4)
+        self.feed_structure(runtime, now, values=(120, 100, 80, 80))
+        runtime.step(now)
+        self.assertEqual(runtime.consecutive_losses, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,8 @@ except Exception:  # pragma: no cover - optional dependency path
 
 
 REQ_FULL = 21
+REQ_UNSUB_FULL = 22
+REQ_DISCONNECT = 12
 MAX_INSTRUMENTS_PER_SUBSCRIBE_MESSAGE = 100
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,7 @@ class DhanLiveMarketFeedWS:
         self._last_manual_reconnect_ts = 0.0
         self._blocked_until_ts = 0.0
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._reconnect_lock = threading.Lock()
         self._callback_condition = threading.Condition()
         self._pending_callbacks: Dict[int, tuple] = {}
@@ -123,13 +126,46 @@ class DhanLiveMarketFeedWS:
         self._thread = threading.Thread(target=self._run_loop, name="DhanMarketFeedWS", daemon=True)
         self._thread.start()
 
-    def close(self) -> None:
+    def close(self, wait_timeout: float = 5.0) -> bool:
         self._stop.set()
         with self._message_condition:
             self._message_condition.notify_all()
         with self._callback_condition:
             self._callback_condition.notify_all()
-        self._safe_close_ws("close")
+        self._safe_close_ws("close", graceful=True)
+        return self.wait_closed(wait_timeout)
+
+    def wait_closed(self, timeout: float = 5.0) -> bool:
+        """Wait until this client's socket and workers have stopped."""
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        current = threading.current_thread()
+        for thread in (
+            self._thread,
+            self._worker_thread,
+            self._callback_thread,
+            self._watchdog_thread,
+        ):
+            if thread is None or thread is current or not thread.is_alive():
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        alive = [
+            thread.name
+            for thread in (
+                self._thread,
+                self._worker_thread,
+                self._callback_thread,
+                self._watchdog_thread,
+            )
+            if thread is not None and thread is not current and thread.is_alive()
+        ]
+        if alive:
+            print(f"FULLQUOTE_CLOSE_TIMEOUT | alive_threads={','.join(alive)}")
+            return False
+        print("FULLQUOTE_CLIENT_STOPPED | state=closed")
+        return True
 
     def subscribe_full(self, instruments: List[Dict[str, str]]) -> None:
         new_subscriptions: List[Dict[str, str]] = []
@@ -193,6 +229,42 @@ class DhanLiveMarketFeedWS:
         )
         return changed
 
+    def refresh_full_subscriptions(
+        self,
+        instruments: Optional[List[Dict[str, str]]] = None,
+        reason: str = "stale_subscription",
+    ) -> bool:
+        """Refresh Dhan's server-side Full subscriptions without opening a socket."""
+        if instruments is not None:
+            self.replace_subscriptions(instruments, reason=f"refresh:{reason}")
+        if not self._connected.is_set() or self._ws is None:
+            print(f"FULLQUOTE_SUBSCRIPTION_REFRESH_SKIPPED | reason={reason} | state=disconnected")
+            return False
+        with self._lock:
+            subscriptions = list(self._subs)
+        if not subscriptions:
+            print(f"FULLQUOTE_SUBSCRIPTION_REFRESH_SKIPPED | reason={reason} | state=empty")
+            return False
+        print(
+            "FULLQUOTE_SUBSCRIPTION_REFRESH_START | "
+            f"reason={reason} | connection_id={self._connection_id} | count={len(subscriptions)}"
+        )
+        if not self._send_instrument_request(REQ_UNSUB_FULL, subscriptions):
+            return False
+        # Keep the unsubscribe and subscribe as distinct websocket messages.
+        time.sleep(0.1)
+        sent = self._send_instrument_request(REQ_FULL, subscriptions)
+        if sent:
+            now = time.time()
+            with self._lock:
+                for item in subscriptions:
+                    self._last_subscribe_ts_by_secid[int(item["SecurityId"])] = now
+            print(
+                "FULLQUOTE_SUBSCRIPTION_REFRESH_DONE | "
+                f"reason={reason} | connection_id={self._connection_id} | count={len(subscriptions)}"
+            )
+        return sent
+
     def reconnect(self, reason: str = "manual") -> None:
         now = time.time()
         blocked_until = self._effective_blocked_until()
@@ -212,14 +284,21 @@ class DhanLiveMarketFeedWS:
                 return
             self._last_manual_reconnect_ts = now
             print(f"FULLQUOTE_FORCE_RECONNECT | reason={reason}")
+            self._safe_close_ws(reason, graceful=True)
             self._connected.clear()
-            self._safe_close_ws(reason)
 
-    def _safe_close_ws(self, reason: str) -> None:
+    def _safe_close_ws(self, reason: str, graceful: bool = False) -> None:
         ws = self._ws
         if ws is None:
             print(f"FULLQUOTE_WS_CLOSE_SKIPPED | reason={reason} | state=no_socket")
             return
+        if graceful and self._connected.is_set():
+            try:
+                with self._send_lock:
+                    ws.send(json.dumps({"RequestCode": REQ_DISCONNECT}))
+                print(f"FULLQUOTE_DISCONNECT_SENT | reason={reason} | connection_id={self._connection_id}")
+            except Exception as exc:
+                print(f"FULLQUOTE_DISCONNECT_SEND_ERROR | reason={reason} | error={exc}")
         try:
             ws.close()
         except AttributeError as exc:
@@ -334,13 +413,17 @@ class DhanLiveMarketFeedWS:
             f"unique_subscribed_instrument_keys={total_unique_keys}"
         )
 
+        self._send_instrument_request(REQ_FULL, subscriptions)
+
+    def _send_instrument_request(self, request_code: int, subscriptions: List[Dict[str, str]]) -> bool:
         chunks = [
             subscriptions[start:start + MAX_INSTRUMENTS_PER_SUBSCRIBE_MESSAGE]
             for start in range(0, len(subscriptions), MAX_INSTRUMENTS_PER_SUBSCRIBE_MESSAGE)
         ]
+        sent_all = True
         for idx, chunk in enumerate(chunks, start=1):
             payload = {
-                "RequestCode": REQ_FULL,
+                "RequestCode": int(request_code),
                 "InstrumentCount": len(chunk),
                 "InstrumentList": [
                     {
@@ -355,13 +438,17 @@ class DhanLiveMarketFeedWS:
                 print("WS_FULLQUOTE_SUB", payload)
 
             try:
+                action = "SUBSCRIBE" if request_code == REQ_FULL else "UNSUBSCRIBE"
                 print(
-                    "WS_FULLQUOTE_SUBSCRIBE | count=%s | chunk=%s/%s"
-                    % (payload["InstrumentCount"], idx, len(chunks))
+                    "WS_FULLQUOTE_%s | count=%s | chunk=%s/%s"
+                    % (action, payload["InstrumentCount"], idx, len(chunks))
                 )
-                self._ws.send(json.dumps(payload))
+                with self._send_lock:
+                    self._ws.send(json.dumps(payload))
             except Exception as exc:
-                print(f"FULLQUOTE_WS_SUBSCRIBE_ERROR | error={exc}")
+                sent_all = False
+                print(f"FULLQUOTE_WS_REQUEST_ERROR | request_code={request_code} | error={exc}")
+        return sent_all
 
     def _on_open(self, ws) -> None:
         self._connected.set()
