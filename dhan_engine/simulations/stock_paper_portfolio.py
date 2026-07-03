@@ -20,6 +20,14 @@ class StockPaperPosition:
     peak_ltp: float
     entry_score: float
     margin_used: float = 0.0
+    side: str = "LONG"
+
+    @property
+    def direction_sign(self) -> float:
+        return -1.0 if self.side == "SHORT" else 1.0
+
+    def gross_pnl(self, price: float) -> float:
+        return (float(price) - self.entry) * self.qty * self.direction_sign
 
 
 class StockPaperPortfolio:
@@ -46,9 +54,15 @@ class StockPaperPortfolio:
         self.realized_pnl = 0.0
         self.closed_trades = 0
 
-    def enter(self, secid: int, symbol: str, ltp: float, score: float, now: Optional[float] = None) -> bool:
+    def enter(
+        self, secid: int, symbol: str, ltp: float, score: float,
+        now: Optional[float] = None, side: str = "LONG",
+    ) -> bool:
         now = time.time() if now is None else float(now)
         price = float(ltp)
+        normalized_side = str(side).upper()
+        if normalized_side not in {"LONG", "SHORT"}:
+            return False
         if int(secid) in self.positions or len(self.positions) >= self.max_positions or price <= 0:
             return False
         exposure_budget = min(self.notional_per_trade, self.cash * self.leverage)
@@ -63,6 +77,7 @@ class StockPaperPortfolio:
             entry_ts=now, last_ltp=price, last_tick_ts=now, peak_ltp=price,
             entry_score=float(score),
             margin_used=margin_used,
+            side=normalized_side,
         )
         return True
 
@@ -73,7 +88,10 @@ class StockPaperPortfolio:
         now = time.time() if now is None else float(now)
         position.last_ltp = float(ltp)
         position.last_tick_ts = now
-        position.peak_ltp = max(position.peak_ltp, float(ltp))
+        if position.side == "SHORT":
+            position.peak_ltp = min(position.peak_ltp, float(ltp))
+        else:
+            position.peak_ltp = max(position.peak_ltp, float(ltp))
 
     def exit(self, secid: int, ltp: float, reason: str, now: Optional[float] = None) -> Optional[dict]:
         position = self.positions.pop(int(secid), None)
@@ -81,9 +99,13 @@ class StockPaperPortfolio:
             return None
         now = time.time() if now is None else float(now)
         price = float(ltp)
-        gross = (price - position.entry) * position.qty
+        gross = position.gross_pnl(price)
         charges = (
-            self.charge_calculator.estimate(position.entry, price, position.qty)
+            self.charge_calculator.estimate(
+                price if position.side == "SHORT" else position.entry,
+                position.entry if position.side == "SHORT" else price,
+                position.qty,
+            )
             if self.charge_calculator is not None
             else None
         )
@@ -94,6 +116,7 @@ class StockPaperPortfolio:
         self.closed_trades += 1
         return {
             "symbol": position.symbol, "secid": position.secid, "qty": position.qty,
+            "side": position.side,
             "entry": position.entry, "exit": price, "gross_pnl": gross,
             "fee": fee, "net_pnl": net,
             "hold_sec": now - position.entry_ts, "reason": str(reason),
@@ -114,14 +137,14 @@ class StockPaperPortfolio:
         }
 
     def unrealized_pnl(self) -> float:
-        return sum((p.last_ltp - p.entry) * p.qty for p in self.positions.values())
+        return sum(p.gross_pnl(p.last_ltp) for p in self.positions.values())
 
     def estimate_round_trip_fee(self, position: StockPaperPosition, exit_price: float) -> float:
         if self.charge_calculator is None:
             return self.round_trip_fee
         return self.charge_calculator.estimate(
-            position.entry,
-            float(exit_price),
+            float(exit_price) if position.side == "SHORT" else position.entry,
+            position.entry if position.side == "SHORT" else float(exit_price),
             position.qty,
         ).total
 
