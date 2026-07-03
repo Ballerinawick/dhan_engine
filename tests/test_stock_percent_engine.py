@@ -180,6 +180,47 @@ class StockPaperPortfolioTests(unittest.TestCase):
         self.assertAlmostEqual(trade["gross_pnl"], 100.0)
         self.assertAlmostEqual(trade["net_pnl"], 90.0)
 
+    def test_fixed_quantity_override_is_used_for_cycle_experiments(self):
+        portfolio = StockPaperPortfolio(
+            capital=100000.0,
+            notional_per_trade=75000.0,
+            max_positions=8,
+            round_trip_fee=0.0,
+        )
+        self.assertTrue(portfolio.enter(1, "RELIANCE", 1300.0, 50.0, now=10.0, qty_override=10))
+        self.assertEqual(portfolio.positions[1].qty, 10)
+        self.assertAlmostEqual(portfolio.cash, 87000.0)
+
+    def test_forced_cycle_opens_every_observed_symbol(self):
+        from dhan_engine.domain.market.five_minute_zone import FiveMinuteZoneDecision
+
+        runtime = StockPaperRuntime.__new__(StockPaperRuntime)
+        runtime.settings = SimpleNamespace(
+            symbols=("SBIN", "RELIANCE"), observe_sec=150.0, confirm_sec=10.0,
+            cycle_selection_grace_sec=2.0, fixed_cycle_qty=1,
+        )
+        runtime.portfolio = StockPaperPortfolio(
+            capital=100000.0, notional_per_trade=75000.0,
+            max_positions=2, round_trip_fee=0.0,
+        )
+        runtime.instrument_by_secid = {1: {"symbol": "SBIN"}, 2: {"symbol": "RELIANCE"}}
+        runtime.cycle_candidates = defaultdict(dict)
+        runtime.completed_trade_cycles = set()
+        runtime.daily_trades = 0
+        runtime._entry_allowed = lambda symbol, now: True
+        signal = SimpleNamespace(score=50.0)
+        first = FiveMinuteZoneDecision(1000.0, 1300.0, 100.0, 101.0, 1.0, 0.8, 0.1, "STRONG", "POSITIVE")
+        second = FiveMinuteZoneDecision(1000.0, 1300.0, 200.0, 198.0, -2.0, -0.9, -0.2, "STRONG", "NEGATIVE")
+
+        runtime._record_cycle_candidate(first, signal, 1, "SBIN", 101.0, 1160.0)
+        self.assertEqual(len(runtime.portfolio.positions), 0)
+        runtime._record_cycle_candidate(second, signal, 2, "RELIANCE", 198.0, 1160.1)
+
+        self.assertEqual(len(runtime.portfolio.positions), 2)
+        self.assertEqual(runtime.portfolio.positions[1].side, "LONG")
+        self.assertEqual(runtime.portfolio.positions[2].side, "SHORT")
+        self.assertEqual(runtime.daily_trades, 2)
+
     def test_score_breakdown_exit_requires_hold_confirmation_and_fee_edge(self):
         runtime = StockPaperRuntime.__new__(StockPaperRuntime)
         runtime.settings = SimpleNamespace(
