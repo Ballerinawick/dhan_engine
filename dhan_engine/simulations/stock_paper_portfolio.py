@@ -57,6 +57,7 @@ class StockPaperPortfolio:
     def enter(
         self, secid: int, symbol: str, ltp: float, score: float,
         now: Optional[float] = None, side: str = "LONG",
+        qty_override: Optional[int] = None,
     ) -> bool:
         now = time.time() if now is None else float(now)
         price = float(ltp)
@@ -66,11 +67,13 @@ class StockPaperPortfolio:
         if int(secid) in self.positions or len(self.positions) >= self.max_positions or price <= 0:
             return False
         exposure_budget = min(self.notional_per_trade, self.cash * self.leverage)
-        qty = int(math.floor(exposure_budget / price))
+        qty = int(qty_override) if qty_override is not None else int(math.floor(exposure_budget / price))
         if qty <= 0:
             return False
         cost = qty * price
         margin_used = cost / self.leverage
+        if margin_used > self.cash:
+            return False
         self.cash -= margin_used
         self.positions[int(secid)] = StockPaperPosition(
             secid=int(secid), symbol=str(symbol), qty=qty, entry=price,

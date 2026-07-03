@@ -84,6 +84,7 @@ class StockPaperSettings:
     positive_exit_min_hold_sec: float = 5.0
     force_cycle_trade_enabled: bool = False
     cycle_selection_grace_sec: float = 2.0
+    fixed_cycle_qty: int = 1
     market_start: dtime = dtime(9, 15)
     market_end: dtime = dtime(15, 25)
 
@@ -139,6 +140,7 @@ class StockPaperSettings:
             positive_exit_min_hold_sec=float(os.getenv("STOCK_CYCLE_POSITIVE_EXIT_MIN_HOLD_SEC", "5") or 5),
             force_cycle_trade_enabled=os.getenv("STOCK_CYCLE_FORCE_TRADE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"},
             cycle_selection_grace_sec=max(0.0, float(os.getenv("STOCK_CYCLE_SELECTION_GRACE_SEC", "2") or 2)),
+            fixed_cycle_qty=max(1, int(os.getenv("STOCK_PAPER_FIXED_QTY", "1") or 1)),
         )
 
 
@@ -154,10 +156,11 @@ class StockPaperRuntime:
             max_spread_pct=settings.max_spread_pct,
         )
         charge_calculator = NseIntradayChargeCalculator() if settings.dynamic_charges_enabled else None
+        effective_max_positions = max(settings.max_positions, len(settings.symbols)) if settings.force_cycle_trade_enabled else settings.max_positions
         self.portfolio = StockPaperPortfolio(
             capital=settings.capital,
             notional_per_trade=settings.notional_per_trade,
-            max_positions=settings.max_positions,
+            max_positions=effective_max_positions,
             round_trip_fee=settings.round_trip_fee,
             charge_calculator=charge_calculator,
             leverage=settings.leverage,
@@ -304,28 +307,37 @@ class StockPaperRuntime:
         if len(candidates) < len(self.settings.symbols) and not grace_elapsed:
             return
         self.completed_trade_cycles.add(cycle_start)
-        _, selected, selected_signal, selected_secid, selected_ltp, selected_now = max(
-            candidates.values(), key=lambda item: item[0]
+        opened = 0
+        for _, selected, selected_signal, selected_secid, selected_ltp, selected_now in sorted(
+            candidates.values(), key=lambda item: item[1].current_price
+        ):
+            selected_symbol = str(self.instrument_by_secid[selected_secid]["symbol"])
+            side = "SHORT" if selected.direction == "NEGATIVE" else "LONG"
+            if selected.direction == "NEUTRAL":
+                side = "SHORT" if selected.displacement < 0 else "LONG"
+            reason = f"STOCK_FORCED_CYCLE_{side}_{selected.zone}"
+            if not self._entry_allowed(selected_symbol, selected_now):
+                logger.info("STOCK_FORCED_CYCLE_SKIPPED | cycle_start=%.0f | symbol=%s | reason=ENTRY_SAFETY_GATE", cycle_start, selected_symbol)
+                continue
+            entry_score = max(float(selected_signal.score), abs(selected.normalized_displacement) * 100.0)
+            if self.portfolio.enter(
+                selected_secid, selected_symbol, selected_ltp, entry_score, selected_now,
+                side=side, qty_override=self.settings.fixed_cycle_qty,
+            ):
+                opened += 1
+                self.daily_trades += 1
+                position = self.portfolio.positions[selected_secid]
+                logger.info(
+                    "STOCK_FORCED_CYCLE_ENTRY | cycle_start=%.0f | symbol=%s | side=%s | qty=%s | entry=%.2f | normalized=%+.3f | zone=%s | candidates=%s | reason=%s",
+                    cycle_start, selected_symbol, side, position.qty, selected_ltp,
+                    selected.normalized_displacement, selected.zone, len(candidates), reason,
+                )
+            else:
+                logger.info("STOCK_FORCED_CYCLE_SKIPPED | cycle_start=%.0f | symbol=%s | side=%s | reason=PORTFOLIO_REJECTED", cycle_start, selected_symbol, side)
+        logger.info(
+            "STOCK_FORCED_CYCLE_BATCH | cycle_start=%.0f | candidates=%s | opened=%s | fixed_qty=%s | paper=true",
+            cycle_start, len(candidates), opened, self.settings.fixed_cycle_qty,
         )
-        selected_symbol = str(self.instrument_by_secid[selected_secid]["symbol"])
-        side = "SHORT" if selected.direction == "NEGATIVE" else "LONG"
-        if selected.direction == "NEUTRAL":
-            side = "SHORT" if selected.displacement < 0 else "LONG"
-        reason = f"STOCK_FORCED_CYCLE_{side}_{selected.zone}"
-        if not self._entry_allowed(selected_symbol, selected_now):
-            logger.info("STOCK_FORCED_CYCLE_SKIPPED | cycle_start=%.0f | symbol=%s | reason=ENTRY_SAFETY_GATE", cycle_start, selected_symbol)
-            return
-        entry_score = max(float(selected_signal.score), abs(selected.normalized_displacement) * 100.0)
-        if self.portfolio.enter(selected_secid, selected_symbol, selected_ltp, entry_score, selected_now, side=side):
-            self.daily_trades += 1
-            position = self.portfolio.positions[selected_secid]
-            logger.info(
-                "STOCK_FORCED_CYCLE_ENTRY | cycle_start=%.0f | symbol=%s | side=%s | qty=%s | entry=%.2f | normalized=%+.3f | zone=%s | candidates=%s | reason=%s",
-                cycle_start, selected_symbol, side, position.qty, selected_ltp,
-                selected.normalized_displacement, selected.zone, len(candidates), reason,
-            )
-        else:
-            logger.info("STOCK_FORCED_CYCLE_SKIPPED | cycle_start=%.0f | symbol=%s | side=%s | reason=PORTFOLIO_REJECTED", cycle_start, selected_symbol, side)
 
     def _score_breakdown_exit_reason(self, position, signal, hold_sec: float, pnl_pct: float, now: float) -> str | None:
         secid = int(position.secid)
@@ -687,14 +699,14 @@ class StockPaperRuntime:
         self.stream.replace_subscriptions(subscriptions, reason="stock_profiles_startup")
         self.stream.start()
         logger.info(
-            "STOCK_PAPER_RUNTIME_ACTIVE | symbols=%s | subscriptions=%s | capital=%.2f | notional=%.2f | max_positions=%s | leverage=%.2fx | fee_model=%s | strategy=percent_normalized_v1 | five_minute_cycle=%s | cycle=%.0fs | observe=%.0fs | confirm=%.0fs | force_cycle_trade=%s | paper=true",
+            "STOCK_PAPER_RUNTIME_ACTIVE | symbols=%s | subscriptions=%s | capital=%.2f | notional=%.2f | max_positions=%s | leverage=%.2fx | fee_model=%s | strategy=percent_normalized_v1 | five_minute_cycle=%s | cycle=%.0fs | observe=%.0fs | confirm=%.0fs | force_cycle_trade=%s | fixed_qty=%s | paper=true",
             ",".join(self.settings.symbols), len(subscriptions), self.settings.capital,
-            self.settings.notional_per_trade, self.settings.max_positions,
+            self.settings.notional_per_trade, self.portfolio.max_positions,
             self.settings.leverage,
             "NSE_INTRADAY_DYNAMIC" if self.settings.dynamic_charges_enabled else "FIXED_FALLBACK",
             self.settings.five_minute_cycle_enabled, self.settings.cycle_sec,
             self.settings.observe_sec, self.settings.confirm_sec,
-            self.settings.force_cycle_trade_enabled,
+            self.settings.force_cycle_trade_enabled, self.settings.fixed_cycle_qty,
         )
         try:
             while True:
