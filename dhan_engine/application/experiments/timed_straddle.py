@@ -9,6 +9,7 @@ from datetime import datetime, time as dtime
 from typing import TYPE_CHECKING, Any, Callable
 from zoneinfo import ZoneInfo
 
+from dhan_engine.domain.market.five_minute_zone import FiveMinuteZoneTracker
 from dhan_engine.infrastructure.mongo.trade_summary_sink import TradeSummarySink
 
 if TYPE_CHECKING:
@@ -47,6 +48,14 @@ class TimedStraddleSettings:
     max_consecutive_losses: int = 3
     daily_loss_limit: float = 1000.0
     heartbeat_sec: float = 10.0
+    five_minute_cycle_enabled: bool = False
+    cycle_sec: float = 300.0
+    observe_sec: float = 150.0
+    confirm_sec: float = 10.0
+    entry_window_sec: float = 30.0
+    middle_zone_ratio: float = 0.25
+    strong_zone_ratio: float = 0.65
+    positive_exit_min_hold_sec: float = 5.0
     market_start: dtime = dtime(9, 15)
     entry_cutoff: dtime = dtime(15, 25)
     force_close: dtime = dtime(15, 30)
@@ -76,6 +85,14 @@ class TimedStraddleSettings:
             max_consecutive_losses=max(1, _env_int("TIMED_STRADDLE_MAX_CONSECUTIVE_LOSSES", 3)),
             daily_loss_limit=max(0.0, _env_float("TIMED_STRADDLE_DAILY_LOSS_LIMIT", 1000.0)),
             heartbeat_sec=max(1.0, _env_float("TIMED_STRADDLE_HEARTBEAT_SEC", 10.0)),
+            five_minute_cycle_enabled=os.getenv("TIMED_STRADDLE_FIVE_MINUTE_CYCLE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"},
+            cycle_sec=max(60.0, _env_float("TIMED_STRADDLE_CYCLE_SEC", 300.0)),
+            observe_sec=max(1.0, _env_float("TIMED_STRADDLE_OBSERVE_SEC", 150.0)),
+            confirm_sec=max(1.0, _env_float("TIMED_STRADDLE_CONFIRM_SEC", 10.0)),
+            entry_window_sec=max(1.0, _env_float("TIMED_STRADDLE_ENTRY_WINDOW_SEC", 30.0)),
+            middle_zone_ratio=max(0.0, _env_float("TIMED_STRADDLE_MIDDLE_ZONE_RATIO", 0.25)),
+            strong_zone_ratio=max(0.0, _env_float("TIMED_STRADDLE_STRONG_ZONE_RATIO", 0.65)),
+            positive_exit_min_hold_sec=max(0.0, _env_float("TIMED_STRADDLE_POSITIVE_EXIT_MIN_HOLD_SEC", 5.0)),
         )
 
 
@@ -109,6 +126,7 @@ class TimedStraddlePosition:
     lot_size: int
     lots: int
     entry_ts: float
+    cycle_end_ts: float
     long_ce_entry: float
     long_pe_entry: float
     short_ce_entry: float
@@ -136,6 +154,7 @@ class TimedStraddleBook:
         short_ce: LegQuote,
         short_pe: LegQuote,
         now: float,
+        cycle_end_ts: float | None = None,
     ) -> TimedStraddlePosition:
         if self.position is not None:
             raise RuntimeError("Timed straddle position already open")
@@ -162,6 +181,7 @@ class TimedStraddleBook:
             lot_size=lot_size,
             lots=self.settings.lots,
             entry_ts=now,
+            cycle_end_ts=float(cycle_end_ts if cycle_end_ts is not None else now + self.settings.hold_sec),
             long_ce_entry=long_ce.ask,
             long_pe_entry=long_pe.ask,
             short_ce_entry=short_ce.bid,
@@ -207,6 +227,12 @@ class TimedStraddleBook:
         mark = self.mark(*legs, now)
         if force_close:
             return "MARKET_FORCE_CLOSE"
+        if self.settings.five_minute_cycle_enabled:
+            if mark["hold_sec"] >= self.settings.positive_exit_min_hold_sec and mark["net_pnl"] > 0:
+                return "FIVE_MINUTE_POSITIVE_NET_EXIT"
+            if now >= self.position.cycle_end_ts:
+                return "FIVE_MINUTE_CYCLE_TIMEOUT"
+            return None
         if mark["net_pnl"] >= self.settings.profit_target_net:
             return "NET_PROFIT_TARGET"
         if mark["hold_sec"] >= self.settings.hold_sec:
@@ -272,6 +298,14 @@ class TimedStraddleRuntime:
         self._selection_started_at = 0.0
         self._last_subscription_recovery_at = 0.0
         self._subscribed_ids: set[int] = set()
+        self.zone_tracker = FiveMinuteZoneTracker(
+            cycle_sec=settings.cycle_sec,
+            observe_sec=settings.observe_sec,
+            confirm_sec=settings.confirm_sec,
+            entry_window_sec=settings.entry_window_sec,
+            middle_zone_ratio=settings.middle_zone_ratio,
+            strong_zone_ratio=settings.strong_zone_ratio,
+        )
 
     def on_quote(self, secid: int, tag: str, ltp: float, depth: Any) -> None:
         features = dict(getattr(depth, "features", None) or {})
@@ -415,6 +449,36 @@ class TimedStraddleRuntime:
                 self._recover_missing_quotes(now)
                 return
             long_ce, long_pe, short_ce, short_pe = structure
+            zone_decision = None
+            if self.settings.five_minute_cycle_enabled:
+                premium_total = max(float(long_ce.ltp) + float(long_pe.ltp), 0.000001)
+                directional_proxy = 100.0 * float(long_ce.ltp) / premium_total
+                zone_decision = self.zone_tracker.update(
+                    f"{self.settings.index}_STRADDLE",
+                    directional_proxy,
+                    now,
+                )
+                if zone_decision is None:
+                    return
+                logger.info(
+                    "TIMED_STRADDLE_FIVE_MINUTE_ZONE | index=%s | cycle_start=%.0f | proxy_origin=%.3f | proxy_current=%.3f | displacement=%+.4f | normalized=%+.3f | velocity=%+.5f | zone=%s | direction=%s",
+                    self.settings.index,
+                    zone_decision.cycle_start,
+                    zone_decision.origin_price,
+                    zone_decision.current_price,
+                    zone_decision.displacement,
+                    zone_decision.normalized_displacement,
+                    zone_decision.velocity_per_sec,
+                    zone_decision.zone,
+                    zone_decision.direction,
+                )
+                if zone_decision.direction not in {"POSITIVE", "NEGATIVE"} or zone_decision.zone not in {"MIDDLE", "STRONG"}:
+                    logger.info(
+                        "TIMED_STRADDLE_ENTRY_BLOCKED | reason=FUTURE_ZONE_NOT_DIRECTIONAL | zone=%s | direction=%s",
+                        zone_decision.zone,
+                        zone_decision.direction,
+                    )
+                    return
             lot_size = self.settings.lot_size_override or int(self.selection.get("lot_size", 1) or 1)
             quantity = lot_size * self.settings.lots
             debit = long_ce.ask + long_pe.ask - short_ce.bid - short_pe.bid
@@ -431,6 +495,7 @@ class TimedStraddleRuntime:
             position = self.book.open(
                 cycle=self.cycle_count, selection=self.selection, long_ce=long_ce, long_pe=long_pe,
                 short_ce=short_ce, short_pe=short_pe, now=now,
+                cycle_end_ts=self.zone_tracker.cycle_end(now) if self.settings.five_minute_cycle_enabled else None,
             )
             logger.info(
                 "TIMED_STRADDLE_ENTRY | cycle=%s | strategy=REVERSE_IRON_FLY | atm=%.2f | lower=%.2f | upper=%.2f | long_ce_ask=%.2f | long_pe_ask=%.2f | short_ce_bid=%.2f | short_pe_bid=%.2f | debit=%.2f | max_profit_net=%+.2f | lot_size=%s | lots=%s | timeout=%.0fs | net_target=%.2f",
@@ -472,10 +537,11 @@ class TimedStraddleRuntime:
     def run(self) -> None:
         self.quote_stream.start()
         logger.info(
-            "TIMED_STRADDLE_RUNTIME_ACTIVE | strategy=REVERSE_IRON_FLY | index=%s | wing_steps=%s | hold=%.0fs | lots=%s | modeled_cost=%.2f | cutoff=15:25 | force_close=15:30 | max_cycles=%s | max_consecutive_losses=%s | daily_loss_limit=%.2f | paper=true",
+            "TIMED_STRADDLE_RUNTIME_ACTIVE | strategy=REVERSE_IRON_FLY | index=%s | wing_steps=%s | hold=%.0fs | lots=%s | modeled_cost=%.2f | cutoff=15:25 | force_close=15:30 | max_cycles=%s | max_consecutive_losses=%s | daily_loss_limit=%.2f | five_minute_cycle=%s | observe=%.0fs | confirm=%.0fs | paper=true",
             self.settings.index, self.settings.wing_steps, self.settings.hold_sec, self.settings.lots,
             self.settings.round_trip_cost, self.settings.max_cycles,
             self.settings.max_consecutive_losses, self.settings.daily_loss_limit,
+            self.settings.five_minute_cycle_enabled, self.settings.observe_sec, self.settings.confirm_sec,
         )
         try:
             while True:

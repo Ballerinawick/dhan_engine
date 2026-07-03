@@ -93,6 +93,51 @@ class TimedStraddleBookTests(unittest.TestCase):
         book.open(cycle=1, selection=selection(), long_ce=legs[0], long_pe=legs[1], short_ce=legs[2], short_pe=legs[3], now=100)
         self.assertEqual(book.exit_reason(*legs, now=101, force_close=True), "MARKET_FORCE_CLOSE")
 
+    def test_five_minute_cycle_exits_on_positive_net_or_cycle_timeout(self):
+        cfg = settings(
+            five_minute_cycle_enabled=True,
+            positive_exit_min_hold_sec=5,
+            round_trip_cost=0,
+        )
+        book = TimedStraddleBook(cfg)
+        legs = entry_legs()
+        book.open(
+            cycle=1,
+            selection=selection(),
+            long_ce=legs[0],
+            long_pe=legs[1],
+            short_ce=legs[2],
+            short_pe=legs[3],
+            now=160,
+            cycle_end_ts=300,
+        )
+        profitable = (
+            quote(1, "CE", 104, 105),
+            quote(2, "PE", 100, 101),
+            quote(3, "CE", 79, 80),
+            quote(4, "PE", 79, 80),
+        )
+        self.assertEqual(
+            book.exit_reason(*profitable, now=166),
+            "FIVE_MINUTE_POSITIVE_NET_EXIT",
+        )
+
+        book.position = None
+        book.open(
+            cycle=2,
+            selection=selection(),
+            long_ce=legs[0],
+            long_pe=legs[1],
+            short_ce=legs[2],
+            short_pe=legs[3],
+            now=160,
+            cycle_end_ts=300,
+        )
+        self.assertEqual(
+            book.exit_reason(*legs, now=300),
+            "FIVE_MINUTE_CYCLE_TIMEOUT",
+        )
+
 
 class FakeSelector:
     def __init__(self):
@@ -156,6 +201,29 @@ class TimedStraddleRuntimeTests(unittest.TestCase):
         self.assertEqual(len(stream.subscriptions[0][0]), 4)
         self.feed_structure(runtime, now + 1, values=(100, 100, 90, 90))
         runtime.step(now + 1)
+        self.assertIsNotNone(runtime.book.position)
+        self.assertEqual(runtime.cycle_count, 1)
+
+    def test_five_minute_mode_waits_until_160_seconds_before_entry(self):
+        runtime, _, _, _ = self.make_runtime(
+            five_minute_cycle_enabled=True,
+            observe_sec=150,
+            confirm_sec=10,
+            entry_window_sec=30,
+            round_trip_cost=80,
+            profit_target_net=100,
+        )
+        now = ist_ts(10, 0)
+        runtime.step(now)
+        for second in range(0, 160):
+            ce = 100.0 + (second * 0.05)
+            pe = 100.0 - (second * 0.05)
+            self.feed_structure(runtime, now + second, values=(ce, pe, 90, 90))
+            runtime.step(now + second)
+            self.assertIsNone(runtime.book.position)
+
+        self.feed_structure(runtime, now + 160, values=(108, 92, 90, 90))
+        runtime.step(now + 160)
         self.assertIsNotNone(runtime.book.position)
         self.assertEqual(runtime.cycle_count, 1)
 
