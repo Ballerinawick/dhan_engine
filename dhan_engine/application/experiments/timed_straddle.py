@@ -56,6 +56,8 @@ class TimedStraddleSettings:
     middle_zone_ratio: float = 0.25
     strong_zone_ratio: float = 0.65
     positive_exit_min_hold_sec: float = 5.0
+    paper_risk_halt_enabled: bool = True
+    force_cycle_entry_enabled: bool = False
     market_start: dtime = dtime(9, 15)
     entry_cutoff: dtime = dtime(15, 25)
     force_close: dtime = dtime(15, 30)
@@ -93,6 +95,8 @@ class TimedStraddleSettings:
             middle_zone_ratio=max(0.0, _env_float("TIMED_STRADDLE_MIDDLE_ZONE_RATIO", 0.25)),
             strong_zone_ratio=max(0.0, _env_float("TIMED_STRADDLE_STRONG_ZONE_RATIO", 0.65)),
             positive_exit_min_hold_sec=max(0.0, _env_float("TIMED_STRADDLE_POSITIVE_EXIT_MIN_HOLD_SEC", 5.0)),
+            paper_risk_halt_enabled=os.getenv("TIMED_STRADDLE_PAPER_RISK_HALT_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"},
+            force_cycle_entry_enabled=os.getenv("TIMED_STRADDLE_FORCE_CYCLE_ENTRY_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"},
         )
 
 
@@ -322,7 +326,7 @@ class TimedStraddleRuntime:
 
     def _can_start_cycle(self, now: float) -> bool:
         current = self._now_ist(now).time().replace(tzinfo=None)
-        if self.risk_halted:
+        if self.risk_halted and self.settings.paper_risk_halt_enabled:
             if not self._risk_halt_logged:
                 self._risk_halt_logged = True
                 logger.error(
@@ -422,7 +426,7 @@ class TimedStraddleRuntime:
                         self.consecutive_losses = 0
                     else:
                         self.consecutive_losses += 1
-                    if (
+                    if self.settings.paper_risk_halt_enabled and (
                         self.consecutive_losses >= self.settings.max_consecutive_losses
                         or (
                             self.settings.daily_loss_limit > 0
@@ -472,7 +476,10 @@ class TimedStraddleRuntime:
                     zone_decision.zone,
                     zone_decision.direction,
                 )
-                if zone_decision.direction not in {"POSITIVE", "NEGATIVE"} or zone_decision.zone not in {"MIDDLE", "STRONG"}:
+                if (
+                    not self.settings.force_cycle_entry_enabled
+                    and (zone_decision.direction not in {"POSITIVE", "NEGATIVE"} or zone_decision.zone not in {"MIDDLE", "STRONG"})
+                ):
                     logger.info(
                         "TIMED_STRADDLE_ENTRY_BLOCKED | reason=FUTURE_ZONE_NOT_DIRECTIONAL | zone=%s | direction=%s",
                         zone_decision.zone,
@@ -483,7 +490,7 @@ class TimedStraddleRuntime:
             quantity = lot_size * self.settings.lots
             debit = long_ce.ask + long_pe.ask - short_ce.bid - short_pe.bid
             max_profit_net = (float(self.selection["wing_width"]) - debit) * quantity - self.settings.round_trip_cost
-            if max_profit_net < self.settings.profit_target_net:
+            if max_profit_net < self.settings.profit_target_net and not self.settings.force_cycle_entry_enabled:
                 logger.warning(
                     "TIMED_STRADDLE_ENTRY_BLOCKED | reason=MAX_PROFIT_BELOW_TARGET | debit=%.2f | width=%.2f | max_profit_net=%+.2f | target=%.2f",
                     debit, self.selection["wing_width"], max_profit_net, self.settings.profit_target_net,
@@ -491,6 +498,11 @@ class TimedStraddleRuntime:
                 self.selection = None
                 self._selection_retry_at = now + 10.0
                 return
+            if max_profit_net < self.settings.profit_target_net:
+                logger.warning(
+                    "TIMED_STRADDLE_FORCED_CYCLE_ENTRY | max_profit_net=%+.2f | target=%.2f | paper=true",
+                    max_profit_net, self.settings.profit_target_net,
+                )
             self.cycle_count += 1
             position = self.book.open(
                 cycle=self.cycle_count, selection=self.selection, long_ce=long_ce, long_pe=long_pe,
@@ -537,11 +549,13 @@ class TimedStraddleRuntime:
     def run(self) -> None:
         self.quote_stream.start()
         logger.info(
-            "TIMED_STRADDLE_RUNTIME_ACTIVE | strategy=REVERSE_IRON_FLY | index=%s | wing_steps=%s | hold=%.0fs | lots=%s | modeled_cost=%.2f | cutoff=15:25 | force_close=15:30 | max_cycles=%s | max_consecutive_losses=%s | daily_loss_limit=%.2f | five_minute_cycle=%s | observe=%.0fs | confirm=%.0fs | paper=true",
+            "TIMED_STRADDLE_RUNTIME_ACTIVE | strategy=REVERSE_IRON_FLY | index=%s | wing_steps=%s | hold=%.0fs | lots=%s | modeled_cost=%.2f | cutoff=15:25 | force_close=15:30 | max_cycles=%s | max_consecutive_losses=%s | daily_loss_limit=%.2f | five_minute_cycle=%s | cycle=%.0fs | observe=%.0fs | confirm=%.0fs | force_cycle_entry=%s | paper_risk_halt=%s | paper=true",
             self.settings.index, self.settings.wing_steps, self.settings.hold_sec, self.settings.lots,
             self.settings.round_trip_cost, self.settings.max_cycles,
             self.settings.max_consecutive_losses, self.settings.daily_loss_limit,
-            self.settings.five_minute_cycle_enabled, self.settings.observe_sec, self.settings.confirm_sec,
+            self.settings.five_minute_cycle_enabled, self.settings.cycle_sec,
+            self.settings.observe_sec, self.settings.confirm_sec,
+            self.settings.force_cycle_entry_enabled, self.settings.paper_risk_halt_enabled,
         )
         try:
             while True:

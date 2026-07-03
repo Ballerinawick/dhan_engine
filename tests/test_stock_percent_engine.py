@@ -165,6 +165,21 @@ class StockPaperPortfolioTests(unittest.TestCase):
         self.assertAlmostEqual(trade["net_pnl"], 460.0)
         self.assertEqual(len(portfolio.positions), 1)
 
+    def test_short_position_uses_directional_pnl_and_fees(self):
+        portfolio = StockPaperPortfolio(
+            capital=100000.0,
+            notional_per_trade=10000.0,
+            max_positions=1,
+            round_trip_fee=10.0,
+        )
+        self.assertTrue(portfolio.enter(1, "SBIN", 100.0, 50.0, now=10.0, side="SHORT"))
+        portfolio.mark(1, 99.0, now=11.0)
+        self.assertAlmostEqual(portfolio.unrealized_pnl(), 100.0)
+        trade = portfolio.exit(1, 99.0, "TEST", now=20.0)
+        self.assertEqual(trade["side"], "SHORT")
+        self.assertAlmostEqual(trade["gross_pnl"], 100.0)
+        self.assertAlmostEqual(trade["net_pnl"], 90.0)
+
     def test_score_breakdown_exit_requires_hold_confirmation_and_fee_edge(self):
         runtime = StockPaperRuntime.__new__(StockPaperRuntime)
         runtime.settings = SimpleNamespace(

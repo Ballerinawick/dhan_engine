@@ -279,6 +279,14 @@ class TimedStraddleRuntimeTests(unittest.TestCase):
         runtime.step(now + 40)
         self.assertEqual(runtime.cycle_count, 3)
 
+    def test_paper_risk_override_does_not_halt_after_losses(self):
+        runtime, _, _, _ = self.make_runtime(
+            paper_risk_halt_enabled=False,
+            max_consecutive_losses=3,
+        )
+        runtime.risk_halted = True
+        self.assertTrue(runtime._can_start_cycle(ist_ts(10, 0)))
+
     def test_win_resets_consecutive_loss_counter(self):
         runtime, _, _, _ = self.make_runtime()
         runtime.consecutive_losses = 2
