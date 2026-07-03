@@ -20,6 +20,7 @@ sys.modules.setdefault(
 
 from dhan_engine.application.stocks.paper_runtime import StockPaperRuntime
 from dhan_engine.domain.stocks.percent_engine import PercentNormalizedStockEngine
+from dhan_engine.domain.stocks.equity_charges import NseIntradayChargeCalculator
 from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
 from dhan_engine.simulations.stock_paper_portfolio import StockPaperPortfolio, StockPaperPosition
 
@@ -111,6 +112,44 @@ class StockPercentEngineTests(unittest.TestCase):
 
 
 class StockPaperPortfolioTests(unittest.TestCase):
+    def test_dynamic_intraday_charges_match_small_order_estimator_shape(self):
+        charges = NseIntradayChargeCalculator().estimate(1305.10, 1305.40, 1)
+        self.assertAlmostEqual(charges.total, 1.39, delta=0.03)
+
+    def test_dynamic_intraday_charges_scale_with_full_trade_turnover(self):
+        charges = NseIntradayChargeCalculator().estimate(1305.10, 1306.00, 57)
+        self.assertGreater(charges.total, 70.0)
+        self.assertLess(charges.total, 80.0)
+
+    def test_dynamic_fee_is_deducted_from_cash_and_realized_pnl(self):
+        portfolio = StockPaperPortfolio(
+            capital=500000.0,
+            notional_per_trade=75000.0,
+            max_positions=2,
+            round_trip_fee=40.0,
+            charge_calculator=NseIntradayChargeCalculator(),
+        )
+        self.assertTrue(portfolio.enter(1, "RELIANCE", 1305.10, 80.0, now=10.0))
+        trade = portfolio.exit(1, 1306.00, "TEST", now=20.0)
+        self.assertIsNotNone(trade)
+        self.assertAlmostEqual(portfolio.cash, 500000.0 + trade["net_pnl"], places=6)
+        self.assertAlmostEqual(portfolio.realized_pnl, trade["net_pnl"], places=6)
+
+    def test_optional_leverage_blocks_only_required_paper_margin(self):
+        portfolio = StockPaperPortfolio(
+            capital=20000.0,
+            notional_per_trade=75000.0,
+            max_positions=1,
+            round_trip_fee=0.0,
+            leverage=4.0,
+        )
+        self.assertTrue(portfolio.enter(1, "RELIANCE", 1000.0, 80.0, now=10.0))
+        self.assertEqual(portfolio.positions[1].qty, 75)
+        self.assertAlmostEqual(portfolio.positions[1].margin_used, 18750.0)
+        trade = portfolio.exit(1, 1001.0, "TEST", now=20.0)
+        self.assertAlmostEqual(trade["net_pnl"], 75.0)
+        self.assertAlmostEqual(portfolio.cash, 20075.0)
+
     def test_multi_stock_positions_and_net_pnl(self):
         portfolio = StockPaperPortfolio(
             capital=500000.0,
