@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from dhan_engine.application.market_data import FutureQuoteStream
 from dhan_engine.domain.market.five_minute_zone import FiveMinuteZoneDecision, FiveMinuteZoneTracker
+from dhan_engine.domain.stocks.equity_charges import NseIntradayChargeCalculator
 from dhan_engine.domain.stocks.percent_engine import PercentNormalizedStockEngine
 from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
 from dhan_engine.infrastructure.mongo.trade_summary_sink import get_trade_summary_sink
@@ -24,7 +25,10 @@ SYMBOL_ALIASES = {"HDFC": "HDFCBANK", "SBI": "SBIN", "ICICI": "ICICIBANK"}
 
 
 def _env_symbols() -> Tuple[str, ...]:
-    raw = os.getenv("STOCK_PAPER_SYMBOLS", "RELIANCE,ICICIBANK,SBIN,HDFCBANK")
+    raw = os.getenv(
+        "STOCK_PAPER_SYMBOLS",
+        "RELIANCE,ICICIBANK,SBIN,HDFCBANK,AXISBANK,INFY,TCS,KOTAKBANK",
+    )
     symbols = []
     for value in raw.split(","):
         symbol = SYMBOL_ALIASES.get(value.strip().upper(), value.strip().upper())
@@ -43,6 +47,8 @@ class StockPaperSettings:
     notional_per_trade: float
     max_positions: int
     round_trip_fee: float
+    dynamic_charges_enabled: bool
+    leverage: float
     entry_score: float
     exit_score: float
     max_spread_pct: float
@@ -94,6 +100,8 @@ class StockPaperSettings:
             notional_per_trade=float(os.getenv("STOCK_PAPER_NOTIONAL", "75000") or 75000),
             max_positions=int(os.getenv("STOCK_PAPER_MAX_POSITIONS", "2") or 2),
             round_trip_fee=float(os.getenv("STOCK_PAPER_ROUND_TRIP_FEE", "40") or 40),
+            dynamic_charges_enabled=os.getenv("STOCK_DYNAMIC_CHARGES_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"},
+            leverage=max(float(os.getenv("STOCK_PAPER_LEVERAGE", "1") or 1), 1.0),
             entry_score=float(os.getenv("STOCK_PERCENT_ENTRY_SCORE", "72") or 72),
             exit_score=float(os.getenv("STOCK_PERCENT_EXIT_SCORE", "40") or 40),
             max_spread_pct=float(os.getenv("STOCK_PERCENT_MAX_SPREAD_PCT", "0.18") or 0.18),
@@ -141,11 +149,14 @@ class StockPaperRuntime:
             exit_score=settings.exit_score,
             max_spread_pct=settings.max_spread_pct,
         )
+        charge_calculator = NseIntradayChargeCalculator() if settings.dynamic_charges_enabled else None
         self.portfolio = StockPaperPortfolio(
             capital=settings.capital,
             notional_per_trade=settings.notional_per_trade,
             max_positions=settings.max_positions,
             round_trip_fee=settings.round_trip_fee,
+            charge_calculator=charge_calculator,
+            leverage=settings.leverage,
         )
         self.instrument_by_secid: Dict[int, dict] = {}
         self.secid_by_symbol: Dict[str, int] = {}
@@ -215,6 +226,12 @@ class StockPaperRuntime:
             return False
         return True
 
+    def _estimated_round_trip_fee(self, position, exit_price: float) -> float:
+        portfolio = getattr(self, "portfolio", None)
+        if portfolio is not None:
+            return portfolio.estimate_round_trip_fee(position, float(exit_price))
+        return max(float(getattr(self.settings, "round_trip_fee", 0.0) or 0.0), 0.0)
+
     def _position_exit_reason(self, position, signal, now: float) -> str | None:
         pnl_pct = ((signal.ltp - position.entry) / position.entry) * 100.0
         peak_pct = ((position.peak_ltp - position.entry) / position.entry) * 100.0
@@ -225,7 +242,8 @@ class StockPaperRuntime:
             return "STOCK_PERCENT_STOP_LOSS"
         if getattr(self.settings, "five_minute_cycle_enabled", False):
             qty = max(int(position.qty), 1)
-            net_after_fee = ((float(signal.ltp) - float(position.entry)) * qty) - self.settings.round_trip_fee
+            estimated_fee = self._estimated_round_trip_fee(position, float(signal.ltp))
+            net_after_fee = ((float(signal.ltp) - float(position.entry)) * qty) - estimated_fee
             if hold_sec >= float(getattr(self.settings, "positive_exit_min_hold_sec", 5.0)) and net_after_fee > 0:
                 self.score_exit_weak_count[int(position.secid)] = 0
                 return "STOCK_FIVE_MINUTE_POSITIVE_NET_EXIT"
@@ -295,7 +313,8 @@ class StockPaperRuntime:
             return None
 
         gross_pnl = (float(signal.ltp) - float(position.entry)) * int(position.qty)
-        fee_guard = abs(gross_pnl) < (self.settings.round_trip_fee * self.settings.score_exit_min_adverse_fee_ratio)
+        estimated_fee = self._estimated_round_trip_fee(position, float(signal.ltp))
+        fee_guard = abs(gross_pnl) < (estimated_fee * self.settings.score_exit_min_adverse_fee_ratio)
         still_inside_discovery = hold_sec < self.settings.score_exit_fee_guard_sec
         not_real_risk_yet = pnl_pct > -(abs(self.settings.stop_loss_pct) * 0.70)
         if gross_pnl < 0 and fee_guard and still_inside_discovery and not_real_risk_yet:
@@ -306,7 +325,7 @@ class StockPaperRuntime:
                 pnl_pct=pnl_pct,
                 score=signal.score,
                 gross_pnl=gross_pnl,
-                fee=self.settings.round_trip_fee,
+                fee=estimated_fee,
                 weak_count=weak_count,
             )
             return None
@@ -322,7 +341,7 @@ class StockPaperRuntime:
         current_gross = (float(signal.ltp) - float(position.entry)) * qty
         peak_gross = (float(position.peak_ltp) - float(position.entry)) * qty
         giveback_gross = max(0.0, peak_gross - current_gross)
-        fee = max(float(getattr(self.settings, "round_trip_fee", 0.0) or 0.0), 0.0)
+        fee = self._estimated_round_trip_fee(position, float(signal.ltp))
         net_after_fee = current_gross - fee
         features = getattr(signal, "features", {}) or {}
         score = float(getattr(signal, "score", 0.0) or 0.0)
@@ -511,6 +530,8 @@ class StockPaperRuntime:
                             "exit": float(trade["exit"]),
                             "gross_pnl": float(trade["gross_pnl"]),
                             "fee": float(trade["fee"]),
+                            "fee_estimated": bool(trade.get("fee_estimated", False)),
+                            "fee_breakdown": dict(trade.get("fee_breakdown", {})),
                             "net_pnl": float(trade["net_pnl"]),
                             "hold_sec": float(trade["hold_sec"]),
                             "exit_reason": trade["reason"],
@@ -524,6 +545,20 @@ class StockPaperRuntime:
                         trade["gross_pnl"], trade["fee"], trade["net_pnl"],
                         trade["hold_sec"], trade["reason"],
                     )
+                    breakdown = trade.get("fee_breakdown", {})
+                    if trade.get("fee_estimated"):
+                        logger.info(
+                            "STOCK_FEE_BREAKDOWN | %s | Brokerage:%.2f | Exchange:%.2f | STT:%.2f | SEBI:%.2f | IPFT:%.2f | Stamp:%.2f | GST:%.2f | Total:%.2f",
+                            symbol,
+                            float(breakdown.get("brokerage", 0.0)),
+                            float(breakdown.get("exchange", 0.0)),
+                            float(breakdown.get("stt", 0.0)),
+                            float(breakdown.get("sebi", 0.0)),
+                            float(breakdown.get("ipft", 0.0)),
+                            float(breakdown.get("stamp_duty", 0.0)),
+                            float(breakdown.get("gst", 0.0)),
+                            float(trade["fee"]),
+                        )
             return
 
         entry_reason = None
@@ -607,9 +642,11 @@ class StockPaperRuntime:
         self.stream.replace_subscriptions(subscriptions, reason="stock_profiles_startup")
         self.stream.start()
         logger.info(
-            "STOCK_PAPER_RUNTIME_ACTIVE | symbols=%s | subscriptions=%s | capital=%.2f | notional=%.2f | max_positions=%s | strategy=percent_normalized_v1 | five_minute_cycle=%s | observe=%.0fs | confirm=%.0fs",
+            "STOCK_PAPER_RUNTIME_ACTIVE | symbols=%s | subscriptions=%s | capital=%.2f | notional=%.2f | max_positions=%s | leverage=%.2fx | fee_model=%s | strategy=percent_normalized_v1 | five_minute_cycle=%s | observe=%.0fs | confirm=%.0fs",
             ",".join(self.settings.symbols), len(subscriptions), self.settings.capital,
             self.settings.notional_per_trade, self.settings.max_positions,
+            self.settings.leverage,
+            "NSE_INTRADAY_DYNAMIC" if self.settings.dynamic_charges_enabled else "FIXED_FALLBACK",
             self.settings.five_minute_cycle_enabled, self.settings.observe_sec, self.settings.confirm_sec,
         )
         try:

@@ -21,8 +21,10 @@ Required variables:
 ```text
 DHAN_CLIENT_ID=<client id>
 DHAN_ACCESS_TOKEN=<daily token>
-STOCK_PAPER_SYMBOLS=RELIANCE,ICICIBANK,SBIN,HDFCBANK
 ```
+
+The code default universe is `RELIANCE,ICICIBANK,SBIN,HDFCBANK,AXISBANK,INFY,TCS,KOTAKBANK`.
+`STOCK_PAPER_SYMBOLS` is optional and can override that list.
 
 Optional paper controls:
 
@@ -34,17 +36,29 @@ STOCK_PAPER_MAX_DAILY_LOSS=3000
 STOCK_PAPER_MAX_DAILY_TRADES=20
 STOCK_PERCENT_ENTRY_SCORE=72
 STOCK_PERCENT_EXIT_SCORE=40
+STOCK_DYNAMIC_CHARGES_ENABLED=1
+STOCK_PAPER_LEVERAGE=1
 ```
+
+Dynamic charges estimate NSE cash-intraday brokerage and statutory costs from
+the actual buy turnover, sell turnover, and quantity. The estimate is used by
+the positive-net exit gate and recorded as `STOCK_FEE_BREAKDOWN`. Exact live
+charges must still be reconciled against the broker contract note.
+
+Paper leverage only changes blocked buying power; it does not multiply PnL by
+itself. Keep it at `1` until the paper results are stable. MTF pledge, DP, and
+funding-interest costs are not represented by the intraday charge model.
 
 ## Validation logs
 
-Confirm all four `STOCK_PROFILE_REGISTERED` lines, followed by:
+Confirm all eight `STOCK_PROFILE_REGISTERED` lines, followed by:
 
 - `STOCK_PAPER_RUNTIME_ACTIVE`
 - `STOCK_FEED_HEALTH` with low tick ages and `stale=none`
 - `STOCK_PERCENT_STATE` for every symbol
 - `STOCK_ENTRY_COMMITTED` only after warmup and a confirmed score
 - `STOCK_TRADE_SUMMARY` for closed paper positions
+- `STOCK_FEE_BREAKDOWN` with turnover-based charge components
 
 This runtime is paper-only. It does not place broker orders or provide a
 guaranteed hedge against losses in the index-options strategy.
