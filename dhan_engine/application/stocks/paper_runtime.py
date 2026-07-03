@@ -11,6 +11,7 @@ from typing import Dict, Tuple
 from zoneinfo import ZoneInfo
 
 from dhan_engine.application.market_data import FutureQuoteStream
+from dhan_engine.domain.market.five_minute_zone import FiveMinuteZoneDecision, FiveMinuteZoneTracker
 from dhan_engine.domain.stocks.percent_engine import PercentNormalizedStockEngine
 from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
 from dhan_engine.infrastructure.mongo.trade_summary_sink import get_trade_summary_sink
@@ -67,6 +68,14 @@ class StockPaperSettings:
     max_daily_loss: float
     max_daily_trades: int
     heartbeat_sec: float
+    five_minute_cycle_enabled: bool = False
+    cycle_sec: float = 300.0
+    observe_sec: float = 150.0
+    confirm_sec: float = 10.0
+    entry_window_sec: float = 30.0
+    middle_zone_ratio: float = 0.25
+    strong_zone_ratio: float = 0.65
+    positive_exit_min_hold_sec: float = 5.0
     market_start: dtime = dtime(9, 15)
     market_end: dtime = dtime(15, 25)
 
@@ -110,6 +119,14 @@ class StockPaperSettings:
             max_daily_loss=float(os.getenv("STOCK_PAPER_MAX_DAILY_LOSS", "3000") or 3000),
             max_daily_trades=int(os.getenv("STOCK_PAPER_MAX_DAILY_TRADES", "20") or 20),
             heartbeat_sec=float(os.getenv("STOCK_PAPER_HEARTBEAT_SEC", "10") or 10),
+            five_minute_cycle_enabled=os.getenv("STOCK_FIVE_MINUTE_CYCLE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"},
+            cycle_sec=float(os.getenv("STOCK_CYCLE_SEC", "300") or 300),
+            observe_sec=float(os.getenv("STOCK_CYCLE_OBSERVE_SEC", "150") or 150),
+            confirm_sec=float(os.getenv("STOCK_CYCLE_CONFIRM_SEC", "10") or 10),
+            entry_window_sec=float(os.getenv("STOCK_CYCLE_ENTRY_WINDOW_SEC", "30") or 30),
+            middle_zone_ratio=float(os.getenv("STOCK_CYCLE_MIDDLE_ZONE_RATIO", "0.25") or 0.25),
+            strong_zone_ratio=float(os.getenv("STOCK_CYCLE_STRONG_ZONE_RATIO", "0.65") or 0.65),
+            positive_exit_min_hold_sec=float(os.getenv("STOCK_CYCLE_POSITIVE_EXIT_MIN_HOLD_SEC", "5") or 5),
         )
 
 
@@ -145,6 +162,14 @@ class StockPaperRuntime:
         self.daily_date = datetime.now(IST).date()
         self.daily_realized_start = 0.0
         self.trade_summary_sink = get_trade_summary_sink()
+        self.zone_tracker = FiveMinuteZoneTracker(
+            cycle_sec=settings.cycle_sec,
+            observe_sec=settings.observe_sec,
+            confirm_sec=settings.confirm_sec,
+            entry_window_sec=settings.entry_window_sec,
+            middle_zone_ratio=settings.middle_zone_ratio,
+            strong_zone_ratio=settings.strong_zone_ratio,
+        )
         self.stream = FutureQuoteStream(
             client_id=settings.client_id,
             token=settings.access_token,
@@ -198,6 +223,16 @@ class StockPaperRuntime:
         if pnl_pct <= -abs(self.settings.stop_loss_pct):
             self.score_exit_weak_count[int(position.secid)] = 0
             return "STOCK_PERCENT_STOP_LOSS"
+        if getattr(self.settings, "five_minute_cycle_enabled", False):
+            qty = max(int(position.qty), 1)
+            net_after_fee = ((float(signal.ltp) - float(position.entry)) * qty) - self.settings.round_trip_fee
+            if hold_sec >= float(getattr(self.settings, "positive_exit_min_hold_sec", 5.0)) and net_after_fee > 0:
+                self.score_exit_weak_count[int(position.secid)] = 0
+                return "STOCK_FIVE_MINUTE_POSITIVE_NET_EXIT"
+            if now >= self.zone_tracker.cycle_end(float(position.entry_ts)):
+                self.score_exit_weak_count[int(position.secid)] = 0
+                return "STOCK_FIVE_MINUTE_CYCLE_TIMEOUT"
+            return None
         if pnl_pct >= self.settings.take_profit_pct:
             self.score_exit_weak_count[int(position.secid)] = 0
             return "STOCK_PERCENT_TAKE_PROFIT"
@@ -217,6 +252,20 @@ class StockPaperRuntime:
             return self._score_breakdown_exit_reason(position, signal, hold_sec, pnl_pct, now)
         self.score_exit_weak_count[int(position.secid)] = 0
         return None
+
+    def _zone_entry_reason(self, decision: FiveMinuteZoneDecision, signal) -> str | None:
+        if decision.direction != "POSITIVE" or decision.zone not in {"MIDDLE", "STRONG"}:
+            return None
+        features = signal.features or {}
+        if float(features.get("spread_pct", 999.0) or 999.0) > self.settings.max_spread_pct:
+            return None
+        if float(features.get("quality_score", 0.0) or 0.0) < 55.0:
+            return None
+        if float(features.get("flow_confirmation_score", 0.0) or 0.0) < 45.0:
+            return None
+        if float(features.get("risk_score", 100.0) or 100.0) > 35.0:
+            return None
+        return f"STOCK_FIVE_MINUTE_FUTURE_POSITIVE_{decision.zone}"
 
     def _score_breakdown_exit_reason(self, position, signal, hold_sec: float, pnl_pct: float, now: float) -> str | None:
         secid = int(position.secid)
@@ -383,6 +432,22 @@ class StockPaperRuntime:
             now,
             in_position=position is not None,
         )
+        zone_decision = None
+        if getattr(self.settings, "five_minute_cycle_enabled", False):
+            zone_decision = self.zone_tracker.update(symbol, float(ltp), now)
+            if zone_decision is not None:
+                logger.info(
+                    "STOCK_FIVE_MINUTE_ZONE | symbol=%s | cycle_start=%.0f | origin=%.2f | current=%.2f | displacement=%+.4f | normalized=%+.3f | velocity=%+.5f | zone=%s | direction=%s",
+                    symbol,
+                    zone_decision.cycle_start,
+                    zone_decision.origin_price,
+                    zone_decision.current_price,
+                    zone_decision.displacement,
+                    zone_decision.normalized_displacement,
+                    zone_decision.velocity_per_sec,
+                    zone_decision.zone,
+                    zone_decision.direction,
+                )
 
         if now - self.last_score_log_ts[symbol] >= self.settings.heartbeat_sec:
             self.last_score_log_ts[symbol] = now
@@ -461,8 +526,17 @@ class StockPaperRuntime:
                     )
             return
 
-        if signal.action == "ENTRY" and self._entry_allowed(symbol, now):
-            if self.portfolio.enter(secid, symbol, ltp, signal.score, now):
+        entry_reason = None
+        entry_score = float(signal.score)
+        if getattr(self.settings, "five_minute_cycle_enabled", False):
+            if zone_decision is not None:
+                entry_reason = self._zone_entry_reason(zone_decision, signal)
+                entry_score = max(entry_score, abs(zone_decision.normalized_displacement) * 100.0)
+        elif signal.action == "ENTRY":
+            entry_reason = signal.reason
+
+        if entry_reason and self._entry_allowed(symbol, now):
+            if self.portfolio.enter(secid, symbol, ltp, entry_score, now):
                 self.daily_trades += 1
                 position = self.portfolio.positions[int(secid)]
                 logger.info(
@@ -471,12 +545,12 @@ class StockPaperRuntime:
                     secid,
                     position.qty,
                     float(ltp),
-                    signal.score,
+                    entry_score,
                     signal.features.get("opportunity_score", 0.0),
                     signal.features.get("risk_score", 0.0),
                     signal.features.get("entry_mode", 0.0),
                     signal.features.get("exit_plan_code", 0.0),
-                    signal.reason,
+                    entry_reason,
                 )
             else:
                 logger.info(
@@ -533,9 +607,10 @@ class StockPaperRuntime:
         self.stream.replace_subscriptions(subscriptions, reason="stock_profiles_startup")
         self.stream.start()
         logger.info(
-            "STOCK_PAPER_RUNTIME_ACTIVE | symbols=%s | subscriptions=%s | capital=%.2f | notional=%.2f | max_positions=%s | strategy=percent_normalized_v1",
+            "STOCK_PAPER_RUNTIME_ACTIVE | symbols=%s | subscriptions=%s | capital=%.2f | notional=%.2f | max_positions=%s | strategy=percent_normalized_v1 | five_minute_cycle=%s | observe=%.0fs | confirm=%.0fs",
             ",".join(self.settings.symbols), len(subscriptions), self.settings.capital,
             self.settings.notional_per_trade, self.settings.max_positions,
+            self.settings.five_minute_cycle_enabled, self.settings.observe_sec, self.settings.confirm_sec,
         )
         try:
             while True:

@@ -253,6 +253,41 @@ class StockPaperPortfolioTests(unittest.TestCase):
             "STOCK_ADAPTIVE_DEAD_SCALP_EXIT",
         )
 
+    def test_five_minute_stock_exit_uses_positive_net_then_cycle_timeout(self):
+        from dhan_engine.domain.market.five_minute_zone import FiveMinuteZoneTracker
+
+        runtime = StockPaperRuntime.__new__(StockPaperRuntime)
+        runtime.settings = SimpleNamespace(
+            stop_loss_pct=0.35,
+            round_trip_fee=40.0,
+            five_minute_cycle_enabled=True,
+            positive_exit_min_hold_sec=5.0,
+        )
+        runtime.zone_tracker = FiveMinuteZoneTracker()
+        runtime.score_exit_weak_count = defaultdict(int)
+        position = StockPaperPosition(
+            secid=1,
+            symbol="SBIN",
+            qty=100,
+            entry=1000.0,
+            entry_ts=1960.0,
+            last_ltp=1000.5,
+            last_tick_ts=1966.0,
+            peak_ltp=1000.5,
+            entry_score=70.0,
+        )
+        positive = SimpleNamespace(ltp=1000.5)
+        self.assertEqual(
+            runtime._position_exit_reason(position, positive, 1966.0),
+            "STOCK_FIVE_MINUTE_POSITIVE_NET_EXIT",
+        )
+
+        flat = SimpleNamespace(ltp=1000.0)
+        self.assertEqual(
+            runtime._position_exit_reason(position, flat, 2100.0),
+            "STOCK_FIVE_MINUTE_CYCLE_TIMEOUT",
+        )
+
 
 class EquityInstrumentResolutionTests(unittest.TestCase):
     def test_exact_nse_equity_resolution(self):
