@@ -288,7 +288,16 @@ class FullDepth:
             return
 
         security_id = payload.get("security_id") if isinstance(payload, dict) else None
-        key = ("security", int(security_id)) if security_id is not None else ("control", 0)
+        msg_code = payload.get("msg_code") if isinstance(payload, dict) else None
+        if security_id is not None and msg_code in (41, 51):
+            # Dhan publishes bid and ask books as separate packets. Preserve one
+            # latest queue slot per side so a fresh ask cannot replace a pending
+            # bid (or vice versa) before the adapter pairs them.
+            key = ("security_side", int(security_id), int(msg_code))
+        elif security_id is not None:
+            key = ("security", int(security_id))
+        else:
+            key = ("control", 0)
         if key in self._queued_keys:
             self._latest_payload_by_key[key] = payload
             self._dropped_payload_count += 1
@@ -434,3 +443,4 @@ class FullDepth:
             "levels": levels,
             "level_count": len(levels),
         }
+
