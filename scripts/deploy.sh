@@ -46,10 +46,8 @@ grep -vE '^(DHAN_CLIENT_ID|DHAN_ACCESS_TOKEN)=' \
 
 sudo install -m 0600 "${TEMP_ENV}" "${ENV_FILE}"
 
-# Copy required instrument data and install the systemd service.
-sudo install -m 0644 data/api-scrip-master.csv \
-  "${DATA_DIR}/api-scrip-master.csv"
-
+# Install the systemd service. The runtime downloads a fresh instrument master
+# atomically at every start so an expired repository snapshot is never seeded.
 sudo install -m 0644 deploy/aws/ec2/dhan-engine.service \
   /etc/systemd/system/dhan-engine.service
 
