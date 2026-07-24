@@ -68,6 +68,22 @@ def main() -> None:
     groups = defaultdict(list)
     for index, (instrument, session_date) in enumerate(zip(instruments, session_dates)):
         groups[(instrument, session_date)].append(index)
+
+    # Capture retains every complete book event. Training deterministically
+    # resamples that raw event stream to the cadence stored in model metadata.
+    sample_interval_ns = args.sample_interval_ms * 1_000_000
+    sampled_groups = {}
+    for key, indices in groups.items():
+        sampled = []
+        next_sample_ns = None
+        for index in indices:
+            received_ns = feature_timestamps[index]
+            if next_sample_ns is None or received_ns >= next_sample_ns:
+                sampled.append(index)
+                next_sample_ns = received_ns + sample_interval_ns
+        sampled_groups[key] = sampled
+    groups = sampled_groups
+
     observed_intervals_ms = []
     for indices in groups.values():
         observed_intervals_ms.extend(
@@ -186,3 +202,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

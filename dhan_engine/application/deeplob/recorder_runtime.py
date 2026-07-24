@@ -43,6 +43,7 @@ class DeepLobRecorderRuntime:
         self.master = master
         self.depth_adapter = depth_adapter
         self.recorder = recorder
+        self.instruments = {}
 
     def run(self) -> None:
         instruments = []
@@ -51,6 +52,13 @@ class DeepLobRecorderRuntime:
             secid = int(future["security_id"])
             tag = f"{index}_FUT"
             instruments.append(("NSE_FNO", secid, tag))
+            expiry = future["expiry"]
+            expiry_text = expiry.strftime("%Y-%m-%d") if hasattr(expiry, "strftime") else str(expiry)
+            self.instruments[tag] = {
+                "index": index,
+                "symbol": future["symbol"],
+                "expiry": expiry_text,
+            }
             logger.info(
                 "DEEPLOB_INSTRUMENT_SELECTED | index=%s | symbol=%s | secid=%s",
                 index,
@@ -83,10 +91,16 @@ def build_deeplob_recorder_runtime(settings: DeepLobRecorderRuntimeSettings):
     master = InstrumentMaster(settings.csv_file, debug=False)
     runtime = None
     recorder = ParquetDepthRecorder(settings.recorder)
+
+    def record(tag, book):
+        metadata = runtime.instruments[tag]
+        runtime.recorder.record(tag, book, **metadata)
+
     adapter = FullDepth200Adapter(
         settings.client_id,
         settings.access_token,
-        lambda tag, book: runtime.recorder.record(tag, book),
+        record,
     )
     runtime = DeepLobRecorderRuntime(settings, master, adapter, recorder)
     return runtime
+

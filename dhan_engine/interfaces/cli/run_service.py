@@ -23,6 +23,8 @@ def main() -> None:
         "deeplob_recorder": "deeplob_recorder",
         "deeplob-inference": "deeplob_inference",
         "deeplob_inference": "deeplob_inference",
+        "deeplob-live": "deeplob_live",
+        "deeplob_live": "deeplob_live",
     }
     selected = aliases.get(service)
     if selected is None:
@@ -59,6 +61,11 @@ def main() -> None:
 
         run_deeplob_inference()
         return
+    if selected == "deeplob_live":
+        from dhan_engine.interfaces.cli.run_deeplob_live import main as run_deeplob_live
+
+        run_deeplob_live()
+        return
 
     from dhan_engine.interfaces.cli.run_ws import main as run_index
 
@@ -67,3 +74,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -77,6 +77,7 @@ class DeepLobPaperInferenceRuntime:
         self._sampled_out = 0
         self._dropped = 0
         self._predictions = 0
+        self._stale = 0
 
     def on_book(self, tag, snapshot) -> None:
         self._received += 1
@@ -102,7 +103,7 @@ class DeepLobPaperInferenceRuntime:
                 future["symbol"],
                 future["security_id"],
             )
-        self._worker.start()
+        self.start_worker()
         self.depth_adapter.subscribe(instruments)
         logger.info(
             "DEEPLOB_PAPER_INFERENCE_ACTIVE | model=%s | indexes=%s | depth=%s | "
@@ -116,23 +117,45 @@ class DeepLobPaperInferenceRuntime:
         try:
             while True:
                 time.sleep(10)
-                logger.info(
-                    "DEEPLOB_INFERENCE_HEALTH | received=%s | sampled_out=%s | predictions=%s | dropped=%s | "
-                    "queue=%s/%s | worker_alive=%s",
-                    self._received,
-                    self._sampled_out,
-                    self._predictions,
-                    self._dropped,
-                    self._queue.qsize(),
-                    self.settings.queue_size,
-                    self._worker.is_alive(),
-                )
+                self.log_health()
         except KeyboardInterrupt:
             logger.info("DEEPLOB_PAPER_INFERENCE_STOPPED")
         finally:
-            self._stop.set()
             self.depth_adapter.close()
-            self._worker.join(10)
+            self.close_worker()
+
+    def start_worker(self) -> None:
+        if not self._worker.is_alive():
+            self._worker.start()
+
+    def close_worker(self, timeout: float = 10.0) -> None:
+        self._stop.set()
+        self._worker.join(timeout)
+        if self._worker.is_alive():
+            logger.warning(
+                "DEEPLOB_INFERENCE_STOP_TIMEOUT | queue=%s/%s",
+                self._queue.qsize(),
+                self.settings.queue_size,
+            )
+
+    @property
+    def worker_alive(self) -> bool:
+        return self._worker.is_alive()
+
+    def log_health(self) -> None:
+        logger.info(
+            "DEEPLOB_INFERENCE_HEALTH | received=%s | sampled_out=%s | predictions=%s | "
+            "dropped=%s | stale=%s | queue=%s/%s | worker_alive=%s | model=%s",
+            self._received,
+            self._sampled_out,
+            self._predictions,
+            self._dropped,
+            self._stale,
+            self._queue.qsize(),
+            self.settings.queue_size,
+            self._worker.is_alive(),
+            self.artifact.version,
+        )
 
     def _infer_loop(self) -> None:
         while not self._stop.is_set() or not self._queue.empty():
@@ -142,6 +165,7 @@ class DeepLobPaperInferenceRuntime:
                 continue
             age_sec = time.monotonic() - snapshot.received_mono
             if age_sec > self.settings.stale_after_sec:
+                self._stale += 1
                 logger.warning(
                     "DEEPLOB_STALE_SNAPSHOT_DROPPED | instrument=%s | age_ms=%.1f",
                     tag,
@@ -211,3 +235,4 @@ def build_deeplob_inference_runtime(settings: DeepLobInferenceSettings):
     )
     runtime = DeepLobPaperInferenceRuntime(settings, master, adapter, artifact)
     return runtime
+

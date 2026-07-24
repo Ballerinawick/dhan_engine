@@ -19,14 +19,15 @@ def test_rejects_invalid_200_depth_row_count():
     assert FullDepth._parse_packet(packet, expected_levels=200) is None
 
 
-def test_depth_queue_coalesces_updates_by_security_id():
+def test_depth_queue_coalesces_updates_by_security_id_and_side():
     feed = FullDepth("client", "token")
     feed._queue = asyncio.Queue(maxsize=4)
 
-    feed._enqueue_latest({"security_id": 101, "levels": [1]})
-    feed._enqueue_latest({"security_id": 101, "levels": [2]})
-    feed._enqueue_latest({"security_id": 202, "levels": [3]})
+    feed._enqueue_latest({"security_id": 101, "msg_code": 41, "levels": [1]})
+    feed._enqueue_latest({"security_id": 101, "msg_code": 41, "levels": [2]})
+    feed._enqueue_latest({"security_id": 101, "msg_code": 51, "levels": [3]})
 
     assert feed._queue.qsize() == 2
-    assert feed._latest_payload_by_key[("security", 101)]["levels"] == [2]
+    assert feed._latest_payload_by_key[("security_side", 101, 41)]["levels"] == [2]
+    assert feed._latest_payload_by_key[("security_side", 101, 51)]["levels"] == [3]
     assert feed._dropped_payload_count == 1
