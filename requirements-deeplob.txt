@@ -1,0 +1,3 @@
+-r requirements-deeplob-recorder.txt
+numpy
+torch

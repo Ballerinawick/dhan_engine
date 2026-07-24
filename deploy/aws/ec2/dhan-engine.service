@@ -1,0 +1,23 @@
+[Unit]
+Description=Dhan Engine Service
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+EnvironmentFile=/etc/dhan-engine/dhan-engine.env
+ExecStartPre=-/usr/bin/docker rm -f dhan-engine
+ExecStart=/usr/bin/docker run --name dhan-engine \
+  --env-file /etc/dhan-engine/dhan-engine.env \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=256m \
+  -v /var/lib/dhan-engine:/var/lib/dhan-engine \
+  dhan-engine:latest
+ExecStop=/usr/bin/docker stop -t 20 dhan-engine
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
