@@ -19,6 +19,10 @@ def main() -> None:
         "straddle-experiment": "timed_straddle",
         "depth-research": "depth_research",
         "full-depth": "depth_research",
+        "deeplob-recorder": "deeplob_recorder",
+        "deeplob_recorder": "deeplob_recorder",
+        "deeplob-inference": "deeplob_inference",
+        "deeplob_inference": "deeplob_inference",
     }
     selected = aliases.get(service)
     if selected is None:
@@ -44,6 +48,16 @@ def main() -> None:
         from dhan_engine.interfaces.cli.run_full_depth_research import main as run_depth_research
 
         run_depth_research()
+        return
+    if selected == "deeplob_recorder":
+        from dhan_engine.interfaces.cli.run_deeplob_recorder import main as run_deeplob_recorder
+
+        run_deeplob_recorder()
+        return
+    if selected == "deeplob_inference":
+        from dhan_engine.interfaces.cli.run_deeplob_inference import main as run_deeplob_inference
+
+        run_deeplob_inference()
         return
 
     from dhan_engine.interfaces.cli.run_ws import main as run_index

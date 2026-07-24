@@ -16,20 +16,5 @@ dependencies = [
   "websockets",
 ]
 
-[tool.setuptools]
-packages = [
-  "dhan_engine",
-  "dhan_engine.application",
-  "dhan_engine.config",
-  "dhan_engine.domain",
-  "dhan_engine.domain.features",
-  "dhan_engine.domain.market",
-  "dhan_engine.domain.strategy",
-  "dhan_engine.domain.trade_lifecycle",
-  "dhan_engine.infrastructure",
-  "dhan_engine.infrastructure.dhan",
-  "dhan_engine.interfaces",
-  "dhan_engine.interfaces.cli",
-  "dhan_engine.interfaces.web",
-  "dhan_engine.simulations",
-]
+[tool.setuptools.packages.find]
+include = ["dhan_engine*"]
