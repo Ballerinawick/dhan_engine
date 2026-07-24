@@ -443,4 +443,3 @@ class FullDepth:
             "levels": levels,
             "level_count": len(levels),
         }
-
