@@ -9,7 +9,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 from dhan_engine.domain.market.full_depth_microstructure import BookSnapshot
 
@@ -27,20 +28,46 @@ class DepthRecorderSettings:
     s3_bucket: str = ""
     s3_prefix: str = "deeplob"
     delete_after_upload: bool = False
+    partition_timezone: str = "Asia/Kolkata"
 
     @classmethod
     def from_env(cls) -> "DepthRecorderSettings":
         return cls(
             output_dir=os.getenv("DEEPLOB_OUTPUT_DIR", "data/deeplob").strip(),
             levels=max(1, min(200, int(os.getenv("DEEPLOB_LEVELS", "200")))),
-            sample_interval_ms=max(0, int(os.getenv("DEEPLOB_SAMPLE_INTERVAL_MS", "250"))),
+            sample_interval_ms=max(
+                0,
+                int(
+                    os.getenv(
+                        "DEEPLOB_RECORD_SAMPLE_INTERVAL_MS",
+                        os.getenv("DEEPLOB_SAMPLE_INTERVAL_MS", "250"),
+                    )
+                ),
+            ),
             queue_size=max(128, int(os.getenv("DEEPLOB_QUEUE_SIZE", "4096"))),
             rows_per_file=max(100, int(os.getenv("DEEPLOB_ROWS_PER_FILE", "2000"))),
             flush_sec=max(1.0, float(os.getenv("DEEPLOB_FLUSH_SEC", "30"))),
             s3_bucket=os.getenv("DEEPLOB_S3_BUCKET", "").strip(),
             s3_prefix=os.getenv("DEEPLOB_S3_PREFIX", "deeplob").strip().strip("/"),
             delete_after_upload=os.getenv("DEEPLOB_DELETE_AFTER_UPLOAD", "0").strip() == "1",
+            partition_timezone=os.getenv(
+                "DEEPLOB_PARTITION_TIMEZONE", "Asia/Kolkata"
+            ).strip(),
         )
+
+
+@dataclass(frozen=True)
+class DepthInstrument:
+    index: str
+    symbol: str
+    expiry: str
+
+
+@dataclass(frozen=True)
+class _RecordedSnapshot:
+    instrument: DepthInstrument
+    snapshot: BookSnapshot
+    full_quote: Optional[Mapping[str, object]] = None
 
 
 class ParquetDepthRecorder:
@@ -48,7 +75,7 @@ class ParquetDepthRecorder:
 
     def __init__(self, settings: DepthRecorderSettings):
         self.settings = settings
-        self._queue: queue.Queue[BookSnapshot] = queue.Queue(maxsize=settings.queue_size)
+        self._queue: queue.Queue[_RecordedSnapshot] = queue.Queue(maxsize=settings.queue_size)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._worker, name="DeepLOBRecorder", daemon=True)
         self._rows: Dict[str, list[dict]] = {}
@@ -80,7 +107,16 @@ class ParquetDepthRecorder:
             self.settings.s3_bucket or "disabled",
         )
 
-    def record(self, instrument: str, snapshot: BookSnapshot) -> None:
+    def record(
+        self,
+        instrument: str,
+        snapshot: BookSnapshot,
+        *,
+        index: str = "",
+        symbol: str = "",
+        expiry: str = "unknown",
+        full_quote: Optional[Mapping[str, object]] = None,
+    ) -> None:
         self._received += 1
         interval_sec = self.settings.sample_interval_ms / 1000.0
         previous_sample = self._last_sample_mono.get(instrument, float("-inf"))
@@ -98,8 +134,19 @@ class ParquetDepthRecorder:
                 snapshot.received_ts,
                 snapshot.received_mono,
             )
+        descriptor = DepthInstrument(
+            index=(index or instrument.removesuffix("_FUT")).upper(),
+            symbol=symbol or instrument,
+            expiry=expiry or "unknown",
+        )
         try:
-            self._queue.put_nowait(snapshot)
+            self._queue.put_nowait(
+                _RecordedSnapshot(
+                    descriptor,
+                    snapshot,
+                    dict(full_quote) if full_quote else None,
+                )
+            )
         except queue.Full:
             self._dropped += 1
         self._log_health()
@@ -110,11 +157,21 @@ class ParquetDepthRecorder:
         if self._thread.is_alive():
             logger.warning("DEEPLOB_RECORDER_STOP_TIMEOUT | queue_size=%s", self._queue.qsize())
 
+    @property
+    def worker_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def log_health(self) -> None:
+        self._log_health(force=True)
+
     def _worker(self) -> None:
         while not self._stop.is_set() or not self._queue.empty():
             try:
-                snapshot = self._queue.get(timeout=0.5)
-                self._rows.setdefault(snapshot.name, []).append(self._to_row(snapshot))
+                item = self._queue.get(timeout=0.5)
+                key = self._partition_key(item.instrument, item.snapshot.name)
+                self._rows.setdefault(key, []).append(
+                    self._to_row(item.snapshot, item.instrument, item.full_quote)
+                )
             except queue.Empty:
                 pass
             except Exception:
@@ -125,21 +182,49 @@ class ParquetDepthRecorder:
             if due or full or (self._stop.is_set() and self._queue.empty()):
                 self._flush_all()
 
-    def _to_row(self, snapshot: BookSnapshot) -> dict:
+    @staticmethod
+    def _partition_key(instrument: DepthInstrument, tag: str) -> str:
+        return "|".join((instrument.index, instrument.symbol, instrument.expiry, tag))
+
+    def _to_row(
+        self,
+        snapshot: BookSnapshot,
+        instrument: DepthInstrument,
+        full_quote: Optional[Mapping[str, object]] = None,
+    ) -> dict:
         levels = self.settings.levels
 
         def column(rows, attr, cast):
             values = [cast(getattr(row, attr)) for row in rows[:levels]]
             return values + [cast(0)] * (levels - len(values))
 
+        quote = full_quote or {}
         return {
+            "schema_version": 1,
             "received_ns": int(snapshot.received_ts * 1_000_000_000),
             "security_id": snapshot.security_id,
+            "index": instrument.index,
+            "symbol": instrument.symbol,
+            "expiry": instrument.expiry,
             "instrument": snapshot.name,
             "best_bid": float(snapshot.bids[0].price),
             "best_ask": float(snapshot.asks[0].price),
             "mid_price": float((snapshot.bids[0].price + snapshot.asks[0].price) / 2.0),
             "spread": float(snapshot.asks[0].price - snapshot.bids[0].price),
+            "ltp": float(quote.get("ltp", 0.0) or 0.0),
+            "ltq": int(quote.get("ltq", 0) or 0),
+            "ltt": str(quote.get("ltt", "") or ""),
+            "volume": int(quote.get("volume", 0) or 0),
+            "oi": int(quote.get("oi", 0) or 0),
+            "average_price": float(quote.get("average_price", 0.0) or 0.0),
+            "open": float(quote.get("open", 0.0) or 0.0),
+            "high": float(quote.get("high", 0.0) or 0.0),
+            "low": float(quote.get("low", 0.0) or 0.0),
+            "close": float(quote.get("close", 0.0) or 0.0),
+            "total_buy_qty": int(quote.get("total_buy_qty", 0) or 0),
+            "total_sell_qty": int(quote.get("total_sell_qty", 0) or 0),
+            "fullquote_received_ns": int(quote.get("received_ns", 0) or 0),
+            "fullquote_age_ms": float(quote.get("age_ms", -1.0)),
             "bid_price": column(snapshot.bids, "price", float),
             "bid_qty": column(snapshot.bids, "qty", int),
             "bid_orders": column(snapshot.bids, "orders", int),
@@ -151,21 +236,22 @@ class ParquetDepthRecorder:
     def _flush_all(self) -> None:
         pending, self._rows = self._rows, {}
         self._last_flush = time.monotonic()
-        for instrument, rows in pending.items():
+        for partition_key, rows in pending.items():
             if not rows:
                 continue
+            instrument = rows[0]["instrument"]
             try:
-                path = self._write_parquet(instrument, rows)
+                path = self._write_parquet(rows)
                 self._written += len(rows)
             except Exception:
                 self._failures += 1
                 logger.exception("DEEPLOB_FLUSH_FAILED | instrument=%s | rows=%s", instrument, len(rows))
-                retained = rows + self._rows.get(instrument, [])
+                retained = rows + self._rows.get(partition_key, [])
                 if len(retained) > self.settings.queue_size:
                     overflow = len(retained) - self.settings.queue_size
                     self._dropped += overflow
                     retained = retained[overflow:]
-                self._rows[instrument] = retained
+                self._rows[partition_key] = retained
                 continue
             try:
                 self._upload(path, instrument)
@@ -177,7 +263,7 @@ class ParquetDepthRecorder:
                     path,
                 )
 
-    def _write_parquet(self, instrument: str, rows: list[dict]) -> Path:
+    def _write_parquet(self, rows: list[dict]) -> Path:
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
@@ -185,12 +271,22 @@ class ParquetDepthRecorder:
             raise RuntimeError("Install pyarrow to record DeepLOB Parquet data") from exc
 
         first_ns = rows[0]["received_ns"]
-        instant = datetime.fromtimestamp(first_ns / 1_000_000_000, tz=timezone.utc)
+        received_utc = datetime.fromtimestamp(
+            first_ns / 1_000_000_000,
+            tz=timezone.utc,
+        )
+        instant = received_utc.astimezone(ZoneInfo(self.settings.partition_timezone))
+        instrument = rows[0]["instrument"]
         safe_name = instrument.replace("/", "_").replace(" ", "_")
+        safe_symbol = rows[0]["symbol"].replace("/", "_").replace(" ", "_")
         directory = (
             Path(self.settings.output_dir)
-            / f"date={instant:%Y-%m-%d}"
+            / "schema=v1"
+            / f"index={rows[0]['index']}"
+            / f"expiry={rows[0]['expiry']}"
+            / f"trade_date={instant:%Y-%m-%d}"
             / f"instrument={safe_name}"
+            / f"symbol={safe_symbol}"
             / f"hour={instant:%H}"
         )
         directory.mkdir(parents=True, exist_ok=True)
@@ -198,7 +294,12 @@ class ParquetDepthRecorder:
         final_path = directory / filename
         temp_path = final_path.with_suffix(".parquet.tmp")
         table = pa.Table.from_pylist(rows)
-        pq.write_table(table, temp_path, compression="zstd", use_dictionary=["instrument"])
+        pq.write_table(
+            table,
+            temp_path,
+            compression="zstd",
+            use_dictionary=["index", "symbol", "expiry", "instrument"],
+        )
         temp_path.replace(final_path)
         digest_builder = hashlib.sha256()
         with final_path.open("rb") as source:
@@ -235,10 +336,12 @@ class ParquetDepthRecorder:
         )
         self._uploaded += 1
         logger.info(
-            "DEEPLOB_S3_UPLOAD_OK | instrument=%s | bucket=%s | key=%s",
+            "DEEPLOB_S3_UPLOAD_OK | instrument=%s | bucket=%s | key=%s | "
+            "local_retained=%s",
             instrument,
             self.settings.s3_bucket,
             key,
+            not self.settings.delete_after_upload,
         )
         if self.settings.delete_after_upload:
             path.unlink(missing_ok=True)
@@ -258,9 +361,9 @@ class ParquetDepthRecorder:
                 self._failures += 1
                 logger.exception("DEEPLOB_S3_RETRY_FAILED | path=%s", path)
 
-    def _log_health(self) -> None:
+    def _log_health(self, *, force: bool = False) -> None:
         now = time.monotonic()
-        if now - self._last_health < 10.0:
+        if not force and now - self._last_health < 10.0:
             return
         self._last_health = now
         logger.info(
@@ -275,3 +378,4 @@ class ParquetDepthRecorder:
             self._uploaded,
             self._failures,
         )
+
