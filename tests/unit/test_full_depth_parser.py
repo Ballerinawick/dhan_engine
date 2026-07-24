@@ -31,4 +31,3 @@ def test_depth_queue_coalesces_updates_by_security_id_and_side():
     assert feed._latest_payload_by_key[("security_side", 101, 41)]["levels"] == [2]
     assert feed._latest_payload_by_key[("security_side", 101, 51)]["levels"] == [3]
     assert feed._dropped_payload_count == 1
-
