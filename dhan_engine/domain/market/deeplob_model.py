@@ -18,6 +18,12 @@ class DeepLobPrediction:
     model_version: str
 
 
+def paper_option_action(direction: str, confidence: float, threshold: float) -> str:
+    if confidence < threshold:
+        return "NO_TRADE"
+    return {"UP": "BUY_CE", "DOWN": "BUY_PE"}.get(direction, "NO_TRADE")
+
+
 def encode_book(snapshot: BookSnapshot, levels: int = 200) -> list[float]:
     """Causal, scale-normalized [price, qty, orders] features for both sides."""
     levels = max(1, min(int(levels), 200))
@@ -56,6 +62,8 @@ class DeepLobArtifact:
             "levels",
             "feature_width",
             "sequence_length",
+            "sample_interval_ms",
+            "horizon_sec",
             "classes",
         }
         missing = required - set(metadata)
@@ -75,10 +83,16 @@ class DeepLobArtifact:
         self.levels = int(metadata["levels"])
         self.feature_width = int(metadata["feature_width"])
         self.sequence_length = int(metadata["sequence_length"])
+        self.sample_interval_ms = int(metadata["sample_interval_ms"])
+        self.horizon_sec = int(metadata["horizon_sec"])
         if self.schema_version != 1:
             raise ValueError(f"Unsupported DeepLOB schema version: {self.schema_version}")
         if self.feature_width != self.levels * 6:
             raise ValueError("DeepLOB feature width does not match configured depth levels")
+        if self.horizon_sec not in {300, 600}:
+            raise ValueError("DeepLOB horizon must be either 300 or 600 seconds")
+        if self.sample_interval_ms <= 0:
+            raise ValueError("DeepLOB sample interval must be positive")
 
     def predict(self, sequence: list[list[float]]) -> DeepLobPrediction:
         if len(sequence) != self.sequence_length:

@@ -1,8 +1,8 @@
 # EC2 and DeepLOB foundation
 
 This deployment keeps the existing trading services unchanged. The new
-`deeplob-recorder` service records NIFTY and BANKNIFTY nearest-future 200-level
-books, writes bounded Parquet/Zstandard chunks, and uploads them to S3.
+`deeplob-recorder` records only the NIFTY nearest-future 200-level book, writes
+bounded Parquet/Zstandard chunks, and uploads them to S3.
 
 ## AWS resources
 
@@ -54,6 +54,10 @@ Every Parquet row is a causally received composite book:
 - 200 bid prices, quantities, and order counts;
 - 200 ask prices, quantities, and order counts.
 
+The default sampler retains one complete 200-level snapshot every 250 ms. Raw
+packet count, sampled-out count, queue drops, and written rows remain separate
+health metrics. Training and inference refuse a mismatched sampling interval.
+
 Files are partitioned by UTC date, instrument, and hour. A SHA-256 sidecar is
 written and uploaded for corruption checks. Queue overflow is visible as
 `DEEPLOB_RECORDER_HEALTH dropped=...`; any non-zero value invalidates that
@@ -65,7 +69,8 @@ Live training is prohibited. After at least 60 clean sessions:
 
 1. download a fixed date range from S3;
 2. split chronologically by complete trading days;
-3. train with `scripts/train_deeplob.py`;
+3. train separate 5-minute and 10-minute artifacts with
+   `scripts/train_deeplob.py --horizon-sec 300` and `--horizon-sec 600`;
 4. compare against flat, last-move, and imbalance baselines;
 5. replay with latency, spread, slippage, and fees;
 6. publish the TorchScript file and matching JSON metadata as one immutable
@@ -75,10 +80,12 @@ Live training is prohibited. After at least 60 clean sessions:
 The model loader refuses missing or malformed metadata. No DeepLOB component is
 connected to broker order placement in this foundation.
 
-`deeplob-inference` subscribes to the selected future books, maintains a
+`deeplob-inference` subscribes to the selected NIFTY future book, maintains a
 bounded queue, rejects stale snapshots, and logs `DEEPLOB_PAPER_PREDICTION`.
-It emits `DOWN`, `UP`, or `NO_TRADE` observations only. It has no paper-broker
-or live-broker dependency, so it cannot place an order.
+It maps a qualified `UP` observation to paper action `BUY_CE` and `DOWN` to
+`BUY_PE`; otherwise it emits `NO_TRADE`. CE and PE books are not recorded or
+used as model inputs. The service has no paper-broker or live-broker dependency,
+so it cannot place an order.
 
 ## Safe migration order
 

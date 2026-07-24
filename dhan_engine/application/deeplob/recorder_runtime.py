@@ -24,10 +24,10 @@ class DeepLobRecorderRuntimeSettings:
         token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
         if not client_id or not token:
             raise RuntimeError("Missing DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN")
-        raw = os.getenv("DEEPLOB_INDEXES", "NIFTY,BANKNIFTY")
+        raw = os.getenv("DEEPLOB_INDEXES", "NIFTY")
         indexes = tuple(dict.fromkeys(x.strip().upper() for x in raw.split(",") if x.strip()))
-        if not indexes or len(indexes) > 5:
-            raise ValueError("DEEPLOB_INDEXES must contain between one and five indexes")
+        if indexes != ("NIFTY",):
+            raise ValueError("The DeepLOB recorder is intentionally restricted to DEEPLOB_INDEXES=NIFTY")
         return cls(
             client_id=client_id,
             access_token=token,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,7 +16,10 @@ def parse_args():
     parser.add_argument("--output", required=True, help="Artifact output directory")
     parser.add_argument("--levels", type=int, default=200)
     parser.add_argument("--sequence-length", type=int, default=100)
-    parser.add_argument("--horizon-events", type=int, default=40)
+    parser.add_argument("--sample-interval-ms", type=int, default=250)
+    parser.add_argument("--sample-tolerance-ms", type=int, default=100)
+    parser.add_argument("--horizon-sec", type=int, choices=(300, 600), default=300)
+    parser.add_argument("--label-smoothing-sec", type=int, default=10)
     parser.add_argument("--flat-bps", type=float, default=0.5)
     parser.add_argument("--epochs", type=int, default=10)
     return parser.parse_args()
@@ -34,7 +39,7 @@ def main() -> None:
     table = ds.dataset(args.input, format="parquet", partitioning="hive").to_table()
     rows = table.to_pylist()
     rows.sort(key=lambda row: (row["instrument"], row["received_ns"]))
-    feature_rows, mids, instruments, session_dates = [], [], [], []
+    feature_rows, mids, instruments, session_dates, feature_timestamps = [], [], [], [], []
     for row in rows:
         bid = np.asarray(row["bid_price"][: args.levels], dtype=np.float32)
         ask = np.asarray(row["ask_price"][: args.levels], dtype=np.float32)
@@ -55,23 +60,54 @@ def main() -> None:
         feature_rows.append(features)
         mids.append(mid)
         instruments.append(row["instrument"])
+        feature_timestamps.append(int(row["received_ns"]))
         session_dates.append(
             datetime.fromtimestamp(row["received_ns"] / 1_000_000_000, tz=timezone.utc).date().isoformat()
         )
 
+    groups = defaultdict(list)
+    for index, (instrument, session_date) in enumerate(zip(instruments, session_dates)):
+        groups[(instrument, session_date)].append(index)
+    observed_intervals_ms = []
+    for indices in groups.values():
+        observed_intervals_ms.extend(
+            (feature_timestamps[right] - feature_timestamps[left]) / 1_000_000
+            for left, right in zip(indices, indices[1:])
+            if feature_timestamps[right] > feature_timestamps[left]
+        )
+    if not observed_intervals_ms:
+        raise SystemExit("No consecutive snapshots are available to validate sampling")
+    observed_sample_interval_ms = float(np.median(observed_intervals_ms))
+    if abs(observed_sample_interval_ms - args.sample_interval_ms) > args.sample_tolerance_ms:
+        raise SystemExit(
+            "Observed sample interval "
+            f"{observed_sample_interval_ms:.1f}ms does not match expected "
+            f"{args.sample_interval_ms}ms"
+        )
+
     x, y, sample_dates = [], [], []
-    end = len(feature_rows) - args.horizon_events
-    for index in range(args.sequence_length - 1, end):
-        start = index - args.sequence_length + 1
-        if instruments[start] != instruments[index + args.horizon_events]:
-            continue
-        if session_dates[start] != session_dates[index + args.horizon_events]:
-            continue
-        future_bps = (mids[index + args.horizon_events] / mids[index] - 1.0) * 10_000
-        label = 2 if future_bps > args.flat_bps else 0 if future_bps < -args.flat_bps else 1
-        x.append(feature_rows[start : index + 1])
-        y.append(label)
-        sample_dates.append(session_dates[index])
+    horizon_ns = args.horizon_sec * 1_000_000_000
+    smoothing_ns = max(0, args.label_smoothing_sec) * 1_000_000_000
+    for (_, session_date), indices in groups.items():
+        timestamps = [feature_timestamps[index] for index in indices]
+        for local_index in range(args.sequence_length - 1, len(indices)):
+            target_ns = timestamps[local_index] + horizon_ns
+            target_local = bisect_left(timestamps, target_ns, lo=local_index + 1)
+            if target_local >= len(indices):
+                break
+            smoothing_end = bisect_right(
+                timestamps,
+                target_ns + smoothing_ns,
+                lo=target_local,
+            )
+            future_mid = float(np.mean([mids[indices[i]] for i in range(target_local, smoothing_end)]))
+            current_index = indices[local_index]
+            future_bps = (future_mid / mids[current_index] - 1.0) * 10_000
+            label = 2 if future_bps > args.flat_bps else 0 if future_bps < -args.flat_bps else 1
+            start_local = local_index - args.sequence_length + 1
+            x.append([feature_rows[indices[i]] for i in range(start_local, local_index + 1)])
+            y.append(label)
+            sample_dates.append(session_date)
     if len(x) < 1000:
         raise SystemExit(f"Only {len(x)} sequences available; collect more data before training")
     dates = sorted(set(sample_dates))
@@ -132,7 +168,10 @@ def main() -> None:
         "levels": args.levels,
         "feature_width": args.levels * 6,
         "sequence_length": args.sequence_length,
-        "horizon_events": args.horizon_events,
+        "sample_interval_ms": args.sample_interval_ms,
+        "observed_sample_interval_ms": observed_sample_interval_ms,
+        "horizon_sec": args.horizon_sec,
+        "label_smoothing_sec": args.label_smoothing_sec,
         "flat_bps": args.flat_bps,
         "classes": ["DOWN", "FLAT", "UP"],
         "validation_accuracy": accuracy,

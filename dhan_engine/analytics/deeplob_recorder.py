@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 class DepthRecorderSettings:
     output_dir: str = "data/deeplob"
     levels: int = 200
+    sample_interval_ms: int = 250
     queue_size: int = 4096
     rows_per_file: int = 2000
     flush_sec: float = 30.0
@@ -32,6 +33,7 @@ class DepthRecorderSettings:
         return cls(
             output_dir=os.getenv("DEEPLOB_OUTPUT_DIR", "data/deeplob").strip(),
             levels=max(1, min(200, int(os.getenv("DEEPLOB_LEVELS", "200")))),
+            sample_interval_ms=max(0, int(os.getenv("DEEPLOB_SAMPLE_INTERVAL_MS", "250"))),
             queue_size=max(128, int(os.getenv("DEEPLOB_QUEUE_SIZE", "4096"))),
             rows_per_file=max(100, int(os.getenv("DEEPLOB_ROWS_PER_FILE", "2000"))),
             flush_sec=max(1.0, float(os.getenv("DEEPLOB_FLUSH_SEC", "30"))),
@@ -52,11 +54,13 @@ class ParquetDepthRecorder:
         self._rows: Dict[str, list[dict]] = {}
         self._last_flush = time.monotonic()
         self._received = 0
+        self._sampled_out = 0
         self._written = 0
         self._dropped = 0
         self._uploaded = 0
         self._failures = 0
         self._last_health = 0.0
+        self._last_sample_mono: Dict[str, float] = {}
         self._s3_client = None
         Path(settings.output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -65,9 +69,10 @@ class ParquetDepthRecorder:
         if not self._thread.is_alive():
             self._thread.start()
         logger.info(
-            "DEEPLOB_RECORDER_ACTIVE | levels=%s | queue_max=%s | rows_per_file=%s | "
+            "DEEPLOB_RECORDER_ACTIVE | levels=%s | sample_interval_ms=%s | queue_max=%s | rows_per_file=%s | "
             "flush_sec=%.1f | output=%s | s3=%s",
             self.settings.levels,
+            self.settings.sample_interval_ms,
             self.settings.queue_size,
             self.settings.rows_per_file,
             self.settings.flush_sec,
@@ -77,6 +82,13 @@ class ParquetDepthRecorder:
 
     def record(self, instrument: str, snapshot: BookSnapshot) -> None:
         self._received += 1
+        interval_sec = self.settings.sample_interval_ms / 1000.0
+        previous_sample = self._last_sample_mono.get(instrument, float("-inf"))
+        if interval_sec and snapshot.received_mono - previous_sample < interval_sec:
+            self._sampled_out += 1
+            self._log_health()
+            return
+        self._last_sample_mono[instrument] = snapshot.received_mono
         if snapshot.name != instrument:
             snapshot = BookSnapshot(
                 snapshot.security_id,
@@ -124,6 +136,10 @@ class ParquetDepthRecorder:
             "received_ns": int(snapshot.received_ts * 1_000_000_000),
             "security_id": snapshot.security_id,
             "instrument": snapshot.name,
+            "best_bid": float(snapshot.bids[0].price),
+            "best_ask": float(snapshot.asks[0].price),
+            "mid_price": float((snapshot.bids[0].price + snapshot.asks[0].price) / 2.0),
+            "spread": float(snapshot.asks[0].price - snapshot.bids[0].price),
             "bid_price": column(snapshot.bids, "price", float),
             "bid_qty": column(snapshot.bids, "qty", int),
             "bid_orders": column(snapshot.bids, "orders", int),
@@ -248,9 +264,10 @@ class ParquetDepthRecorder:
             return
         self._last_health = now
         logger.info(
-            "DEEPLOB_RECORDER_HEALTH | received=%s | written=%s | dropped=%s | "
+            "DEEPLOB_RECORDER_HEALTH | received=%s | sampled_out=%s | written=%s | dropped=%s | "
             "queue=%s/%s | uploads=%s | failures=%s",
             self._received,
+            self._sampled_out,
             self._written,
             self._dropped,
             self._queue.qsize(),

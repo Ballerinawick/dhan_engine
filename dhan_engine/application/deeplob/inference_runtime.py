@@ -8,7 +8,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
-from dhan_engine.domain.market.deeplob_model import DeepLobArtifact, encode_book
+from dhan_engine.domain.market.deeplob_model import DeepLobArtifact, encode_book, paper_option_action
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,7 @@ class DeepLobInferenceSettings:
     metadata_path: str
     confidence_threshold: float
     stale_after_sec: float
+    sample_interval_ms: int
     log_interval_sec: float
     queue_size: int
 
@@ -35,12 +36,12 @@ class DeepLobInferenceSettings:
         indexes = tuple(
             dict.fromkeys(
                 value.strip().upper()
-                for value in os.getenv("DEEPLOB_INDEXES", "NIFTY,BANKNIFTY").split(",")
+                for value in os.getenv("DEEPLOB_INDEXES", "NIFTY").split(",")
                 if value.strip()
             )
         )
-        if not indexes or len(indexes) > 5:
-            raise ValueError("DEEPLOB_INDEXES must contain between one and five indexes")
+        if indexes != ("NIFTY",):
+            raise ValueError("DeepLOB inference is intentionally restricted to DEEPLOB_INDEXES=NIFTY")
         return cls(
             client_id=client_id,
             access_token=token,
@@ -52,6 +53,7 @@ class DeepLobInferenceSettings:
                 0.0, min(1.0, float(os.getenv("DEEPLOB_CONFIDENCE_THRESHOLD", "0.65")))
             ),
             stale_after_sec=max(0.1, float(os.getenv("DEEPLOB_STALE_AFTER_SEC", "1.5"))),
+            sample_interval_ms=max(0, int(os.getenv("DEEPLOB_SAMPLE_INTERVAL_MS", "250"))),
             log_interval_sec=max(0.1, float(os.getenv("DEEPLOB_LOG_INTERVAL_SEC", "1.0"))),
             queue_size=max(8, int(os.getenv("DEEPLOB_INFERENCE_QUEUE_SIZE", "64"))),
         )
@@ -70,12 +72,19 @@ class DeepLobPaperInferenceRuntime:
         self._worker = threading.Thread(target=self._infer_loop, name="DeepLOBInference", daemon=True)
         self._sequences = defaultdict(lambda: deque(maxlen=artifact.sequence_length))
         self._last_log = defaultdict(float)
+        self._last_sample = defaultdict(lambda: float("-inf"))
         self._received = 0
+        self._sampled_out = 0
         self._dropped = 0
         self._predictions = 0
 
     def on_book(self, tag, snapshot) -> None:
         self._received += 1
+        interval_sec = self.settings.sample_interval_ms / 1000.0
+        if interval_sec and snapshot.received_mono - self._last_sample[tag] < interval_sec:
+            self._sampled_out += 1
+            return
+        self._last_sample[tag] = snapshot.received_mono
         try:
             self._queue.put_nowait((tag, snapshot))
         except queue.Full:
@@ -108,9 +117,10 @@ class DeepLobPaperInferenceRuntime:
             while True:
                 time.sleep(10)
                 logger.info(
-                    "DEEPLOB_INFERENCE_HEALTH | received=%s | predictions=%s | dropped=%s | "
+                    "DEEPLOB_INFERENCE_HEALTH | received=%s | sampled_out=%s | predictions=%s | dropped=%s | "
                     "queue=%s/%s | worker_alive=%s",
                     self._received,
+                    self._sampled_out,
                     self._predictions,
                     self._dropped,
                     self._queue.qsize(),
@@ -154,18 +164,21 @@ class DeepLobPaperInferenceRuntime:
                     prediction.probability_flat,
                     prediction.probability_up,
                 )
-                observation = (
-                    prediction.direction
-                    if prediction.direction != "FLAT"
-                    and confidence >= self.settings.confidence_threshold
-                    else "NO_TRADE"
+                paper_action = paper_option_action(
+                    prediction.direction,
+                    confidence,
+                    self.settings.confidence_threshold,
                 )
+                observation = prediction.direction if paper_action != "NO_TRADE" else "NO_TRADE"
                 logger.info(
-                    "DEEPLOB_PAPER_PREDICTION | instrument=%s | observation=%s | "
+                    "DEEPLOB_PAPER_PREDICTION | instrument=%s | observation=%s | paper_action=%s | "
+                    "horizon_sec=%s | "
                     "down=%.4f | flat=%.4f | up=%.4f | confidence=%.4f | model=%s | "
                     "snapshot_age_ms=%.1f | orders=false",
                     tag,
                     observation,
+                    paper_action,
+                    self.artifact.horizon_sec,
                     prediction.probability_down,
                     prediction.probability_flat,
                     prediction.probability_up,
@@ -184,6 +197,11 @@ def build_deeplob_inference_runtime(settings: DeepLobInferenceSettings):
     if not settings.model_path or not settings.metadata_path:
         raise RuntimeError("DEEPLOB_MODEL_PATH and DEEPLOB_METADATA_PATH are required")
     artifact = DeepLobArtifact(settings.model_path, settings.metadata_path)
+    if artifact.sample_interval_ms != settings.sample_interval_ms:
+        raise RuntimeError(
+            "DEEPLOB_SAMPLE_INTERVAL_MS must match the model metadata "
+            f"({artifact.sample_interval_ms}ms)"
+        )
     master = InstrumentMaster(settings.csv_file, debug=False)
     runtime = None
     adapter = FullDepth200Adapter(
