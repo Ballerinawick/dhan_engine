@@ -1,3 +1,6 @@
+Exit code: 0
+Wall time: 12.1 seconds
+Output:
 """Offline DeepLOB-style trainer. Never run this inside the live trading service."""
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ def parse_args():
     parser.add_argument("--sequence-length", type=int, default=100)
     parser.add_argument("--sample-interval-ms", type=int, default=250)
     parser.add_argument("--sample-tolerance-ms", type=int, default=100)
-    parser.add_argument("--horizon-sec", type=int, choices=(300, 600), default=300)
+    parser.add_argument("--horizon-sec", type=int, choices=(600, 900), default=600)
     parser.add_argument("--label-smoothing-sec", type=int, default=10)
     parser.add_argument("--flat-bps", type=float, default=0.5)
     parser.add_argument("--epochs", type=int, default=10)
