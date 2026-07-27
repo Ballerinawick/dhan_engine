@@ -1,3 +1,6 @@
+Exit code: 0
+Wall time: 7.3 seconds
+Output:
 from __future__ import annotations
 
 import json
@@ -89,8 +92,8 @@ class DeepLobArtifact:
             raise ValueError(f"Unsupported DeepLOB schema version: {self.schema_version}")
         if self.feature_width != self.levels * 6:
             raise ValueError("DeepLOB feature width does not match configured depth levels")
-        if self.horizon_sec not in {300, 600}:
-            raise ValueError("DeepLOB horizon must be either 300 or 600 seconds")
+        if self.horizon_sec not in {600, 900}:
+            raise ValueError("DeepLOB horizon must be either 600 or 900 seconds")
         if self.sample_interval_ms <= 0:
             raise ValueError("DeepLOB sample interval must be positive")
 
@@ -110,3 +113,4 @@ class DeepLobArtifact:
             probability_up=float(probabilities[2]),
             model_version=self.version,
         )
+

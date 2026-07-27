@@ -1,6 +1,10 @@
+Exit code: 0
+Wall time: 7 seconds
+Output:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -9,6 +13,11 @@ from dhan_engine.analytics.deeplob_recorder import DepthRecorderSettings, Parque
 from dhan_engine.application.deeplob.inference_runtime import (
     DeepLobInferenceSettings,
     DeepLobPaperInferenceRuntime,
+)
+from dhan_engine.domain.market.market_by_price_execution import (
+    CompositeMarketSnapshot,
+    derive_market_by_price_features,
+    validate_composite_snapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +56,12 @@ class DeepLobLiveRuntime:
         self._quote_lock = threading.Lock()
         self._latest_fullquote = {}
         self._fullquote_received = 0
+        self._previous_book = {}
+        self._quality_rejections = {}
+        self._max_quote_age_ms = float(os.getenv("DEEPLOB_MAX_FULLQUOTE_AGE_MS", "1500"))
+        self._max_spread_bps = float(os.getenv("DEEPLOB_MAX_FUTURE_SPREAD_BPS", "25"))
+        self._probe_quantity = max(1, int(os.getenv("DEEPLOB_EXECUTION_PROBE_QTY", "65")))
+        self._last_quality_log = {}
 
     @staticmethod
     def _pick(raw, *names, default=0):
@@ -88,6 +103,12 @@ class DeepLobLiveRuntime:
                 0.0,
                 (snapshot.received_ts - latest_quote["received_ts"]) * 1000.0,
             )
+        valid, quality_reason, quote_age_ms = validate_composite_snapshot(
+            snapshot,
+            latest_quote,
+            max_quote_age_ms=self._max_quote_age_ms,
+            max_spread_bps=self._max_spread_bps,
+        )
         try:
             self.recorder.record(
                 tag,
@@ -98,8 +119,33 @@ class DeepLobLiveRuntime:
         except Exception:
             self._recorder_dispatch_failures += 1
             logger.exception("DEEPLOB_LIVE_RECORDER_DISPATCH_FAILED | instrument=%s", tag)
+        if not valid:
+            self._quality_rejections[quality_reason] = self._quality_rejections.get(quality_reason, 0) + 1
+            now = time.monotonic()
+            if now - self._last_quality_log.get(tag, 0.0) >= 1.0:
+                self._last_quality_log[tag] = now
+                logger.warning(
+                    "DEEPLOB_COMPOSITE_REJECTED | instrument=%s | reason=%s | "
+                    "quote_age_ms=%s | inference_blocked=true | recorder_continues=true",
+                    tag,
+                    quality_reason,
+                    f"{quote_age_ms:.1f}" if quote_age_ms != float("inf") else "NA",
+                )
+            return
+        features = derive_market_by_price_features(
+            snapshot,
+            self._previous_book.get(tag),
+            probe_quantity=self._probe_quantity,
+        )
+        self._previous_book[tag] = snapshot
+        composite = CompositeMarketSnapshot(
+            book=snapshot,
+            full_quote=latest_quote,
+            quote_age_ms=quote_age_ms,
+            features=features,
+        )
         try:
-            self.inference.on_book(tag, snapshot)
+            self.inference.on_book(tag, snapshot, composite)
         except Exception:
             self._inference_dispatch_failures += 1
             logger.exception("DEEPLOB_LIVE_INFERENCE_DISPATCH_FAILED | instrument=%s", tag)
@@ -155,13 +201,14 @@ class DeepLobLiveRuntime:
                     "DEEPLOB_LIVE_PIPELINE_HEALTH | received=%s | recorder_dispatch_failures=%s | "
                     "inference_dispatch_failures=%s | fullquote_received=%s | "
                     "recorder_worker_alive=%s | "
-                    "inference_worker_alive=%s",
+                    "inference_worker_alive=%s | quality_rejections=%s",
                     self._received,
                     self._recorder_dispatch_failures,
                     self._inference_dispatch_failures,
                     self._fullquote_received,
                     self.recorder.worker_alive,
                     self.inference.worker_alive,
+                    self._quality_rejections,
                 )
                 self.recorder.log_health()
                 self.inference.log_health()

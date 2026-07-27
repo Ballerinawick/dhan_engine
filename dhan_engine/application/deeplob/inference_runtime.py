@@ -1,3 +1,6 @@
+Exit code: 0
+Wall time: 7.3 seconds
+Output:
 from __future__ import annotations
 
 import logging
@@ -9,6 +12,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from dhan_engine.domain.market.deeplob_model import DeepLobArtifact, encode_book, paper_option_action
+from dhan_engine.domain.market.market_by_price_execution import CompositeMarketSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +83,7 @@ class DeepLobPaperInferenceRuntime:
         self._predictions = 0
         self._stale = 0
 
-    def on_book(self, tag, snapshot) -> None:
+    def on_book(self, tag, snapshot, composite: CompositeMarketSnapshot | None = None) -> None:
         self._received += 1
         interval_sec = self.settings.sample_interval_ms / 1000.0
         if interval_sec and snapshot.received_mono - self._last_sample[tag] < interval_sec:
@@ -87,7 +91,7 @@ class DeepLobPaperInferenceRuntime:
             return
         self._last_sample[tag] = snapshot.received_mono
         try:
-            self._queue.put_nowait((tag, snapshot))
+            self._queue.put_nowait((tag, snapshot, composite))
         except queue.Full:
             self._dropped += 1
 
@@ -160,7 +164,7 @@ class DeepLobPaperInferenceRuntime:
     def _infer_loop(self) -> None:
         while not self._stop.is_set() or not self._queue.empty():
             try:
-                tag, snapshot = self._queue.get(timeout=0.5)
+                tag, snapshot, composite = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             age_sec = time.monotonic() - snapshot.received_mono
@@ -198,7 +202,8 @@ class DeepLobPaperInferenceRuntime:
                     "DEEPLOB_PAPER_PREDICTION | instrument=%s | observation=%s | paper_action=%s | "
                     "horizon_sec=%s | "
                     "down=%.4f | flat=%.4f | up=%.4f | confidence=%.4f | model=%s | "
-                    "snapshot_age_ms=%.1f | orders=false",
+                    "snapshot_age_ms=%.1f | quote_age_ms=%s | pressure_score=%s | "
+                    "buy_slippage_bps=%s | sell_slippage_bps=%s | orders=false",
                     tag,
                     observation,
                     paper_action,
@@ -209,6 +214,10 @@ class DeepLobPaperInferenceRuntime:
                     confidence,
                     prediction.model_version,
                     age_sec * 1000,
+                    f"{composite.quote_age_ms:.1f}" if composite else "NA",
+                    f"{composite.features.pressure_score:.4f}" if composite else "NA",
+                    f"{composite.features.buy_slippage_bps:.3f}" if composite else "NA",
+                    f"{composite.features.sell_slippage_bps:.3f}" if composite else "NA",
                 )
             except Exception:
                 logger.exception("DEEPLOB_INFERENCE_FAILED | instrument=%s", tag)
