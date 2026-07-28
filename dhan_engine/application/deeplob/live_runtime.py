@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 7 seconds
-Output:
 from __future__ import annotations
 
 import logging
@@ -13,6 +10,14 @@ from dhan_engine.analytics.deeplob_recorder import DepthRecorderSettings, Parque
 from dhan_engine.application.deeplob.inference_runtime import (
     DeepLobInferenceSettings,
     DeepLobPaperInferenceRuntime,
+)
+from dhan_engine.application.deeplob.option_paper_executor import (
+    DeepLobOptionPaperExecutor,
+    DeepLobOptionPaperSettings,
+)
+from dhan_engine.application.deeplob.trade_summary_s3 import (
+    TradeSummaryS3Settings,
+    TradeSummaryS3Sink,
 )
 from dhan_engine.domain.market.market_by_price_execution import (
     CompositeMarketSnapshot,
@@ -42,13 +47,27 @@ class DeepLobLiveSettings:
 class DeepLobLiveRuntime:
     """Fans one NIFTY 200-depth feed into isolated recorder and inference workers."""
 
-    def __init__(self, settings, master, depth_adapter, fullquote_feed, recorder, inference):
+    def __init__(
+        self,
+        settings,
+        master,
+        depth_adapter,
+        fullquote_feed,
+        recorder,
+        inference,
+        option_paper=None,
+        option_selection=None,
+        trade_summary_sink=None,
+    ):
         self.settings = settings
         self.master = master
         self.depth_adapter = depth_adapter
         self.fullquote_feed = fullquote_feed
         self.recorder = recorder
         self.inference = inference
+        self.option_paper = option_paper
+        self.option_selection = option_selection or {}
+        self.trade_summary_sink = trade_summary_sink
         self.instrument_metadata = {}
         self._received = 0
         self._recorder_dispatch_failures = 0
@@ -88,10 +107,21 @@ class DeepLobLiveRuntime:
             "total_sell_qty": self._pick(raw, "total_sell_quantity", "total_sell_qty"),
             "received_ns": int(received_ts * 1_000_000_000),
             "received_ts": received_ts,
+            "best_bid": float(depth.bid_price[0]) if depth.bid_price else 0.0,
+            "best_ask": float(depth.ask_price[0]) if depth.ask_price else 0.0,
         }
         with self._quote_lock:
             self._latest_fullquote[int(secid)] = quote
             self._fullquote_received += 1
+        if self.option_paper is not None:
+            self.option_paper.on_quote(
+                int(secid),
+                tag,
+                float(ltp),
+                bid=quote["best_bid"],
+                ask=quote["best_ask"],
+                received_ts=received_ts,
+            )
 
     def on_book(self, tag, snapshot) -> None:
         self._received += 1
@@ -173,6 +203,8 @@ class DeepLobLiveRuntime:
 
         self.recorder.start()
         self.inference.start_worker()
+        if self.trade_summary_sink is not None:
+            self.trade_summary_sink.start()
         self.fullquote_feed.subscribe_full(
             [
                 {
@@ -183,6 +215,10 @@ class DeepLobLiveRuntime:
                 for segment, secid, tag in instruments
             ]
         )
+        if self.option_paper is not None:
+            self.fullquote_feed.subscribe_full(
+                self.option_paper.register_contracts(self.option_selection)
+            )
         self.fullquote_feed.connect()
         self.depth_adapter.subscribe(instruments)
         logger.info(
@@ -210,6 +246,19 @@ class DeepLobLiveRuntime:
                     self.inference.worker_alive,
                     self._quality_rejections,
                 )
+                if self.option_paper is not None:
+                    self.option_paper.heartbeat()
+                    logger.info(
+                        "DEEPLOB_OPTION_PAPER_HEALTH | state=%s",
+                        {
+                            **self.option_paper.health(),
+                            "trade_summary_s3": (
+                                self.trade_summary_sink.health()
+                                if self.trade_summary_sink is not None
+                                else None
+                            ),
+                        },
+                    )
                 self.recorder.log_health()
                 self.inference.log_health()
         except KeyboardInterrupt:
@@ -219,6 +268,8 @@ class DeepLobLiveRuntime:
             self.fullquote_feed.close()
             self.inference.close_worker()
             self.recorder.close()
+            if self.trade_summary_sink is not None:
+                self.trade_summary_sink.close()
 
 
 def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRuntime:
@@ -226,6 +277,8 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
     from dhan_engine.infrastructure.dhan.full_depth_200_adapter import FullDepth200Adapter
     from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
     from dhan_engine.infrastructure.dhan.marketfeed_ws import DhanLiveMarketFeedWS
+    from dhan_engine.infrastructure.dhan.option_chain_selector import OptionChainSelector
+    from dhan_engine.simulations.paper_trade_manager import PaperTradeManager
 
     inference_settings = settings.inference
     if not inference_settings.model_path or not inference_settings.metadata_path:
@@ -242,6 +295,33 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
 
     master = InstrumentMaster(inference_settings.csv_file, debug=False)
     recorder = ParquetDepthRecorder(settings.recorder)
+    option_paper_settings = DeepLobOptionPaperSettings.from_env()
+    option_selection = {}
+    option_paper = None
+    trade_summary_sink = None
+    if option_paper_settings.enabled:
+        selector = OptionChainSelector(
+            access_token=inference_settings.access_token,
+            client_id=inference_settings.client_id,
+            instrument_master=master,
+            strike_step_map={"NIFTY": 50},
+            mode=2,
+            max_steps_each_side=10,
+            debug=False,
+        )
+        option_selection = selector.select_best("NIFTY") or {}
+        if not option_selection.get("CE") or not option_selection.get("PE"):
+            raise RuntimeError(
+                "DeepLOB option paper mode requires one executable NIFTY CE and PE selection"
+            )
+        trade_summary_sink = TradeSummaryS3Sink(
+            TradeSummaryS3Settings.from_env()
+        )
+        option_paper = DeepLobOptionPaperExecutor(
+            option_paper_settings,
+            PaperTradeManager(capital=option_paper_settings.capital),
+            trade_summary_sink=trade_summary_sink,
+        )
     runtime = None
     adapter = FullDepth200Adapter(
         inference_settings.client_id,
@@ -264,6 +344,7 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
         master,
         adapter,
         artifact,
+        prediction_sink=option_paper.on_prediction if option_paper else None,
     )
     runtime = DeepLobLiveRuntime(
         settings,
@@ -272,6 +353,9 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
         fullquote_feed,
         recorder,
         inference,
+        option_paper,
+        option_selection,
+        trade_summary_sink,
     )
     return runtime
 

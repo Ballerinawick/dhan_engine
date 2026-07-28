@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 7.3 seconds
-Output:
 from __future__ import annotations
 
 import logging
@@ -66,11 +63,12 @@ class DeepLobInferenceSettings:
 class DeepLobPaperInferenceRuntime:
     """Runs versioned depth inference and logs observations; it cannot place orders."""
 
-    def __init__(self, settings, master, depth_adapter, artifact):
+    def __init__(self, settings, master, depth_adapter, artifact, prediction_sink=None):
         self.settings = settings
         self.master = master
         self.depth_adapter = depth_adapter
         self.artifact = artifact
+        self.prediction_sink = prediction_sink
         self._queue = queue.Queue(maxsize=settings.queue_size)
         self._stop = threading.Event()
         self._worker = threading.Thread(target=self._infer_loop, name="DeepLOBInference", daemon=True)
@@ -197,6 +195,17 @@ class DeepLobPaperInferenceRuntime:
                     confidence,
                     self.settings.confidence_threshold,
                 )
+                if self.prediction_sink is not None:
+                    self.prediction_sink(
+                        paper_action=paper_action,
+                        confidence=confidence,
+                        composite=composite,
+                        probability_down=prediction.probability_down,
+                        probability_flat=prediction.probability_flat,
+                        probability_up=prediction.probability_up,
+                        model_version=prediction.model_version,
+                        horizon_sec=self.artifact.horizon_sec,
+                    )
                 observation = prediction.direction if paper_action != "NO_TRADE" else "NO_TRADE"
                 logger.info(
                     "DEEPLOB_PAPER_PREDICTION | instrument=%s | observation=%s | paper_action=%s | "
