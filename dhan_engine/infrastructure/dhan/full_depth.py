@@ -43,6 +43,10 @@ class FullDepth:
         self._connection_seq = 0
         self._connection_id = ""
         self._last_queue_health_ts = 0.0
+        self._queue_health_interval_sec = max(
+            1.0,
+            float(os.getenv("DEPTH_QUEUE_HEALTH_INTERVAL_SEC", "10") or 10),
+        )
         self._queue_high_watermark = 0
         self._dropped_payload_count = 0
 
@@ -321,7 +325,7 @@ class FullDepth:
         if queue_size > self._queue_high_watermark:
             self._queue_high_watermark = queue_size
         now = time.time()
-        if now - self._last_queue_health_ts >= 1.0:
+        if now - self._last_queue_health_ts >= self._queue_health_interval_sec:
             self._last_queue_health_ts = now
             print(
                 "QUEUE_HEALTH | feed=DEPTH | "
@@ -443,3 +447,4 @@ class FullDepth:
             "levels": levels,
             "level_count": len(levels),
         }
+
