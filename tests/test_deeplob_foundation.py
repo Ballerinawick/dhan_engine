@@ -91,6 +91,24 @@ class DeepLobFoundationTest(unittest.TestCase):
             self.assertEqual(recorder._queue.qsize(), 1)
             self.assertEqual(recorder._sampled_out, 1)
 
+    def test_recorder_drops_empty_book_before_worker_encoding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = ParquetDepthRecorder(
+                DepthRecorderSettings(output_dir=directory, sample_interval_ms=0)
+            )
+            empty = BookSnapshot.build(
+                123,
+                "NIFTY_FUT",
+                [],
+                [],
+                received_ts=1_700_000_000.0,
+                received_mono=10.0,
+            )
+            recorder.record("NIFTY_FUT", empty)
+            self.assertEqual(recorder._invalid_books, 1)
+            self.assertEqual(recorder._queue.qsize(), 0)
+            self.assertEqual(recorder._failures, 0)
+
     def test_recorder_row_contains_training_partitions_and_full_depth_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             recorder = ParquetDepthRecorder(
