@@ -84,9 +84,11 @@ class ParquetDepthRecorder:
         self._sampled_out = 0
         self._written = 0
         self._dropped = 0
+        self._invalid_books = 0
         self._uploaded = 0
         self._failures = 0
         self._last_health = 0.0
+        self._last_invalid_book_log = 0.0
         self._last_sample_mono: Dict[str, float] = {}
         self._s3_client = None
         Path(settings.output_dir).mkdir(parents=True, exist_ok=True)
@@ -118,6 +120,21 @@ class ParquetDepthRecorder:
         full_quote: Optional[Mapping[str, object]] = None,
     ) -> None:
         self._received += 1
+        if not snapshot.bids or not snapshot.asks:
+            self._invalid_books += 1
+            now = time.monotonic()
+            if now - self._last_invalid_book_log >= 10.0:
+                self._last_invalid_book_log = now
+                logger.warning(
+                    "DEEPLOB_INVALID_BOOK_DROPPED | instrument=%s | secid=%s | bids=%s | asks=%s | total=%s",
+                    instrument,
+                    snapshot.security_id,
+                    len(snapshot.bids),
+                    len(snapshot.asks),
+                    self._invalid_books,
+                )
+            self._log_health()
+            return
         interval_sec = self.settings.sample_interval_ms / 1000.0
         previous_sample = self._last_sample_mono.get(instrument, float("-inf"))
         if interval_sec and snapshot.received_mono - previous_sample < interval_sec:
@@ -192,6 +209,11 @@ class ParquetDepthRecorder:
         instrument: DepthInstrument,
         full_quote: Optional[Mapping[str, object]] = None,
     ) -> dict:
+        if not snapshot.bids or not snapshot.asks:
+            raise ValueError(
+                "DeepLOB snapshot requires both sides of the book: "
+                f"bids={len(snapshot.bids)} asks={len(snapshot.asks)}"
+            )
         levels = self.settings.levels
 
         def column(rows, attr, cast):
@@ -367,12 +389,13 @@ class ParquetDepthRecorder:
             return
         self._last_health = now
         logger.info(
-            "DEEPLOB_RECORDER_HEALTH | received=%s | sampled_out=%s | written=%s | dropped=%s | "
+            "DEEPLOB_RECORDER_HEALTH | received=%s | sampled_out=%s | written=%s | dropped=%s | invalid_books=%s | "
             "queue=%s/%s | uploads=%s | failures=%s",
             self._received,
             self._sampled_out,
             self._written,
             self._dropped,
+            self._invalid_books,
             self._queue.qsize(),
             self.settings.queue_size,
             self._uploaded,

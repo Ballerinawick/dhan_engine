@@ -69,8 +69,23 @@ case "${DHAN_SERVICE}" in
     fi
     MODEL_TEMP="$(mktemp)"
     METADATA_TEMP="$(mktemp)"
-    aws s3 cp "${MODEL_S3_URI}" "${MODEL_TEMP}"
-    aws s3 cp "${METADATA_S3_URI}" "${METADATA_TEMP}"
+    require_s3_artifact() {
+      local uri="$1"
+      local label="$2"
+      local without_scheme="${uri#s3://}"
+      local bucket="${without_scheme%%/*}"
+      local key="${without_scheme#*/}"
+      if [[ -z "${bucket}" || -z "${key}" || "${bucket}" == "${key}" ]] ||
+         ! aws s3api head-object --bucket "${bucket}" --key "${key}" >/dev/null 2>&1; then
+        echo "DEEPLOB_MODEL_MISSING | artifact=${label} | uri=${uri}"
+        echo "Upload the trained, validated artifact before deploying deeplob-live."
+        exit 1
+      fi
+    }
+    require_s3_artifact "${MODEL_S3_URI}" "model"
+    require_s3_artifact "${METADATA_S3_URI}" "metadata"
+    aws s3 cp "${MODEL_S3_URI}" "${MODEL_TEMP}" --only-show-errors
+    aws s3 cp "${METADATA_S3_URI}" "${METADATA_TEMP}" --only-show-errors
     sudo install -m 0640 "${MODEL_TEMP}" "${DATA_DIR}/models/deeplob.pt"
     sudo install -m 0640 "${METADATA_TEMP}" "${DATA_DIR}/models/deeplob.json"
     echo "DEEPLOB_MODEL_DOWNLOAD_OK | service=${DHAN_SERVICE}"
