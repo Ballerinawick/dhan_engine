@@ -18,7 +18,10 @@ from dhan_engine.application.deeplob.trade_summary_s3 import (
     TradeSummaryS3Settings,
     TradeSummaryS3Sink,
 )
-from dhan_engine.application.deeplob.recorder_runtime import DeepLobRecorderRuntimeSettings
+from dhan_engine.application.deeplob.recorder_runtime import (
+    DeepLobRecorderRuntime,
+    DeepLobRecorderRuntimeSettings,
+)
 from dhan_engine.domain.market.deeplob_model import encode_book, paper_option_action
 from dhan_engine.domain.market.full_depth_microstructure import BookSnapshot
 from dhan_engine.domain.market.market_by_price_execution import (
@@ -80,6 +83,41 @@ class DeepLobFoundationTest(unittest.TestCase):
         with patch.dict("os.environ", environment, clear=True):
             with self.assertRaisesRegex(ValueError, "restricted"):
                 DeepLobRecorderRuntimeSettings.from_env()
+
+    def test_recorder_runtime_persists_only_synchronized_fullquote_and_depth(self):
+        class Recorder:
+            def __init__(self):
+                self.calls = []
+
+            def record(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        recorder = Recorder()
+        runtime = DeepLobRecorderRuntime(None, None, None, None, recorder)
+        runtime.instruments["NIFTY_FUT"] = {
+            "index": "NIFTY",
+            "symbol": "NIFTY-Jul2026-FUT",
+            "expiry": "2026-07-30",
+        }
+        book = snapshot()
+        runtime.on_book("NIFTY_FUT", book)
+        self.assertEqual(runtime._sync_rejections, 1)
+        self.assertEqual(recorder.calls, [])
+
+        runtime._latest_fullquote[book.security_id] = {
+            "ltp": 100.25,
+            "received_ts": book.received_ts,
+            "received_ns": int(book.received_ts * 1_000_000_000),
+        }
+        runtime.on_book("NIFTY_FUT", book)
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertEqual(recorder.calls[0][1]["full_quote"]["ltp"], 100.25)
+        self.assertEqual(recorder.calls[0][1]["full_quote"]["age_ms"], 0.0)
+
+        runtime._latest_fullquote[book.security_id]["received_ts"] = book.received_ts + 2.0
+        runtime.on_book("NIFTY_FUT", book)
+        self.assertEqual(runtime._sync_rejections, 2)
+        self.assertEqual(len(recorder.calls), 1)
 
     def test_recorder_sampling_retains_one_snapshot_per_interval(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -442,6 +480,15 @@ class DeepLobFoundationTest(unittest.TestCase):
         self.assertIn("trade_date=2026-07-28", uploaded["Key"])
         self.assertIn("instrument=NIFTY_CE", uploaded["Key"])
         self.assertIn(b'"net_pnl":135.0', uploaded["Body"])
+
+    def test_trade_summary_prefix_must_be_separate_from_market_data(self):
+        environment = {
+            "DEEPLOB_S3_PREFIX": "market-data/deeplob",
+            "DEEPLOB_TRADE_SUMMARY_S3_PREFIX": "market-data/deeplob/trades",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "must be separate"):
+                TradeSummaryS3Settings.from_env()
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ class TradeSummaryS3Settings:
 
     @classmethod
     def from_env(cls) -> "TradeSummaryS3Settings":
-        return cls(
+        settings = cls(
             bucket=os.getenv("DEEPLOB_S3_BUCKET", "").strip(),
             prefix=os.getenv(
                 "DEEPLOB_TRADE_SUMMARY_S3_PREFIX",
@@ -32,6 +32,12 @@ class TradeSummaryS3Settings:
                 int(os.getenv("DEEPLOB_TRADE_SUMMARY_S3_QUEUE_SIZE", "256")),
             ),
         )
+        market_prefix = os.getenv("DEEPLOB_S3_PREFIX", "market-data/deeplob").strip().strip("/")
+        if settings.prefix == market_prefix or settings.prefix.startswith(f"{market_prefix}/"):
+            raise ValueError(
+                "DEEPLOB_TRADE_SUMMARY_S3_PREFIX must be separate from DEEPLOB_S3_PREFIX"
+            )
+        return settings
 
 
 class TradeSummaryS3Sink:
