@@ -92,6 +92,16 @@ case "${DHAN_SERVICE}" in
     ;;
   deeplob-recorder|deeplob_recorder)
     # Data collection must not depend on a model that has not been trained yet.
+    RECORDER_S3_BUCKET="$(grep '^DEEPLOB_S3_BUCKET=' "${TEMP_ENV}" | cut -d= -f2-)"
+    if [[ -z "${RECORDER_S3_BUCKET}" ]]; then
+      echo "DEEPLOB_S3_BUCKET is required for ${DHAN_SERVICE}."
+      exit 1
+    fi
+    if ! aws s3api head-bucket --bucket "${RECORDER_S3_BUCKET}" >/dev/null 2>&1; then
+      echo "DEEPLOB_S3_PREFLIGHT_FAILED | bucket=${RECORDER_S3_BUCKET}"
+      exit 1
+    fi
+    echo "DEEPLOB_S3_PREFLIGHT_OK | bucket=${RECORDER_S3_BUCKET}"
     echo "DEEPLOB_MODEL_DOWNLOAD_SKIPPED | service=${DHAN_SERVICE} | reason=recorder_mode"
     ;;
   *)

@@ -129,9 +129,8 @@ class DeepLobLiveRuntime:
         with self._quote_lock:
             latest_quote = dict(self._latest_fullquote.get(snapshot.security_id, {}))
         if latest_quote:
-            latest_quote["age_ms"] = max(
-                0.0,
-                (snapshot.received_ts - latest_quote["received_ts"]) * 1000.0,
+            latest_quote["age_ms"] = abs(
+                (snapshot.received_ts - latest_quote["received_ts"]) * 1000.0
             )
         valid, quality_reason, quote_age_ms = validate_composite_snapshot(
             snapshot,
@@ -139,16 +138,18 @@ class DeepLobLiveRuntime:
             max_quote_age_ms=self._max_quote_age_ms,
             max_spread_bps=self._max_spread_bps,
         )
-        try:
-            self.recorder.record(
-                tag,
-                snapshot,
-                full_quote=latest_quote,
-                **metadata,
-            )
-        except Exception:
-            self._recorder_dispatch_failures += 1
-            logger.exception("DEEPLOB_LIVE_RECORDER_DISPATCH_FAILED | instrument=%s", tag)
+        quote_synchronized = bool(latest_quote) and quote_age_ms <= self._max_quote_age_ms
+        if quote_synchronized:
+            try:
+                self.recorder.record(
+                    tag,
+                    snapshot,
+                    full_quote=latest_quote,
+                    **metadata,
+                )
+            except Exception:
+                self._recorder_dispatch_failures += 1
+                logger.exception("DEEPLOB_LIVE_RECORDER_DISPATCH_FAILED | instrument=%s", tag)
         if not valid:
             self._quality_rejections[quality_reason] = self._quality_rejections.get(quality_reason, 0) + 1
             now = time.monotonic()

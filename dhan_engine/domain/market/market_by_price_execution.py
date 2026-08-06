@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 11 seconds
-Output:
 from __future__ import annotations
 
 import math
