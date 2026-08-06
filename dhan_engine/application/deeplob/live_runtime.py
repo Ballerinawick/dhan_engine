@@ -32,15 +32,18 @@ logger = logging.getLogger(__name__)
 class DeepLobLiveSettings:
     inference: DeepLobInferenceSettings
     recorder: DepthRecorderSettings
+    premodel_paper: bool = False
 
     @classmethod
     def from_env(cls) -> "DeepLobLiveSettings":
         recorder = DepthRecorderSettings.from_env()
         if not recorder.s3_bucket:
             raise RuntimeError("DEEPLOB_S3_BUCKET is required for DHAN_SERVICE=deeplob-live")
+        service = os.getenv("DHAN_SERVICE", "deeplob-live").strip().lower().replace("_", "-")
         return cls(
             inference=DeepLobInferenceSettings.from_env(),
             recorder=recorder,
+            premodel_paper=service == "deeplob-paper",
         )
 
 
@@ -222,14 +225,25 @@ class DeepLobLiveRuntime:
             )
         self.fullquote_feed.connect()
         self.depth_adapter.subscribe(instruments)
+        inference_version = getattr(
+            self.inference,
+            "version",
+            getattr(getattr(self.inference, "artifact", None), "version", "unknown"),
+        )
         logger.info(
             "DEEPLOB_LIVE_PIPELINE_ACTIVE | indexes=%s | depth=200 | connections=%s | "
-            "fullquote=true | recorder=true | inference=true | s3_bucket=%s | model=%s | "
-            "orders=false",
+            "fullquote=true | recorder=true | inference=true | s3_bucket=%s | "
+            "market_data_prefix=%s | paper_trade_prefix=%s | model=%s | orders=false",
             ",".join(self.settings.inference.indexes),
             len(instruments) + 1,
             self.settings.recorder.s3_bucket,
-            self.inference.artifact.version,
+            self.settings.recorder.s3_prefix,
+            (
+                self.trade_summary_sink.settings.prefix
+                if self.trade_summary_sink is not None
+                else "disabled"
+            ),
+            inference_version,
         )
         try:
             while True:
@@ -274,7 +288,6 @@ class DeepLobLiveRuntime:
 
 
 def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRuntime:
-    from dhan_engine.domain.market.deeplob_model import DeepLobArtifact
     from dhan_engine.infrastructure.dhan.full_depth_200_adapter import FullDepth200Adapter
     from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
     from dhan_engine.infrastructure.dhan.marketfeed_ws import DhanLiveMarketFeedWS
@@ -282,17 +295,6 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
     from dhan_engine.simulations.paper_trade_manager import PaperTradeManager
 
     inference_settings = settings.inference
-    if not inference_settings.model_path or not inference_settings.metadata_path:
-        raise RuntimeError("DEEPLOB_MODEL_PATH and DEEPLOB_METADATA_PATH are required")
-    artifact = DeepLobArtifact(
-        inference_settings.model_path,
-        inference_settings.metadata_path,
-    )
-    if artifact.sample_interval_ms != inference_settings.sample_interval_ms:
-        raise RuntimeError(
-            "DEEPLOB_SAMPLE_INTERVAL_MS must match the model metadata "
-            f"({artifact.sample_interval_ms}ms)"
-        )
 
     master = InstrumentMaster(inference_settings.csv_file, debug=False)
     recorder = ParquetDepthRecorder(settings.recorder)
@@ -340,13 +342,41 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
         ),
         debug=False,
     )
-    inference = DeepLobPaperInferenceRuntime(
-        inference_settings,
-        master,
-        adapter,
-        artifact,
-        prediction_sink=option_paper.on_prediction if option_paper else None,
-    )
+    if settings.premodel_paper:
+        from dhan_engine.application.deeplob.premodel_paper_runtime import (
+            MarketByPricePaperRuntime,
+            MarketByPricePaperSettings,
+        )
+
+        inference = MarketByPricePaperRuntime(
+            MarketByPricePaperSettings.from_env(),
+            prediction_sink=option_paper.on_prediction if option_paper else None,
+        )
+        logger.warning(
+            "DEEPLOB_PREMODEL_MODE | inference=MBP_HEURISTIC | trained_model=false | "
+            "paper_only=true | recorder=true"
+        )
+    else:
+        from dhan_engine.domain.market.deeplob_model import DeepLobArtifact
+
+        if not inference_settings.model_path or not inference_settings.metadata_path:
+            raise RuntimeError("DEEPLOB_MODEL_PATH and DEEPLOB_METADATA_PATH are required")
+        artifact = DeepLobArtifact(
+            inference_settings.model_path,
+            inference_settings.metadata_path,
+        )
+        if artifact.sample_interval_ms != inference_settings.sample_interval_ms:
+            raise RuntimeError(
+                "DEEPLOB_SAMPLE_INTERVAL_MS must match the model metadata "
+                f"({artifact.sample_interval_ms}ms)"
+            )
+        inference = DeepLobPaperInferenceRuntime(
+            inference_settings,
+            master,
+            adapter,
+            artifact,
+            prediction_sink=option_paper.on_prediction if option_paper else None,
+        )
     runtime = DeepLobLiveRuntime(
         settings,
         master,

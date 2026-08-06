@@ -90,8 +90,9 @@ case "${DHAN_SERVICE}" in
     sudo install -m 0640 "${METADATA_TEMP}" "${DATA_DIR}/models/deeplob.json"
     echo "DEEPLOB_MODEL_DOWNLOAD_OK | service=${DHAN_SERVICE}"
     ;;
-  deeplob-recorder|deeplob_recorder)
-    # Data collection must not depend on a model that has not been trained yet.
+  deeplob-recorder|deeplob_recorder|deeplob-paper|deeplob_paper)
+    # Data collection and pre-model paper execution must not depend on a model
+    # that has not been trained yet.
     RECORDER_S3_BUCKET="$(grep '^DEEPLOB_S3_BUCKET=' "${TEMP_ENV}" | cut -d= -f2-)"
     if [[ -z "${RECORDER_S3_BUCKET}" ]]; then
       echo "DEEPLOB_S3_BUCKET is required for ${DHAN_SERVICE}."
@@ -102,7 +103,7 @@ case "${DHAN_SERVICE}" in
       exit 1
     fi
     echo "DEEPLOB_S3_PREFLIGHT_OK | bucket=${RECORDER_S3_BUCKET}"
-    echo "DEEPLOB_MODEL_DOWNLOAD_SKIPPED | service=${DHAN_SERVICE} | reason=recorder_mode"
+    echo "DEEPLOB_MODEL_DOWNLOAD_SKIPPED | service=${DHAN_SERVICE} | reason=premodel_mode"
     ;;
   *)
     # Preserve the inference-capable image used by the existing non-DeepLOB
