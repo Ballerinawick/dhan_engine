@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import hashlib
@@ -247,6 +248,7 @@ class ParquetDepthRecorder:
             "total_sell_qty": int(quote.get("total_sell_qty", 0) or 0),
             "fullquote_received_ns": int(quote.get("received_ns", 0) or 0),
             "fullquote_age_ms": float(quote.get("age_ms", -1.0)),
+            "fullquote_synchronized": bool(quote.get("received_ns", 0)),
             "bid_price": column(snapshot.bids, "price", float),
             "bid_qty": column(snapshot.bids, "qty", int),
             "bid_orders": column(snapshot.bids, "orders", int),
@@ -401,4 +403,5 @@ class ParquetDepthRecorder:
             self._uploaded,
             self._failures,
         )
+
 
