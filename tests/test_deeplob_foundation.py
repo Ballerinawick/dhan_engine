@@ -1,4 +1,3 @@
-
 import tempfile
 import time
 import unittest
@@ -15,6 +14,7 @@ from dhan_engine.application.deeplob.live_runtime import DeepLobLiveSettings, De
 from dhan_engine.application.deeplob.option_paper_executor import (
     DeepLobOptionPaperExecutor,
     DeepLobOptionPaperSettings,
+    ParallelDeepLobOptionPaperExecutor,
 )
 from dhan_engine.application.deeplob.trade_summary_s3 import (
     TradeSummaryS3Settings,
@@ -588,6 +588,67 @@ class DeepLobFoundationTest(unittest.TestCase):
         )
         self.assertEqual(executor.health()["blocks"], 1)
 
+    def test_parallel_option_paper_profiles_are_isolated(self):
+        class Executor:
+            def __init__(self, profile):
+                self.profile = profile
+                self.contracts = {}
+                self.predictions = 0
+                self.quotes = 0
+
+            def register_contracts(self, selection):
+                self.contracts = dict(selection)
+                return [
+                    {
+                        "ExchangeSegment": "NSE_FNO",
+                        "SecurityId": "201",
+                        "tag": "NIFTY_CE",
+                    }
+                ]
+
+            def on_prediction(self, **kwargs):
+                self.predictions += 1
+
+            def on_quote(self, *args, **kwargs):
+                self.quotes += 1
+
+            def heartbeat(self):
+                return None
+
+            def health(self):
+                return {"predictions": self.predictions, "quotes": self.quotes}
+
+        dynamic = Executor("dynamic")
+        scalp = Executor("scalp")
+        parallel = ParallelDeepLobOptionPaperExecutor([dynamic, scalp])
+        subscriptions = parallel.register_contracts({"CE": {"security_id": 201}})
+        parallel.on_prediction(paper_action="BUY_CE")
+        parallel.on_quote(201, "NIFTY_CE", 100, bid=99, ask=101, received_ts=time.time())
+
+        self.assertEqual(len(subscriptions), 1)
+        self.assertEqual(dynamic.predictions, 1)
+        self.assertEqual(scalp.predictions, 1)
+        self.assertEqual(dynamic.quotes, 1)
+        self.assertEqual(scalp.quotes, 1)
+        self.assertIn("dynamic", parallel.health()["profiles"])
+        self.assertIn("scalp", parallel.health()["profiles"])
+
+    def test_scalp_settings_use_independent_environment_prefix(self):
+        environment = {
+            "DEEPLOB_OPTION_PAPER_CONFIDENCE": "0.81",
+            "DEEPLOB_SCALP_PAPER_CONFIDENCE": "0.59",
+            "DEEPLOB_SCALP_PAPER_MAX_HOLD_SEC": "75",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            dynamic = DeepLobOptionPaperSettings.from_env()
+            scalp = DeepLobOptionPaperSettings.from_env(
+                "DEEPLOB_SCALP_PAPER",
+                defaults={"CONFIDENCE": "0.60", "MAX_HOLD_SEC": "120"},
+            )
+        self.assertEqual(dynamic.confidence_threshold, 0.81)
+        self.assertEqual(scalp.confidence_threshold, 0.59)
+        self.assertEqual(scalp.max_hold_sec, 75)
+
     def test_trade_summary_s3_sink_uploads_partitioned_json(self):
         class S3:
             def __init__(self):
@@ -625,6 +686,7 @@ class DeepLobFoundationTest(unittest.TestCase):
         uploaded = client.calls[0]
         self.assertEqual(uploaded["Bucket"], "market-data")
         self.assertIn("trade_date=2026-07-28", uploaded["Key"])
+        self.assertIn("strategy=deeplob_mbp_option_paper_v1", uploaded["Key"])
         self.assertIn("instrument=NIFTY_CE", uploaded["Key"])
         self.assertIn(b'"net_pnl":135.0', uploaded["Body"])
 
@@ -640,3 +702,4 @@ class DeepLobFoundationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

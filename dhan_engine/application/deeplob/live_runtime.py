@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import logging
@@ -15,6 +14,7 @@ from dhan_engine.application.deeplob.inference_runtime import (
 from dhan_engine.application.deeplob.option_paper_executor import (
     DeepLobOptionPaperExecutor,
     DeepLobOptionPaperSettings,
+    ParallelDeepLobOptionPaperExecutor,
 )
 from dhan_engine.application.deeplob.trade_summary_s3 import (
     TradeSummaryS3Settings,
@@ -351,11 +351,30 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
     master = InstrumentMaster(inference_settings.csv_file, debug=False)
     recorder = ParquetDepthRecorder(settings.recorder)
     option_paper_settings = DeepLobOptionPaperSettings.from_env()
+    scalp_paper_settings = DeepLobOptionPaperSettings.from_env(
+        "DEEPLOB_SCALP_PAPER",
+        defaults={
+            "ENABLED": "1",
+            "CAPITAL": "500000",
+            "CONFIDENCE": "0.60",
+            "PRESSURE": "0.04",
+            "CONFIRMATIONS": "2",
+            "COOLDOWN_SEC": "20",
+            "MAX_QUOTE_AGE_SEC": "2",
+            "TAKE_PROFIT_PCT": "1.50",
+            "STOP_LOSS_PCT": "0.75",
+            "MAX_HOLD_SEC": "120",
+            "ENFORCE_MARKET_HOURS": "1",
+            "MARKET_START": "09:15",
+            "ENTRY_CUTOFF": "15:25",
+            "MARKET_END": "15:30",
+        },
+    )
     option_selection = {}
     option_selector = None
     option_paper = None
     trade_summary_sink = None
-    if option_paper_settings.enabled:
+    if option_paper_settings.enabled or scalp_paper_settings.enabled:
         option_selector = OptionChainSelector(
             access_token=inference_settings.access_token,
             client_id=inference_settings.client_id,
@@ -368,10 +387,32 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
         trade_summary_sink = TradeSummaryS3Sink(
             TradeSummaryS3Settings.from_env()
         )
-        option_paper = DeepLobOptionPaperExecutor(
-            option_paper_settings,
-            PaperTradeManager(capital=option_paper_settings.capital),
-            trade_summary_sink=trade_summary_sink,
+        paper_executors = []
+        if option_paper_settings.enabled:
+            paper_executors.append(
+                DeepLobOptionPaperExecutor(
+                    option_paper_settings,
+                    PaperTradeManager(capital=option_paper_settings.capital),
+                    trade_summary_sink=trade_summary_sink,
+                    profile="dynamic",
+                    strategy="deeplob_mbp_dynamic_v1",
+                )
+            )
+        if scalp_paper_settings.enabled:
+            paper_executors.append(
+                DeepLobOptionPaperExecutor(
+                    scalp_paper_settings,
+                    PaperTradeManager(capital=scalp_paper_settings.capital),
+                    trade_summary_sink=trade_summary_sink,
+                    profile="scalp",
+                    strategy="deeplob_mbp_scalp_v1",
+                )
+            )
+        option_paper = ParallelDeepLobOptionPaperExecutor(paper_executors)
+        logger.warning(
+            "DEEPLOB_PARALLEL_PAPER_ACTIVE | profiles=%s | isolated_portfolios=true | "
+            "shared_live_evidence=true",
+            ",".join(executor.profile for executor in paper_executors),
         )
     runtime = None
     adapter = FullDepth200Adapter(
@@ -438,3 +479,4 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
         option_selector=option_selector,
     )
     return runtime
+

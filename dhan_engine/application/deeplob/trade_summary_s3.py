@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -148,8 +149,16 @@ class TradeSummaryS3Sink:
 
         exit_ts = float(summary.get("exit_ts", 0.0) or 0.0)
         instant = datetime.fromtimestamp(exit_ts, self._timezone)
-        tag = str(summary.get("tag", "UNKNOWN")).replace("/", "_")
-        index = str(summary.get("index", "NIFTY")).replace("/", "_")
+        def safe_partition(value: object, default: str) -> str:
+            cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or default))
+            return cleaned.strip("._") or default
+
+        tag = safe_partition(summary.get("tag"), "UNKNOWN")
+        index = safe_partition(summary.get("index"), "NIFTY")
+        strategy = safe_partition(
+            summary.get("strategy"),
+            "deeplob_mbp_option_paper_v1",
+        )
         secid = int(summary.get("secid", 0) or 0)
         exit_ns = int(exit_ts * 1_000_000_000)
         filename = f"{exit_ns}-{secid}.json"
@@ -158,6 +167,7 @@ class TradeSummaryS3Sink:
             "schema=v1",
             f"trade_date={instant:%Y-%m-%d}",
             f"index={index}",
+            f"strategy={strategy}",
             f"instrument={tag}",
             filename,
         ]
@@ -175,7 +185,7 @@ class TradeSummaryS3Sink:
             Body=payload,
             ContentType="application/json",
             Metadata={
-                "strategy": str(summary.get("strategy", "deeplob_mbp_option_paper_v1")),
+                "strategy": strategy,
                 "paper": "true",
             },
         )
