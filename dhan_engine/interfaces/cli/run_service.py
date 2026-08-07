@@ -25,6 +25,8 @@ def main() -> None:
         "deeplob_inference": "deeplob_inference",
         "deeplob-live": "deeplob_live",
         "deeplob_live": "deeplob_live",
+        "deeplob-paper": "deeplob_live",
+        "deeplob_paper": "deeplob_live",
     }
     selected = aliases.get(service)
     if selected is None:

@@ -2,6 +2,7 @@ import tempfile
 import time
 import unittest
 from datetime import time as market_time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dhan_engine.analytics.deeplob_recorder import (
@@ -21,6 +22,10 @@ from dhan_engine.application.deeplob.trade_summary_s3 import (
 from dhan_engine.application.deeplob.recorder_runtime import (
     DeepLobRecorderRuntime,
     DeepLobRecorderRuntimeSettings,
+)
+from dhan_engine.application.deeplob.premodel_paper_runtime import (
+    MarketByPricePaperRuntime,
+    MarketByPricePaperSettings,
 )
 from dhan_engine.domain.market.deeplob_model import encode_book, paper_option_action
 from dhan_engine.domain.market.full_depth_microstructure import BookSnapshot
@@ -194,6 +199,59 @@ class DeepLobFoundationTest(unittest.TestCase):
         with patch.dict("os.environ", environment, clear=True):
             with self.assertRaisesRegex(RuntimeError, "DEEPLOB_S3_BUCKET"):
                 DeepLobLiveSettings.from_env()
+
+    def test_live_settings_select_premodel_paper_service(self):
+        environment = {
+            "DHAN_CLIENT_ID": "client",
+            "DHAN_ACCESS_TOKEN": "token",
+            "DHAN_SERVICE": "deeplob-paper",
+            "DEEPLOB_INDEXES": "NIFTY",
+            "DEEPLOB_S3_BUCKET": "market-data",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            settings = DeepLobLiveSettings.from_env()
+        self.assertTrue(settings.premodel_paper)
+
+    def test_premodel_worker_emits_causal_paper_signal(self):
+        predictions = []
+        settings = MarketByPricePaperSettings(
+            sample_interval_ms=50,
+            signal_interval_sec=0,
+            sequence_length=4,
+            signal_threshold=0.05,
+            stale_after_sec=1.5,
+            queue_size=8,
+            horizon_sec=600,
+        )
+        runtime = MarketByPricePaperRuntime(
+            settings,
+            prediction_sink=lambda **payload: predictions.append(payload),
+        )
+        runtime.start_worker()
+        now = time.monotonic()
+        features = SimpleNamespace(
+            pressure_score=0.30,
+            weighted_imbalance_20=0.30,
+            imbalance_20=0.25,
+            microprice_bps=0.50,
+        )
+        composite = SimpleNamespace(features=features, quote_age_ms=10.0)
+        for index in range(4):
+            book = BookSnapshot.build(
+                123,
+                "NIFTY_FUT",
+                [(100.0, 30, 5)],
+                [(100.5, 5, 1)],
+                received_ts=time.time(),
+                received_mono=now + index * 0.06,
+            )
+            runtime.on_book("NIFTY_FUT", book, composite)
+        deadline = time.time() + 1.0
+        while not predictions and time.time() < deadline:
+            time.sleep(0.01)
+        runtime.close_worker()
+        self.assertEqual(predictions[0]["paper_action"], "BUY_CE")
+        self.assertEqual(predictions[0]["model_version"], "MBP_PREMODEL_V1")
 
     def test_live_callback_fans_out_to_recorder_and_inference(self):
         class Sink:
