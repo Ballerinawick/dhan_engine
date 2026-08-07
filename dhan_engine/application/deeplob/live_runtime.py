@@ -438,5 +438,3 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
         option_selector=option_selector,
     )
     return runtime
-
-
