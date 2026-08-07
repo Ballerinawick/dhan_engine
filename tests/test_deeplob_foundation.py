@@ -14,6 +14,7 @@ from dhan_engine.application.deeplob.live_runtime import DeepLobLiveSettings, De
 from dhan_engine.application.deeplob.option_paper_executor import (
     DeepLobOptionPaperExecutor,
     DeepLobOptionPaperSettings,
+    ParallelDeepLobOptionPaperExecutor,
 )
 from dhan_engine.application.deeplob.trade_summary_s3 import (
     TradeSummaryS3Settings,
@@ -179,6 +180,13 @@ class DeepLobFoundationTest(unittest.TestCase):
             self.assertEqual(row["volume"], 1234)
             self.assertEqual(row["oi"], 5678)
             self.assertEqual(row["fullquote_age_ms"], 25.0)
+            self.assertTrue(row["fullquote_synchronized"])
+            unsynchronized = recorder._to_row(
+                snapshot(),
+                DepthInstrument("NIFTY", "NIFTY-Jul2026-FUT", "2026-07-30"),
+                None,
+            )
+            self.assertFalse(unsynchronized["fullquote_synchronized"])
 
     def test_recorder_can_store_every_book_while_inference_keeps_250ms_sampling(self):
         environment = {
@@ -284,6 +292,87 @@ class DeepLobFoundationTest(unittest.TestCase):
         self.assertEqual(recorder.calls[0][0], ("NIFTY_FUT", book))
         self.assertEqual(inference.calls[0][0:2], ("NIFTY_FUT", book))
         self.assertEqual(inference.calls[0][2].full_quote["ltp"], 100.25)
+
+    def test_live_callback_records_depth_when_fullquote_is_missing(self):
+        class Sink:
+            def __init__(self):
+                self.calls = []
+
+            def record(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+            def on_book(self, *args):
+                self.calls.append(args)
+
+        recorder = Sink()
+        inference = Sink()
+        runtime = DeepLobLiveRuntime(None, None, None, None, recorder, inference)
+        runtime._max_spread_bps = 100
+        runtime.instrument_metadata["NIFTY_FUT"] = {
+            "index": "NIFTY",
+            "symbol": "NIFTY-Jul2026-FUT",
+            "expiry": "2026-07-30",
+        }
+
+        runtime.on_book("NIFTY_FUT", snapshot())
+
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertIsNone(recorder.calls[0][1]["full_quote"])
+        self.assertEqual(inference.calls, [])
+        self.assertEqual(runtime._quality_rejections["FULLQUOTE_MISSING"], 1)
+
+    def test_option_selection_failure_retries_without_stopping_recorder(self):
+        class Selector:
+            def __init__(self):
+                self.calls = 0
+
+            def select_best(self, _index):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("temporary option-chain failure")
+                return {
+                    "CE": {"security_id": 101, "tag": "NIFTY_CE"},
+                    "PE": {"security_id": 102, "tag": "NIFTY_PE"},
+                }
+
+        class Paper:
+            def __init__(self):
+                self.contracts = {}
+
+            def register_contracts(self, selection):
+                self.contracts = dict(selection)
+                return [
+                    (selection["CE"]["security_id"], selection["CE"]["tag"]),
+                    (selection["PE"]["security_id"], selection["PE"]["tag"]),
+                ]
+
+        class Feed:
+            def __init__(self):
+                self.subscriptions = []
+
+            def subscribe_full(self, items):
+                self.subscriptions.append(list(items))
+
+        selector = Selector()
+        paper = Paper()
+        feed = Feed()
+        runtime = DeepLobLiveRuntime(
+            None,
+            None,
+            None,
+            feed,
+            None,
+            None,
+            option_paper=paper,
+            option_selector=selector,
+        )
+
+        self.assertFalse(runtime._ensure_option_contracts(force=True))
+        self.assertEqual(feed.subscriptions, [])
+        self.assertTrue(runtime._ensure_option_contracts(force=True))
+        self.assertEqual(feed.subscriptions, [[(101, "NIFTY_CE"), (102, "NIFTY_PE")]])
+        self.assertEqual(runtime._option_selection_attempts, 2)
+        self.assertEqual(runtime._option_selection_failures, 1)
 
     def test_composite_rejects_missing_or_stale_fullquote(self):
         book = snapshot()
@@ -499,6 +588,67 @@ class DeepLobFoundationTest(unittest.TestCase):
         )
         self.assertEqual(executor.health()["blocks"], 1)
 
+    def test_parallel_option_paper_profiles_are_isolated(self):
+        class Executor:
+            def __init__(self, profile):
+                self.profile = profile
+                self.contracts = {}
+                self.predictions = 0
+                self.quotes = 0
+
+            def register_contracts(self, selection):
+                self.contracts = dict(selection)
+                return [
+                    {
+                        "ExchangeSegment": "NSE_FNO",
+                        "SecurityId": "201",
+                        "tag": "NIFTY_CE",
+                    }
+                ]
+
+            def on_prediction(self, **kwargs):
+                self.predictions += 1
+
+            def on_quote(self, *args, **kwargs):
+                self.quotes += 1
+
+            def heartbeat(self):
+                return None
+
+            def health(self):
+                return {"predictions": self.predictions, "quotes": self.quotes}
+
+        dynamic = Executor("dynamic")
+        scalp = Executor("scalp")
+        parallel = ParallelDeepLobOptionPaperExecutor([dynamic, scalp])
+        subscriptions = parallel.register_contracts({"CE": {"security_id": 201}})
+        parallel.on_prediction(paper_action="BUY_CE")
+        parallel.on_quote(201, "NIFTY_CE", 100, bid=99, ask=101, received_ts=time.time())
+
+        self.assertEqual(len(subscriptions), 1)
+        self.assertEqual(dynamic.predictions, 1)
+        self.assertEqual(scalp.predictions, 1)
+        self.assertEqual(dynamic.quotes, 1)
+        self.assertEqual(scalp.quotes, 1)
+        self.assertIn("dynamic", parallel.health()["profiles"])
+        self.assertIn("scalp", parallel.health()["profiles"])
+
+    def test_scalp_settings_use_independent_environment_prefix(self):
+        environment = {
+            "DEEPLOB_OPTION_PAPER_CONFIDENCE": "0.81",
+            "DEEPLOB_SCALP_PAPER_CONFIDENCE": "0.59",
+            "DEEPLOB_SCALP_PAPER_MAX_HOLD_SEC": "75",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            dynamic = DeepLobOptionPaperSettings.from_env()
+            scalp = DeepLobOptionPaperSettings.from_env(
+                "DEEPLOB_SCALP_PAPER",
+                defaults={"CONFIDENCE": "0.60", "MAX_HOLD_SEC": "120"},
+            )
+        self.assertEqual(dynamic.confidence_threshold, 0.81)
+        self.assertEqual(scalp.confidence_threshold, 0.59)
+        self.assertEqual(scalp.max_hold_sec, 75)
+
     def test_trade_summary_s3_sink_uploads_partitioned_json(self):
         class S3:
             def __init__(self):
@@ -536,6 +686,7 @@ class DeepLobFoundationTest(unittest.TestCase):
         uploaded = client.calls[0]
         self.assertEqual(uploaded["Bucket"], "market-data")
         self.assertIn("trade_date=2026-07-28", uploaded["Key"])
+        self.assertIn("strategy=deeplob_mbp_option_paper_v1", uploaded["Key"])
         self.assertIn("instrument=NIFTY_CE", uploaded["Key"])
         self.assertIn(b'"net_pnl":135.0', uploaded["Body"])
 

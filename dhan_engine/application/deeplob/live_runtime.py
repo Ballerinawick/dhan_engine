@@ -14,6 +14,7 @@ from dhan_engine.application.deeplob.inference_runtime import (
 from dhan_engine.application.deeplob.option_paper_executor import (
     DeepLobOptionPaperExecutor,
     DeepLobOptionPaperSettings,
+    ParallelDeepLobOptionPaperExecutor,
 )
 from dhan_engine.application.deeplob.trade_summary_s3 import (
     TradeSummaryS3Settings,
@@ -61,6 +62,7 @@ class DeepLobLiveRuntime:
         option_paper=None,
         option_selection=None,
         trade_summary_sink=None,
+        option_selector=None,
     ):
         self.settings = settings
         self.master = master
@@ -70,6 +72,7 @@ class DeepLobLiveRuntime:
         self.inference = inference
         self.option_paper = option_paper
         self.option_selection = option_selection or {}
+        self.option_selector = option_selector
         self.trade_summary_sink = trade_summary_sink
         self.instrument_metadata = {}
         self._received = 0
@@ -84,6 +87,13 @@ class DeepLobLiveRuntime:
         self._max_spread_bps = float(os.getenv("DEEPLOB_MAX_FUTURE_SPREAD_BPS", "25"))
         self._probe_quantity = max(1, int(os.getenv("DEEPLOB_EXECUTION_PROBE_QTY", "65")))
         self._last_quality_log = {}
+        self._option_selection_attempts = 0
+        self._option_selection_failures = 0
+        self._last_option_selection_mono = float("-inf")
+        self._option_selection_retry_sec = max(
+            5.0,
+            float(os.getenv("DEEPLOB_OPTION_SELECTION_RETRY_SEC", "60")),
+        )
 
     @staticmethod
     def _pick(raw, *names, default=0):
@@ -142,17 +152,19 @@ class DeepLobLiveRuntime:
             max_spread_bps=self._max_spread_bps,
         )
         quote_synchronized = bool(latest_quote) and quote_age_ms <= self._max_quote_age_ms
-        if quote_synchronized:
-            try:
-                self.recorder.record(
-                    tag,
-                    snapshot,
-                    full_quote=latest_quote,
-                    **metadata,
-                )
-            except Exception:
-                self._recorder_dispatch_failures += 1
-                logger.exception("DEEPLOB_LIVE_RECORDER_DISPATCH_FAILED | instrument=%s", tag)
+        # Raw 200-depth capture must never depend on Full Quote availability.
+        # Unsynchronised rows carry empty quote fields and are still rejected
+        # below before they can reach inference or paper execution.
+        try:
+            self.recorder.record(
+                tag,
+                snapshot,
+                full_quote=latest_quote if quote_synchronized else None,
+                **metadata,
+            )
+        except Exception:
+            self._recorder_dispatch_failures += 1
+            logger.exception("DEEPLOB_LIVE_RECORDER_DISPATCH_FAILED | instrument=%s", tag)
         if not valid:
             self._quality_rejections[quality_reason] = self._quality_rejections.get(quality_reason, 0) + 1
             now = time.monotonic()
@@ -183,6 +195,46 @@ class DeepLobLiveRuntime:
         except Exception:
             self._inference_dispatch_failures += 1
             logger.exception("DEEPLOB_LIVE_INFERENCE_DISPATCH_FAILED | instrument=%s", tag)
+
+    def _ensure_option_contracts(self, *, force: bool = False) -> bool:
+        if self.option_paper is None or self.option_selector is None:
+            return False
+        if self.option_paper.contracts.get("CE") and self.option_paper.contracts.get("PE"):
+            return True
+        now = time.monotonic()
+        if not force and now - self._last_option_selection_mono < self._option_selection_retry_sec:
+            return False
+        self._last_option_selection_mono = now
+        self._option_selection_attempts += 1
+        try:
+            selection = self.option_selector.select_best("NIFTY") or {}
+            if not selection.get("CE") or not selection.get("PE"):
+                raise RuntimeError("selection did not contain both CE and PE")
+            subscriptions = self.option_paper.register_contracts(selection)
+            if len(subscriptions) != 2:
+                raise RuntimeError(
+                    f"expected 2 option subscriptions, received {len(subscriptions)}"
+                )
+            self.option_selection = selection
+            self.fullquote_feed.subscribe_full(subscriptions)
+            logger.info(
+                "DEEPLOB_OPTION_SELECTION_READY | attempts=%s | ce_id=%s | pe_id=%s",
+                self._option_selection_attempts,
+                selection["CE"].get("security_id"),
+                selection["PE"].get("security_id"),
+            )
+            return True
+        except Exception as exc:
+            self._option_selection_failures += 1
+            logger.warning(
+                "DEEPLOB_OPTION_SELECTION_RETRY | attempts=%s | failures=%s | "
+                "retry_sec=%.1f | recorder_continues=true | paper_entries_blocked=true | error=%s",
+                self._option_selection_attempts,
+                self._option_selection_failures,
+                self._option_selection_retry_sec,
+                exc,
+            )
+            return False
 
     def run(self) -> None:
         instruments = []
@@ -219,12 +271,9 @@ class DeepLobLiveRuntime:
                 for segment, secid, tag in instruments
             ]
         )
-        if self.option_paper is not None:
-            self.fullquote_feed.subscribe_full(
-                self.option_paper.register_contracts(self.option_selection)
-            )
         self.fullquote_feed.connect()
         self.depth_adapter.subscribe(instruments)
+        self._ensure_option_contracts(force=True)
         inference_version = getattr(
             self.inference,
             "version",
@@ -262,11 +311,14 @@ class DeepLobLiveRuntime:
                     self._quality_rejections,
                 )
                 if self.option_paper is not None:
+                    self._ensure_option_contracts()
                     self.option_paper.heartbeat()
                     logger.info(
                         "DEEPLOB_OPTION_PAPER_HEALTH | state=%s",
                         {
                             **self.option_paper.health(),
+                            "selection_attempts": self._option_selection_attempts,
+                            "selection_failures": self._option_selection_failures,
                             "trade_summary_s3": (
                                 self.trade_summary_sink.health()
                                 if self.trade_summary_sink is not None
@@ -299,11 +351,31 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
     master = InstrumentMaster(inference_settings.csv_file, debug=False)
     recorder = ParquetDepthRecorder(settings.recorder)
     option_paper_settings = DeepLobOptionPaperSettings.from_env()
+    scalp_paper_settings = DeepLobOptionPaperSettings.from_env(
+        "DEEPLOB_SCALP_PAPER",
+        defaults={
+            "ENABLED": "1",
+            "CAPITAL": "500000",
+            "CONFIDENCE": "0.60",
+            "PRESSURE": "0.04",
+            "CONFIRMATIONS": "2",
+            "COOLDOWN_SEC": "20",
+            "MAX_QUOTE_AGE_SEC": "2",
+            "TAKE_PROFIT_PCT": "1.50",
+            "STOP_LOSS_PCT": "0.75",
+            "MAX_HOLD_SEC": "120",
+            "ENFORCE_MARKET_HOURS": "1",
+            "MARKET_START": "09:15",
+            "ENTRY_CUTOFF": "15:25",
+            "MARKET_END": "15:30",
+        },
+    )
     option_selection = {}
+    option_selector = None
     option_paper = None
     trade_summary_sink = None
-    if option_paper_settings.enabled:
-        selector = OptionChainSelector(
+    if option_paper_settings.enabled or scalp_paper_settings.enabled:
+        option_selector = OptionChainSelector(
             access_token=inference_settings.access_token,
             client_id=inference_settings.client_id,
             instrument_master=master,
@@ -312,18 +384,35 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
             max_steps_each_side=10,
             debug=False,
         )
-        option_selection = selector.select_best("NIFTY") or {}
-        if not option_selection.get("CE") or not option_selection.get("PE"):
-            raise RuntimeError(
-                "DeepLOB option paper mode requires one executable NIFTY CE and PE selection"
-            )
         trade_summary_sink = TradeSummaryS3Sink(
             TradeSummaryS3Settings.from_env()
         )
-        option_paper = DeepLobOptionPaperExecutor(
-            option_paper_settings,
-            PaperTradeManager(capital=option_paper_settings.capital),
-            trade_summary_sink=trade_summary_sink,
+        paper_executors = []
+        if option_paper_settings.enabled:
+            paper_executors.append(
+                DeepLobOptionPaperExecutor(
+                    option_paper_settings,
+                    PaperTradeManager(capital=option_paper_settings.capital),
+                    trade_summary_sink=trade_summary_sink,
+                    profile="dynamic",
+                    strategy="deeplob_mbp_dynamic_v1",
+                )
+            )
+        if scalp_paper_settings.enabled:
+            paper_executors.append(
+                DeepLobOptionPaperExecutor(
+                    scalp_paper_settings,
+                    PaperTradeManager(capital=scalp_paper_settings.capital),
+                    trade_summary_sink=trade_summary_sink,
+                    profile="scalp",
+                    strategy="deeplob_mbp_scalp_v1",
+                )
+            )
+        option_paper = ParallelDeepLobOptionPaperExecutor(paper_executors)
+        logger.warning(
+            "DEEPLOB_PARALLEL_PAPER_ACTIVE | profiles=%s | isolated_portfolios=true | "
+            "shared_live_evidence=true",
+            ",".join(executor.profile for executor in paper_executors),
         )
     runtime = None
     adapter = FullDepth200Adapter(
@@ -384,9 +473,10 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
         fullquote_feed,
         recorder,
         inference,
-        option_paper,
-        option_selection,
-        trade_summary_sink,
+        option_paper=option_paper,
+        option_selection=option_selection,
+        trade_summary_sink=trade_summary_sink,
+        option_selector=option_selector,
     )
     return runtime
 

@@ -31,47 +31,58 @@ class DeepLobOptionPaperSettings:
     market_end: market_time
 
     @classmethod
-    def from_env(cls) -> "DeepLobOptionPaperSettings":
-        def parse_clock(name: str, default: str) -> market_time:
-            return datetime.strptime(os.getenv(name, default).strip(), "%H:%M").time()
+    def from_env(
+        cls,
+        prefix: str = "DEEPLOB_OPTION_PAPER",
+        *,
+        defaults: Mapping[str, str] | None = None,
+    ) -> "DeepLobOptionPaperSettings":
+        values = {
+            "ENABLED": "1",
+            "CAPITAL": "500000",
+            "CONFIDENCE": "0.65",
+            "PRESSURE": "0.05",
+            "CONFIRMATIONS": "3",
+            "COOLDOWN_SEC": "60",
+            "MAX_QUOTE_AGE_SEC": "2",
+            "TAKE_PROFIT_PCT": "2.0",
+            "STOP_LOSS_PCT": "1.5",
+            "MAX_HOLD_SEC": "600",
+            "ENFORCE_MARKET_HOURS": "1",
+            "MARKET_START": "09:15",
+            "ENTRY_CUTOFF": "15:25",
+            "MARKET_END": "15:30",
+        }
+        values.update(dict(defaults or {}))
+
+        def read(name: str) -> str:
+            return os.getenv(f"{prefix}_{name}", values[name]).strip()
+
+        def parse_clock(name: str) -> market_time:
+            return datetime.strptime(read(name), "%H:%M").time()
 
         return cls(
-            enabled=os.getenv("DEEPLOB_OPTION_PAPER_ENABLED", "1").strip().lower()
-            in {"1", "true", "yes", "on"},
-            capital=max(1.0, float(os.getenv("DEEPLOB_OPTION_PAPER_CAPITAL", "500000"))),
+            enabled=read("ENABLED").lower() in {"1", "true", "yes", "on"},
+            capital=max(1.0, float(read("CAPITAL"))),
             confidence_threshold=max(
                 0.0,
-                min(1.0, float(os.getenv("DEEPLOB_OPTION_PAPER_CONFIDENCE", "0.65"))),
+                min(1.0, float(read("CONFIDENCE"))),
             ),
             pressure_threshold=max(
                 0.0,
-                min(1.0, float(os.getenv("DEEPLOB_OPTION_PAPER_PRESSURE", "0.05"))),
+                min(1.0, float(read("PRESSURE"))),
             ),
-            confirmation_count=max(
-                1, int(os.getenv("DEEPLOB_OPTION_PAPER_CONFIRMATIONS", "3"))
-            ),
-            entry_cooldown_sec=max(
-                0.0, float(os.getenv("DEEPLOB_OPTION_PAPER_COOLDOWN_SEC", "60"))
-            ),
-            max_quote_age_sec=max(
-                0.1, float(os.getenv("DEEPLOB_OPTION_PAPER_MAX_QUOTE_AGE_SEC", "2"))
-            ),
-            take_profit_pct=max(
-                0.01, float(os.getenv("DEEPLOB_OPTION_PAPER_TAKE_PROFIT_PCT", "2.0"))
-            ),
-            stop_loss_pct=max(
-                0.01, float(os.getenv("DEEPLOB_OPTION_PAPER_STOP_LOSS_PCT", "1.5"))
-            ),
-            max_hold_sec=max(
-                1.0, float(os.getenv("DEEPLOB_OPTION_PAPER_MAX_HOLD_SEC", "600"))
-            ),
-            enforce_market_hours=os.getenv(
-                "DEEPLOB_OPTION_PAPER_ENFORCE_MARKET_HOURS", "1"
-            ).strip().lower()
+            confirmation_count=max(1, int(read("CONFIRMATIONS"))),
+            entry_cooldown_sec=max(0.0, float(read("COOLDOWN_SEC"))),
+            max_quote_age_sec=max(0.1, float(read("MAX_QUOTE_AGE_SEC"))),
+            take_profit_pct=max(0.01, float(read("TAKE_PROFIT_PCT"))),
+            stop_loss_pct=max(0.01, float(read("STOP_LOSS_PCT"))),
+            max_hold_sec=max(1.0, float(read("MAX_HOLD_SEC"))),
+            enforce_market_hours=read("ENFORCE_MARKET_HOURS").lower()
             in {"1", "true", "yes", "on"},
-            market_start=parse_clock("DEEPLOB_OPTION_PAPER_MARKET_START", "09:15"),
-            entry_cutoff=parse_clock("DEEPLOB_OPTION_PAPER_ENTRY_CUTOFF", "15:25"),
-            market_end=parse_clock("DEEPLOB_OPTION_PAPER_MARKET_END", "15:30"),
+            market_start=parse_clock("MARKET_START"),
+            entry_cutoff=parse_clock("ENTRY_CUTOFF"),
+            market_end=parse_clock("MARKET_END"),
         )
 
 
@@ -84,10 +95,14 @@ class DeepLobOptionPaperExecutor:
         paper_trader,
         *,
         trade_summary_sink=None,
+        profile: str = "dynamic",
+        strategy: str = "deeplob_mbp_dynamic_v1",
     ):
         self.settings = settings
         self.paper_trader = paper_trader
         self.trade_summary_sink = trade_summary_sink
+        self.profile = str(profile)
+        self.strategy = str(strategy)
         self.contracts: dict[str, dict] = {}
         self.quotes: dict[int, dict] = {}
         self._candidate_action = "NO_TRADE"
@@ -116,8 +131,9 @@ class DeepLobOptionPaperExecutor:
                 }
             )
             logger.info(
-                "DEEPLOB_OPTION_PAPER_CONTRACT | side=%s | secid=%s | strike=%s | "
+                "DEEPLOB_OPTION_PAPER_CONTRACT | profile=%s | side=%s | secid=%s | strike=%s | "
                 "expiry=%s | source=%s",
+                self.profile,
                 side,
                 secid,
                 leg.get("strike"),
@@ -203,7 +219,8 @@ class DeepLobOptionPaperExecutor:
         if not contract:
             self._blocks += 1
             logger.warning(
-                "DEEPLOB_OPTION_PAPER_ENTRY_BLOCKED | reason=CONTRACT_MISSING | side=%s",
+                "DEEPLOB_OPTION_PAPER_ENTRY_BLOCKED | profile=%s | reason=CONTRACT_MISSING | side=%s",
+                self.profile,
                 side,
             )
             self._reset_candidate()
@@ -215,8 +232,9 @@ class DeepLobOptionPaperExecutor:
         if not quote or quote_age > self.settings.max_quote_age_sec or entry_price <= 0:
             self._blocks += 1
             logger.warning(
-                "DEEPLOB_OPTION_PAPER_ENTRY_BLOCKED | reason=OPTION_QUOTE_NOT_EXECUTABLE | "
+                "DEEPLOB_OPTION_PAPER_ENTRY_BLOCKED | profile=%s | reason=OPTION_QUOTE_NOT_EXECUTABLE | "
                 "side=%s | secid=%s | quote_age_sec=%s | ask=%s",
+                self.profile,
                 side,
                 secid,
                 f"{quote_age:.3f}" if quote else "NA",
@@ -226,7 +244,8 @@ class DeepLobOptionPaperExecutor:
             return
 
         metadata = {
-            "strategy": "deeplob_mbp_option_paper_v1",
+            "strategy": self.strategy,
+            "paper_profile": self.profile,
             "future_ltp": float(composite.full_quote.get("ltp", 0.0) or 0.0),
             "future_mid": float(composite.features.mid),
             "pressure_score": pressure,
@@ -257,9 +276,11 @@ class DeepLobOptionPaperExecutor:
         if accepted:
             self._entries += 1
             logger.info(
-                "DEEPLOB_OPTION_PAPER_ENTRY | tag=%s | secid=%s | price=%.2f | "
+                "DEEPLOB_OPTION_PAPER_ENTRY | profile=%s | strategy=%s | tag=%s | secid=%s | price=%.2f | "
                 "execution=ASK | future_ltp=%.2f | confidence=%.4f | pressure=%.4f | "
                 "horizon_sec=%s",
+                self.profile,
+                self.strategy,
                 contract["tag"],
                 secid,
                 entry_price,
@@ -313,7 +334,8 @@ class DeepLobOptionPaperExecutor:
         executable_bid = float(quote.get("bid", 0.0) or 0.0)
         if executable_bid <= 0:
             logger.warning(
-                "DEEPLOB_OPTION_PAPER_EXIT_BLOCKED | reason=NO_EXECUTABLE_BID | secid=%s",
+                "DEEPLOB_OPTION_PAPER_EXIT_BLOCKED | profile=%s | reason=NO_EXECUTABLE_BID | secid=%s",
+                self.profile,
                 secid,
             )
             return
@@ -323,6 +345,7 @@ class DeepLobOptionPaperExecutor:
         if summary and self.trade_summary_sink is not None:
             context_keys = (
                 "strategy",
+                "paper_profile",
                 "future_ltp",
                 "future_mid",
                 "pressure_score",
@@ -348,7 +371,9 @@ class DeepLobOptionPaperExecutor:
                 {
                     "schema_version": 1,
                     "index": "NIFTY",
-                    "runtime": "deeplob_live",
+                    "runtime": f"deeplob_live_{self.profile}",
+                    "strategy": self.strategy,
+                    "paper_profile": self.profile,
                     "paper": True,
                     "exit_execution_side": "BID",
                     "exit_quote_age_sec": max(
@@ -362,7 +387,9 @@ class DeepLobOptionPaperExecutor:
         self._last_exit_mono = time.monotonic()
         self._exits += 1
         logger.info(
-            "DEEPLOB_OPTION_PAPER_EXIT | secid=%s | price=%.2f | execution=BID | reason=%s",
+            "DEEPLOB_OPTION_PAPER_EXIT | profile=%s | strategy=%s | secid=%s | price=%.2f | execution=BID | reason=%s",
+            self.profile,
+            self.strategy,
             secid,
             executable_bid,
             reason,
@@ -374,6 +401,8 @@ class DeepLobOptionPaperExecutor:
 
     def health(self) -> dict:
         return {
+            "profile": self.profile,
+            "strategy": self.strategy,
             "enabled": self.settings.enabled,
             "contracts": {
                 side: int(contract["security_id"])
@@ -388,5 +417,64 @@ class DeepLobOptionPaperExecutor:
             "entries": self._entries,
             "exits": self._exits,
             "blocks": self._blocks,
+        }
+
+
+class ParallelDeepLobOptionPaperExecutor:
+    """Fans one live evidence stream into isolated paper portfolios."""
+
+    def __init__(self, executors):
+        self.executors = tuple(executor for executor in executors if executor is not None)
+
+    @property
+    def contracts(self) -> dict[str, dict]:
+        return self.executors[0].contracts if self.executors else {}
+
+    def register_contracts(self, selection: Mapping[str, Mapping]) -> list[dict]:
+        unique = {}
+        for executor in self.executors:
+            for subscription in executor.register_contracts(selection):
+                key = (
+                    subscription.get("ExchangeSegment"),
+                    subscription.get("SecurityId"),
+                )
+                unique[key] = subscription
+        return list(unique.values())
+
+    def on_quote(self, *args, **kwargs) -> None:
+        for executor in self.executors:
+            try:
+                executor.on_quote(*args, **kwargs)
+            except Exception:
+                logger.exception(
+                    "DEEPLOB_OPTION_PAPER_PROFILE_FAILED | profile=%s | stage=QUOTE",
+                    executor.profile,
+                )
+
+    def on_prediction(self, *args, **kwargs) -> None:
+        for executor in self.executors:
+            try:
+                executor.on_prediction(*args, **kwargs)
+            except Exception:
+                logger.exception(
+                    "DEEPLOB_OPTION_PAPER_PROFILE_FAILED | profile=%s | stage=PREDICTION",
+                    executor.profile,
+                )
+
+    def heartbeat(self) -> None:
+        for executor in self.executors:
+            try:
+                executor.heartbeat()
+            except Exception:
+                logger.exception(
+                    "DEEPLOB_OPTION_PAPER_PROFILE_FAILED | profile=%s | stage=HEARTBEAT",
+                    executor.profile,
+                )
+
+    def health(self) -> dict:
+        return {
+            "profiles": {
+                executor.profile: executor.health() for executor in self.executors
+            }
         }
 
