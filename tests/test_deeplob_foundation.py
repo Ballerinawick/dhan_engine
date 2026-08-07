@@ -1,3 +1,4 @@
+
 import tempfile
 import time
 import unittest
@@ -179,6 +180,13 @@ class DeepLobFoundationTest(unittest.TestCase):
             self.assertEqual(row["volume"], 1234)
             self.assertEqual(row["oi"], 5678)
             self.assertEqual(row["fullquote_age_ms"], 25.0)
+            self.assertTrue(row["fullquote_synchronized"])
+            unsynchronized = recorder._to_row(
+                snapshot(),
+                DepthInstrument("NIFTY", "NIFTY-Jul2026-FUT", "2026-07-30"),
+                None,
+            )
+            self.assertFalse(unsynchronized["fullquote_synchronized"])
 
     def test_recorder_can_store_every_book_while_inference_keeps_250ms_sampling(self):
         environment = {
@@ -284,6 +292,87 @@ class DeepLobFoundationTest(unittest.TestCase):
         self.assertEqual(recorder.calls[0][0], ("NIFTY_FUT", book))
         self.assertEqual(inference.calls[0][0:2], ("NIFTY_FUT", book))
         self.assertEqual(inference.calls[0][2].full_quote["ltp"], 100.25)
+
+    def test_live_callback_records_depth_when_fullquote_is_missing(self):
+        class Sink:
+            def __init__(self):
+                self.calls = []
+
+            def record(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+            def on_book(self, *args):
+                self.calls.append(args)
+
+        recorder = Sink()
+        inference = Sink()
+        runtime = DeepLobLiveRuntime(None, None, None, None, recorder, inference)
+        runtime._max_spread_bps = 100
+        runtime.instrument_metadata["NIFTY_FUT"] = {
+            "index": "NIFTY",
+            "symbol": "NIFTY-Jul2026-FUT",
+            "expiry": "2026-07-30",
+        }
+
+        runtime.on_book("NIFTY_FUT", snapshot())
+
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertIsNone(recorder.calls[0][1]["full_quote"])
+        self.assertEqual(inference.calls, [])
+        self.assertEqual(runtime._quality_rejections["FULLQUOTE_MISSING"], 1)
+
+    def test_option_selection_failure_retries_without_stopping_recorder(self):
+        class Selector:
+            def __init__(self):
+                self.calls = 0
+
+            def select_best(self, _index):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("temporary option-chain failure")
+                return {
+                    "CE": {"security_id": 101, "tag": "NIFTY_CE"},
+                    "PE": {"security_id": 102, "tag": "NIFTY_PE"},
+                }
+
+        class Paper:
+            def __init__(self):
+                self.contracts = {}
+
+            def register_contracts(self, selection):
+                self.contracts = dict(selection)
+                return [
+                    (selection["CE"]["security_id"], selection["CE"]["tag"]),
+                    (selection["PE"]["security_id"], selection["PE"]["tag"]),
+                ]
+
+        class Feed:
+            def __init__(self):
+                self.subscriptions = []
+
+            def subscribe_full(self, items):
+                self.subscriptions.append(list(items))
+
+        selector = Selector()
+        paper = Paper()
+        feed = Feed()
+        runtime = DeepLobLiveRuntime(
+            None,
+            None,
+            None,
+            feed,
+            None,
+            None,
+            option_paper=paper,
+            option_selector=selector,
+        )
+
+        self.assertFalse(runtime._ensure_option_contracts(force=True))
+        self.assertEqual(feed.subscriptions, [])
+        self.assertTrue(runtime._ensure_option_contracts(force=True))
+        self.assertEqual(feed.subscriptions, [[(101, "NIFTY_CE"), (102, "NIFTY_PE")]])
+        self.assertEqual(runtime._option_selection_attempts, 2)
+        self.assertEqual(runtime._option_selection_failures, 1)
 
     def test_composite_rejects_missing_or_stale_fullquote(self):
         book = snapshot()
@@ -551,4 +640,5 @@ class DeepLobFoundationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
