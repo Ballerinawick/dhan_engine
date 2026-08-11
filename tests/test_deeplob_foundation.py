@@ -1,3 +1,5 @@
+import json
+import io
 import tempfile
 import time
 import unittest
@@ -11,6 +13,9 @@ from dhan_engine.analytics.deeplob_recorder import (
     ParquetDepthRecorder,
 )
 from dhan_engine.application.deeplob.live_runtime import DeepLobLiveSettings, DeepLobLiveRuntime
+from dhan_engine.application.deeplob.liquidity_pulse_scalp import (
+    LiquidityPulseScalpRuntime,
+)
 from dhan_engine.application.deeplob.option_paper_executor import (
     DeepLobOptionPaperExecutor,
     DeepLobOptionPaperSettings,
@@ -24,11 +29,16 @@ from dhan_engine.application.deeplob.recorder_runtime import (
     DeepLobRecorderRuntime,
     DeepLobRecorderRuntimeSettings,
 )
+from dhan_engine.application.deeplob.post_market_analysis import (
+    PostMarketAnalysisRuntime,
+    PostMarketAnalysisSettings,
+)
 from dhan_engine.application.deeplob.premodel_paper_runtime import (
     MarketByPricePaperRuntime,
     MarketByPricePaperSettings,
 )
 from dhan_engine.domain.market.deeplob_model import encode_book, paper_option_action
+from dhan_engine.domain.market.expiry_cycle import expiry_cycle_context
 from dhan_engine.domain.market.full_depth_microstructure import BookSnapshot
 from dhan_engine.domain.market.market_by_price_execution import (
     derive_market_by_price_features,
@@ -649,7 +659,50 @@ class DeepLobFoundationTest(unittest.TestCase):
         self.assertEqual(scalp.confidence_threshold, 0.59)
         self.assertEqual(scalp.max_hold_sec, 75)
 
-    def test_trade_summary_s3_sink_uploads_partitioned_json(self):
+    def test_expiry_cycle_maps_wednesday_through_tuesday(self):
+        self.assertEqual(
+            expiry_cycle_context("2026-08-05", "2026-08-11").cycle_label,
+            "DAY_1",
+        )
+        self.assertEqual(
+            expiry_cycle_context("2026-08-11", "2026-08-11").premium_regime,
+            "EXPIRY_GAMMA_DECAY",
+        )
+
+    def test_liquidity_pulse_uses_depth_change_and_velocity_evidence(self):
+        features = SimpleNamespace(
+            microprice_bps=1.0,
+            ask_depletion=0.6,
+            bid_depletion=0.1,
+            bid_replenishment=0.5,
+            ask_replenishment=0.1,
+            imbalance_50=0.4,
+            weighted_imbalance_20=0.5,
+            imbalance_5=0.4,
+            ofi_top=0.3,
+        )
+        score = LiquidityPulseScalpRuntime._pulse(
+            SimpleNamespace(features=features)
+        )
+        self.assertGreater(score, 0.25)
+
+    def test_adaptive_scalp_settings_are_fee_aware_and_isolated(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "DEEPLOB_SCALP_ENABLED": "1",
+                "DEEPLOB_SCALP_ROUND_TRIP_FEE": "60",
+                "DEEPLOB_SCALP_MIN_COST_MULTIPLE": "2",
+            },
+            clear=True,
+        ):
+            settings = DeepLobOptionPaperSettings.scalp_from_env()
+        self.assertEqual(settings.profile, "scalp")
+        self.assertTrue(settings.edge_decay_exit)
+        self.assertEqual(settings.round_trip_fee, 60)
+        self.assertEqual(settings.minimum_cost_multiple, 2)
+
+    def test_trade_summary_s3_sink_consolidates_one_daily_json(self):
         class S3:
             def __init__(self):
                 self.calls = []
@@ -681,14 +734,34 @@ class DeepLobFoundationTest(unittest.TestCase):
                 }
             )
         )
+        self.assertTrue(
+            sink.record(
+                {
+                    "secid": 202,
+                    "tag": "NIFTY_PE",
+                    "index": "NIFTY",
+                    "profile": "scalp",
+                    "entry": 90.0,
+                    "exit": 91.0,
+                    "gross_pnl": 65.0,
+                    "fee": 60.0,
+                    "net_pnl": 5.0,
+                    "exit_ts": 1785224460.0,
+                    "strategy": "deeplob_mbp_liquidity_pulse_scalp_v1",
+                }
+            )
+        )
         sink.close()
-        self.assertEqual(len(client.calls), 1)
-        uploaded = client.calls[0]
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[0]["Key"], client.calls[1]["Key"])
+        uploaded = client.calls[-1]
         self.assertEqual(uploaded["Bucket"], "market-data")
         self.assertIn("trade_date=2026-07-28", uploaded["Key"])
-        self.assertIn("strategy=deeplob_mbp_option_paper_v1", uploaded["Key"])
-        self.assertIn("instrument=NIFTY_CE", uploaded["Key"])
-        self.assertIn(b'"net_pnl":135.0', uploaded["Body"])
+        self.assertTrue(uploaded["Key"].endswith("daily-trades.json"))
+        ledger = json.loads(uploaded["Body"])
+        self.assertEqual(ledger["summary"]["trade_count"], 2)
+        self.assertEqual(len(ledger["trades"]), 2)
+        self.assertEqual(ledger["summary"]["by_profile"]["scalp"]["trades"], 1)
 
     def test_trade_summary_prefix_must_be_separate_from_market_data(self):
         environment = {
@@ -699,7 +772,68 @@ class DeepLobFoundationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be separate"):
                 TradeSummaryS3Settings.from_env()
 
+    def test_post_market_report_reads_canonical_s3_parquet(self):
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest("pyarrow is installed in the DeepLOB deployment image")
+
+        buffer = io.BytesIO()
+        pq.write_table(
+            pa.table(
+                {
+                    "received_ns": [1, 2],
+                    "ltp": [24000.0, 24024.0],
+                    "mid_price": [24000.0, 24024.0],
+                    "bid_qty": [[10] * 20, [12] * 20],
+                    "ask_qty": [[8] * 20, [9] * 20],
+                }
+            ),
+            buffer,
+        )
+        parquet_key = (
+            "market-data/deeplob/schema=v1/index=NIFTY/expiry=2026-08-11/"
+            "trade_date=2026-08-11/instrument=NIFTY_FUT/hour=15/depth.parquet"
+        )
+
+        class Body:
+            def read(self):
+                return buffer.getvalue()
+
+        class S3:
+            def __init__(self):
+                self.report = None
+
+            def list_objects_v2(self, **kwargs):
+                return {"Contents": [{"Key": parquet_key}], "IsTruncated": False}
+
+            def get_object(self, **kwargs):
+                return {"Body": Body()}
+
+            def put_object(self, **kwargs):
+                self.report = kwargs
+
+        client = S3()
+        runtime = PostMarketAnalysisRuntime(
+            PostMarketAnalysisSettings(
+                enabled=True,
+                bucket="market-data",
+                market_prefix="market-data/deeplob",
+                report_prefix="analysis/deeplob",
+                run_after=market_time(15, 35),
+                sideways_bps=5.0,
+            ),
+            s3_client=client,
+        )
+        runtime._analyze("2026-08-11")
+        report = json.loads(client.report["Body"])
+        self.assertEqual(report["realized_trend"], "UP")
+        self.assertEqual(report["expiry_cycle"]["cycle_label"], "DAY_5")
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
 

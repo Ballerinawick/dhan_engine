@@ -11,10 +11,18 @@ from dhan_engine.application.deeplob.inference_runtime import (
     DeepLobInferenceSettings,
     DeepLobPaperInferenceRuntime,
 )
+from dhan_engine.application.deeplob.liquidity_pulse_scalp import (
+    LiquidityPulseScalpRuntime,
+    LiquidityPulseScalpSettings,
+)
 from dhan_engine.application.deeplob.option_paper_executor import (
     DeepLobOptionPaperExecutor,
     DeepLobOptionPaperSettings,
     ParallelDeepLobOptionPaperExecutor,
+)
+from dhan_engine.application.deeplob.post_market_analysis import (
+    PostMarketAnalysisRuntime,
+    PostMarketAnalysisSettings,
 )
 from dhan_engine.application.deeplob.trade_summary_s3 import (
     TradeSummaryS3Settings,
@@ -63,6 +71,9 @@ class DeepLobLiveRuntime:
         option_selection=None,
         trade_summary_sink=None,
         option_selector=None,
+        scalp_inference=None,
+        scalp_option_paper=None,
+        post_market_analysis=None,
     ):
         self.settings = settings
         self.master = master
@@ -74,6 +85,9 @@ class DeepLobLiveRuntime:
         self.option_selection = option_selection or {}
         self.option_selector = option_selector
         self.trade_summary_sink = trade_summary_sink
+        self.scalp_inference = scalp_inference
+        self.scalp_option_paper = scalp_option_paper
+        self.post_market_analysis = post_market_analysis
         self.instrument_metadata = {}
         self._received = 0
         self._recorder_dispatch_failures = 0
@@ -126,15 +140,16 @@ class DeepLobLiveRuntime:
         with self._quote_lock:
             self._latest_fullquote[int(secid)] = quote
             self._fullquote_received += 1
-        if self.option_paper is not None:
-            self.option_paper.on_quote(
-                int(secid),
-                tag,
-                float(ltp),
-                bid=quote["best_bid"],
-                ask=quote["best_ask"],
-                received_ts=received_ts,
-            )
+        for executor in (self.option_paper, self.scalp_option_paper):
+            if executor is not None:
+                executor.on_quote(
+                    int(secid),
+                    tag,
+                    float(ltp),
+                    bid=quote["best_bid"],
+                    ask=quote["best_ask"],
+                    received_ts=received_ts,
+                )
 
     def on_book(self, tag, snapshot) -> None:
         self._received += 1
@@ -195,11 +210,27 @@ class DeepLobLiveRuntime:
         except Exception:
             self._inference_dispatch_failures += 1
             logger.exception("DEEPLOB_LIVE_INFERENCE_DISPATCH_FAILED | instrument=%s", tag)
+        if self.scalp_inference is not None:
+            try:
+                self.scalp_inference.on_book(tag, snapshot, composite)
+            except Exception:
+                self._inference_dispatch_failures += 1
+                logger.exception(
+                    "DEEPLOB_SCALP_DISPATCH_FAILED | instrument=%s", tag
+                )
 
     def _ensure_option_contracts(self, *, force: bool = False) -> bool:
-        if self.option_paper is None or self.option_selector is None:
+        executors = tuple(
+            executor
+            for executor in (self.option_paper, self.scalp_option_paper)
+            if executor is not None
+        )
+        if not executors or self.option_selector is None:
             return False
-        if self.option_paper.contracts.get("CE") and self.option_paper.contracts.get("PE"):
+        if all(
+            executor.contracts.get("CE") and executor.contracts.get("PE")
+            for executor in executors
+        ):
             return True
         now = time.monotonic()
         if not force and now - self._last_option_selection_mono < self._option_selection_retry_sec:
@@ -210,7 +241,18 @@ class DeepLobLiveRuntime:
             selection = self.option_selector.select_best("NIFTY") or {}
             if not selection.get("CE") or not selection.get("PE"):
                 raise RuntimeError("selection did not contain both CE and PE")
-            subscriptions = self.option_paper.register_contracts(selection)
+            unique_subscriptions = {}
+            for executor in executors:
+                for subscription in executor.register_contracts(selection):
+                    if isinstance(subscription, dict):
+                        key = (
+                            subscription.get("ExchangeSegment"),
+                            str(subscription.get("SecurityId")),
+                        )
+                    else:
+                        key = tuple(subscription[:2])
+                    unique_subscriptions[key] = subscription
+            subscriptions = list(unique_subscriptions.values())
             if len(subscriptions) != 2:
                 raise RuntimeError(
                     f"expected 2 option subscriptions, received {len(subscriptions)}"
@@ -259,6 +301,8 @@ class DeepLobLiveRuntime:
 
         self.recorder.start()
         self.inference.start_worker()
+        if self.scalp_inference is not None:
+            self.scalp_inference.start_worker()
         if self.trade_summary_sink is not None:
             self.trade_summary_sink.start()
         self.fullquote_feed.subscribe_full(
@@ -310,8 +354,9 @@ class DeepLobLiveRuntime:
                     self.inference.worker_alive,
                     self._quality_rejections,
                 )
-                if self.option_paper is not None:
+                if self.option_paper is not None or self.scalp_option_paper is not None:
                     self._ensure_option_contracts()
+                if self.option_paper is not None:
                     self.option_paper.heartbeat()
                     logger.info(
                         "DEEPLOB_OPTION_PAPER_HEALTH | state=%s",
@@ -326,14 +371,30 @@ class DeepLobLiveRuntime:
                             ),
                         },
                     )
+                if self.scalp_option_paper is not None:
+                    self.scalp_option_paper.heartbeat()
+                    logger.info(
+                        "DEEPLOB_SCALP_PAPER_HEALTH | state=%s",
+                        self.scalp_option_paper.health(),
+                    )
                 self.recorder.log_health()
                 self.inference.log_health()
+                if self.scalp_inference is not None:
+                    self.scalp_inference.log_health()
+                if self.post_market_analysis is not None:
+                    self.post_market_analysis.maybe_start()
+                    logger.info(
+                        "DEEPLOB_POST_MARKET_HEALTH | state=%s",
+                        self.post_market_analysis.health(),
+                    )
         except KeyboardInterrupt:
             logger.info("DEEPLOB_LIVE_PIPELINE_STOPPED")
         finally:
             self.depth_adapter.close()
             self.fullquote_feed.close()
             self.inference.close_worker()
+            if self.scalp_inference is not None:
+                self.scalp_inference.close_worker()
             self.recorder.close()
             if self.trade_summary_sink is not None:
                 self.trade_summary_sink.close()
@@ -354,7 +415,7 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
     scalp_paper_settings = DeepLobOptionPaperSettings.from_env(
         "DEEPLOB_SCALP_PAPER",
         defaults={
-            "ENABLED": "1",
+            "ENABLED": "0",
             "CAPITAL": "500000",
             "CONFIDENCE": "0.60",
             "PRESSURE": "0.04",
@@ -373,8 +434,18 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
     option_selection = {}
     option_selector = None
     option_paper = None
+    scalp_option_paper = None
+    scalp_inference = None
     trade_summary_sink = None
-    if option_paper_settings.enabled or scalp_paper_settings.enabled:
+    post_market_analysis = PostMarketAnalysisRuntime(
+        PostMarketAnalysisSettings.from_env()
+    )
+    adaptive_scalp_settings = DeepLobOptionPaperSettings.scalp_from_env()
+    if (
+        option_paper_settings.enabled
+        or scalp_paper_settings.enabled
+        or adaptive_scalp_settings.enabled
+    ):
         option_selector = OptionChainSelector(
             access_token=inference_settings.access_token,
             client_id=inference_settings.client_id,
@@ -408,12 +479,25 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
                     strategy="deeplob_mbp_scalp_v1",
                 )
             )
-        option_paper = ParallelDeepLobOptionPaperExecutor(paper_executors)
-        logger.warning(
-            "DEEPLOB_PARALLEL_PAPER_ACTIVE | profiles=%s | isolated_portfolios=true | "
-            "shared_live_evidence=true",
-            ",".join(executor.profile for executor in paper_executors),
-        )
+        if paper_executors:
+            option_paper = ParallelDeepLobOptionPaperExecutor(paper_executors)
+            logger.warning(
+                "DEEPLOB_PARALLEL_PAPER_ACTIVE | profiles=%s | isolated_portfolios=true | "
+                "shared_live_evidence=true",
+                ",".join(executor.profile for executor in paper_executors),
+            )
+        if adaptive_scalp_settings.enabled:
+            scalp_option_paper = DeepLobOptionPaperExecutor(
+                adaptive_scalp_settings,
+                PaperTradeManager(capital=adaptive_scalp_settings.capital),
+                trade_summary_sink=trade_summary_sink,
+                profile="scalp",
+                strategy="deeplob_mbp_liquidity_pulse_scalp_v1",
+            )
+            scalp_inference = LiquidityPulseScalpRuntime(
+                LiquidityPulseScalpSettings.from_env(),
+                prediction_sink=scalp_option_paper.on_prediction,
+            )
     runtime = None
     adapter = FullDepth200Adapter(
         inference_settings.client_id,
@@ -477,6 +561,11 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
         option_selection=option_selection,
         trade_summary_sink=trade_summary_sink,
         option_selector=option_selector,
+        scalp_inference=scalp_inference,
+        scalp_option_paper=scalp_option_paper,
+        post_market_analysis=post_market_analysis,
     )
     return runtime
+
+
 
