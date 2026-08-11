@@ -8,6 +8,7 @@ from datetime import datetime, time as market_time
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
+from dhan_engine.domain.market.expiry_cycle import expiry_cycle_context
 from dhan_engine.domain.market.market_by_price_execution import CompositeMarketSnapshot
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,11 @@ class DeepLobOptionPaperSettings:
     market_start: market_time
     entry_cutoff: market_time
     market_end: market_time
+    profile: str = "dynamic"
+    strategy: str = "deeplob_mbp_option_paper_v1"
+    round_trip_fee: float = 60.0
+    minimum_cost_multiple: float = 0.0
+    edge_decay_exit: bool = False
 
     @classmethod
     def from_env(
@@ -85,6 +91,55 @@ class DeepLobOptionPaperSettings:
             market_end=parse_clock("MARKET_END"),
         )
 
+    @classmethod
+    def scalp_from_env(cls) -> "DeepLobOptionPaperSettings":
+        def parse_clock(name: str, default: str) -> market_time:
+            return datetime.strptime(os.getenv(name, default).strip(), "%H:%M").time()
+
+        return cls(
+            enabled=os.getenv("DEEPLOB_SCALP_ENABLED", "1").strip().lower()
+            in {"1", "true", "yes", "on"},
+            capital=max(1.0, float(os.getenv("DEEPLOB_SCALP_CAPITAL", "500000"))),
+            confidence_threshold=max(
+                0.0, min(1.0, float(os.getenv("DEEPLOB_SCALP_CONFIDENCE", "0.58")))
+            ),
+            pressure_threshold=0.0,
+            confirmation_count=max(
+                1, int(os.getenv("DEEPLOB_SCALP_CONFIRMATIONS", "2"))
+            ),
+            entry_cooldown_sec=max(
+                0.0, float(os.getenv("DEEPLOB_SCALP_COOLDOWN_SEC", "15"))
+            ),
+            max_quote_age_sec=max(
+                0.1, float(os.getenv("DEEPLOB_SCALP_MAX_QUOTE_AGE_SEC", "2"))
+            ),
+            take_profit_pct=max(
+                0.01, float(os.getenv("DEEPLOB_SCALP_TAKE_PROFIT_PCT", "1.2"))
+            ),
+            stop_loss_pct=max(
+                0.01, float(os.getenv("DEEPLOB_SCALP_STOP_LOSS_PCT", "0.8"))
+            ),
+            max_hold_sec=max(
+                5.0, float(os.getenv("DEEPLOB_SCALP_MAX_HOLD_SEC", "60"))
+            ),
+            enforce_market_hours=os.getenv(
+                "DEEPLOB_SCALP_ENFORCE_MARKET_HOURS", "1"
+            ).strip().lower()
+            in {"1", "true", "yes", "on"},
+            market_start=parse_clock("DEEPLOB_SCALP_MARKET_START", "09:15"),
+            entry_cutoff=parse_clock("DEEPLOB_SCALP_ENTRY_CUTOFF", "15:24"),
+            market_end=parse_clock("DEEPLOB_SCALP_MARKET_END", "15:25"),
+            profile="scalp",
+            strategy="deeplob_mbp_liquidity_pulse_scalp_v1",
+            round_trip_fee=max(
+                0.0, float(os.getenv("DEEPLOB_SCALP_ROUND_TRIP_FEE", "60"))
+            ),
+            minimum_cost_multiple=max(
+                1.0, float(os.getenv("DEEPLOB_SCALP_MIN_COST_MULTIPLE", "2"))
+            ),
+            edge_decay_exit=True,
+        )
+
 
 class DeepLobOptionPaperExecutor:
     """Paper-only CE/PE execution driven by NIFTY futures evidence."""
@@ -95,14 +150,14 @@ class DeepLobOptionPaperExecutor:
         paper_trader,
         *,
         trade_summary_sink=None,
-        profile: str = "dynamic",
-        strategy: str = "deeplob_mbp_dynamic_v1",
+        profile: str | None = None,
+        strategy: str | None = None,
     ):
         self.settings = settings
         self.paper_trader = paper_trader
         self.trade_summary_sink = trade_summary_sink
-        self.profile = str(profile)
-        self.strategy = str(strategy)
+        self.profile = str(profile or settings.profile)
+        self.strategy = str(strategy or settings.strategy)
         self.contracts: dict[str, dict] = {}
         self.quotes: dict[int, dict] = {}
         self._candidate_action = "NO_TRADE"
@@ -112,6 +167,7 @@ class DeepLobOptionPaperExecutor:
         self._exits = 0
         self._blocks = 0
         self._timezone = ZoneInfo("Asia/Kolkata")
+        self._last_signal_metadata: dict = {}
 
     def register_contracts(self, selection: Mapping[str, Mapping]) -> list[dict]:
         subscriptions = []
@@ -178,11 +234,14 @@ class DeepLobOptionPaperExecutor:
         probability_up: float,
         model_version: str,
         horizon_sec: int,
+        signal_metadata: Mapping[str, object] | None = None,
     ) -> None:
         if not self.settings.enabled or composite is None:
             return
+        signal_metadata = dict(signal_metadata or {})
+        self._last_signal_metadata = signal_metadata
         if self.paper_trader.has_open_position():
-            self._evaluate_prediction_exit(paper_action, confidence)
+            self._evaluate_prediction_exit(paper_action, confidence, signal_metadata)
             return
         clock = datetime.now(self._timezone).time()
         if self.settings.enforce_market_hours and not (
@@ -243,9 +302,46 @@ class DeepLobOptionPaperExecutor:
             self._reset_candidate()
             return
 
+        expected_premium_move_pct = float(
+            signal_metadata.get("expected_premium_move_pct", 0.0) or 0.0
+        )
+        lot_size = int(getattr(self.paper_trader, "LOT_SIZES", {}).get("NIFTY", 65))
+        expected_gross = (
+            entry_price * lot_size * expected_premium_move_pct / 100.0
+        )
+        required_gross = (
+            self.settings.round_trip_fee * self.settings.minimum_cost_multiple
+        )
+        if required_gross > 0 and expected_gross < required_gross:
+            self._blocks += 1
+            logger.info(
+                "DEEPLOB_SCALP_ENTRY_BLOCKED | reason=EXPECTED_GROSS_BELOW_COST_BUFFER | "
+                "side=%s | expected_gross=%.2f | required_gross=%.2f | "
+                "expected_premium_pct=%.3f",
+                side,
+                expected_gross,
+                required_gross,
+                expected_premium_move_pct,
+            )
+            self._reset_candidate()
+            return
+
+        cycle = {}
+        try:
+            cycle = expiry_cycle_context(
+                datetime.now(self._timezone).date(), contract.get("expiry")
+            ).as_dict()
+        except (TypeError, ValueError):
+            logger.warning(
+                "DEEPLOB_EXPIRY_CYCLE_UNAVAILABLE | profile=%s | expiry=%s",
+                self.settings.profile,
+                contract.get("expiry"),
+            )
+
         metadata = {
             "strategy": self.strategy,
             "paper_profile": self.profile,
+            "profile": self.profile,
             "future_ltp": float(composite.full_quote.get("ltp", 0.0) or 0.0),
             "future_mid": float(composite.features.mid),
             "pressure_score": pressure,
@@ -259,6 +355,10 @@ class DeepLobOptionPaperExecutor:
             "option_expiry": contract.get("expiry"),
             "entry_quote_age_sec": quote_age,
             "entry_execution_side": "ASK",
+            "expected_gross": expected_gross,
+            "required_gross": required_gross,
+            **cycle,
+            **signal_metadata,
         }
         reason = (
             f"DEEPLOB_MBP_ENTRY:{side}|confidence={confidence:.4f}|"
@@ -278,7 +378,7 @@ class DeepLobOptionPaperExecutor:
             logger.info(
                 "DEEPLOB_OPTION_PAPER_ENTRY | profile=%s | strategy=%s | tag=%s | secid=%s | price=%.2f | "
                 "execution=ASK | future_ltp=%.2f | confidence=%.4f | pressure=%.4f | "
-                "horizon_sec=%s",
+                "horizon_sec=%s | cycle=%s",
                 self.profile,
                 self.strategy,
                 contract["tag"],
@@ -288,6 +388,7 @@ class DeepLobOptionPaperExecutor:
                 confidence,
                 pressure,
                 horizon_sec,
+                cycle.get("cycle_label", "UNKNOWN"),
             )
         self._reset_candidate()
 
@@ -302,7 +403,12 @@ class DeepLobOptionPaperExecutor:
         secid = int(next(iter(self.paper_trader.positions)))
         self._evaluate_price_exit(secid)
 
-    def _evaluate_prediction_exit(self, paper_action: str, confidence: float) -> None:
+    def _evaluate_prediction_exit(
+        self,
+        paper_action: str,
+        confidence: float,
+        signal_metadata: Mapping[str, object] | None = None,
+    ) -> None:
         secid, position = next(iter(self.paper_trader.positions.items()))
         held_side = "CE" if str(position.get("tag", "")).endswith("_CE") else "PE"
         opposite = (held_side == "CE" and paper_action == "BUY_PE") or (
@@ -310,6 +416,13 @@ class DeepLobOptionPaperExecutor:
         )
         if opposite and confidence >= self.settings.confidence_threshold:
             self._exit(int(secid), "DEEPLOB_MBP_EXIT:MODEL_REVERSAL")
+            return
+        if self.settings.edge_decay_exit and not bool(
+            dict(signal_metadata or {}).get("edge_active", False)
+        ):
+            hold_sec = time.time() - float(position["entry_ts"])
+            if hold_sec >= 5.0:
+                self._exit(int(secid), "DEEPLOB_MBP_EXIT:EDGE_DECAY")
 
     def _evaluate_price_exit(self, secid: int) -> None:
         position = self.paper_trader.positions.get(int(secid))
@@ -359,6 +472,18 @@ class DeepLobOptionPaperExecutor:
                 "option_expiry",
                 "entry_quote_age_sec",
                 "entry_execution_side",
+                "profile",
+                "expected_gross",
+                "required_gross",
+                "cycle_day",
+                "cycle_label",
+                "sessions_to_expiry",
+                "premium_regime",
+                "pulse_strength",
+                "pulse_alignment",
+                "mid_velocity_bps_sec",
+                "expected_future_move_bps",
+                "expected_premium_move_pct",
             )
             summary.update(
                 {
@@ -369,7 +494,7 @@ class DeepLobOptionPaperExecutor:
             )
             summary.update(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "index": "NIFTY",
                     "runtime": f"deeplob_live_{self.profile}",
                     "strategy": self.strategy,
@@ -477,4 +602,6 @@ class ParallelDeepLobOptionPaperExecutor:
                 executor.profile: executor.health() for executor in self.executors
             }
         }
+
+
 
