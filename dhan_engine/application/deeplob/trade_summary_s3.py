@@ -42,7 +42,7 @@ class TradeSummaryS3Settings:
 
 
 class TradeSummaryS3Sink:
-    """Asynchronously persists immutable paper-trade summaries to S3."""
+    """Asynchronously maintains one consolidated paper-trade ledger per day."""
 
     def __init__(self, settings: TradeSummaryS3Settings, *, s3_client=None):
         self.settings = settings
@@ -58,6 +58,7 @@ class TradeSummaryS3Sink:
         self._uploaded = 0
         self._dropped = 0
         self._failures = 0
+        self._ledgers: dict[tuple[str, str], dict] = {}
         self._timezone = ZoneInfo("Asia/Kolkata")
 
     def start(self) -> None:
@@ -117,6 +118,7 @@ class TradeSummaryS3Sink:
             "uploaded": self._uploaded,
             "dropped": self._dropped,
             "failures": self._failures,
+            "daily_ledgers": len(self._ledgers),
         }
 
     def _worker(self) -> None:
@@ -153,27 +155,38 @@ class TradeSummaryS3Sink:
             cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or default))
             return cleaned.strip("._") or default
 
-        tag = safe_partition(summary.get("tag"), "UNKNOWN")
         index = safe_partition(summary.get("index"), "NIFTY")
-        strategy = safe_partition(
-            summary.get("strategy"),
-            "deeplob_mbp_option_paper_v1",
-        )
         secid = int(summary.get("secid", 0) or 0)
         exit_ns = int(exit_ts * 1_000_000_000)
-        filename = f"{exit_ns}-{secid}.json"
+        trade_date = f"{instant:%Y-%m-%d}"
         parts = [
             self.settings.prefix,
-            "schema=v1",
-            f"trade_date={instant:%Y-%m-%d}",
+            "schema=v2",
+            f"trade_date={trade_date}",
             f"index={index}",
-            f"strategy={strategy}",
-            f"instrument={tag}",
-            filename,
+            "daily-trades.json",
         ]
         key = "/".join(part for part in parts if part)
+        ledger_key = (trade_date, index)
+        ledger = self._ledgers.get(ledger_key)
+        if ledger is None:
+            ledger = self._load_existing_ledger(key, trade_date, index)
+            self._ledgers[ledger_key] = ledger
+
+        trade = dict(summary)
+        trade_id = str(
+            trade.get("trade_id")
+            or f"{trade.get('profile', 'dynamic')}:{exit_ns}:{secid}"
+        )
+        trade["trade_id"] = trade_id
+        trades = [row for row in ledger["trades"] if row.get("trade_id") != trade_id]
+        trades.append(trade)
+        trades.sort(key=lambda row: float(row.get("exit_ts", 0.0) or 0.0))
+        ledger["trades"] = trades
+        ledger["updated_at"] = datetime.now(self._timezone).isoformat()
+        ledger["summary"] = self._summarize(trades)
         payload = json.dumps(
-            dict(summary),
+            ledger,
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
@@ -185,17 +198,74 @@ class TradeSummaryS3Sink:
             Body=payload,
             ContentType="application/json",
             Metadata={
-                "strategy": strategy,
+                "strategy": "deeplob_multi_profile_paper",
                 "paper": "true",
             },
         )
         self._uploaded += 1
         logger.info(
-            "DEEPLOB_TRADE_SUMMARY_S3_UPLOAD_OK | bucket=%s | key=%s | "
-            "tag=%s | net_pnl=%s",
+            "DEEPLOB_DAILY_TRADE_LEDGER_UPLOAD_OK | bucket=%s | key=%s | "
+            "trade_count=%s | net_pnl=%s",
             self.settings.bucket,
             key,
-            tag,
-            summary.get("net_pnl"),
+            ledger["summary"]["trade_count"],
+            ledger["summary"]["net_pnl"],
         )
+
+    def _load_existing_ledger(self, key: str, trade_date: str, index: str) -> dict:
+        ledger = {
+            "schema_version": 2,
+            "trade_date": trade_date,
+            "index": index,
+            "updated_at": None,
+            "trades": [],
+            "summary": self._summarize([]),
+        }
+        get_object = getattr(self._s3_client, "get_object", None)
+        if get_object is None:
+            return ledger
+        try:
+            response = get_object(Bucket=self.settings.bucket, Key=key)
+            body = response["Body"].read()
+            existing = json.loads(body.decode("utf-8"))
+            if isinstance(existing, dict) and isinstance(existing.get("trades"), list):
+                return existing
+        except Exception as exc:
+            code = str(
+                getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+            )
+            if code not in {"NoSuchKey", "404", "NotFound"}:
+                logger.warning(
+                    "DEEPLOB_DAILY_TRADE_LEDGER_LOAD_FAILED | key=%s | error=%s",
+                    key,
+                    exc,
+                )
+        return ledger
+
+    @staticmethod
+    def _summarize(trades: list[dict]) -> dict:
+        by_profile: dict[str, dict] = {}
+        for trade in trades:
+            profile = str(trade.get("profile", "dynamic"))
+            stats = by_profile.setdefault(
+                profile, {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+            )
+            net = float(trade.get("net_pnl", 0.0) or 0.0)
+            stats["trades"] += 1
+            stats["wins"] += int(net > 0)
+            stats["losses"] += int(net < 0)
+            stats["net_pnl"] = round(stats["net_pnl"] + net, 2)
+        net_values = [float(row.get("net_pnl", 0.0) or 0.0) for row in trades]
+        return {
+            "trade_count": len(trades),
+            "wins": sum(value > 0 for value in net_values),
+            "losses": sum(value < 0 for value in net_values),
+            "flat": sum(value == 0 for value in net_values),
+            "gross_pnl": round(
+                sum(float(row.get("gross_pnl", 0.0) or 0.0) for row in trades), 2
+            ),
+            "fees": round(sum(float(row.get("fee", 0.0) or 0.0) for row in trades), 2),
+            "net_pnl": round(sum(net_values), 2),
+            "by_profile": by_profile,
+        }
 
