@@ -175,6 +175,7 @@ class DeepLobOptionPaperExecutor:
 
     def register_contracts(self, selection: Mapping[str, Mapping]) -> list[dict]:
         subscriptions = []
+        selected_secids = set()
         for side in ("CE", "PE"):
             leg = dict(selection.get(side) or {})
             secid = int(leg.get("security_id", 0) or 0)
@@ -183,6 +184,7 @@ class DeepLobOptionPaperExecutor:
             leg["security_id"] = secid
             leg["tag"] = f"NIFTY_{side}"
             self.contracts[side] = leg
+            selected_secids.add(secid)
             subscriptions.append(
                 {
                     "ExchangeSegment": "NSE_FNO",
@@ -200,6 +202,11 @@ class DeepLobOptionPaperExecutor:
                 leg.get("expiry"),
                 leg.get("selection_source", "UNKNOWN"),
             )
+        self.quotes = {
+            secid: quote
+            for secid, quote in self.quotes.items()
+            if secid in selected_secids
+        }
         return subscriptions
 
     def on_quote(
@@ -616,7 +623,5 @@ class ParallelDeepLobOptionPaperExecutor:
                 executor.profile: executor.health() for executor in self.executors
             }
         }
-
-
 
 
