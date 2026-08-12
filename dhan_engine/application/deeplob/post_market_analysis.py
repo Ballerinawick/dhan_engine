@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import io
 import json
 import logging
@@ -22,6 +23,7 @@ class PostMarketAnalysisSettings:
     report_prefix: str
     run_after: market_time
     sideways_bps: float
+    trade_prefix: str = "paper-trades/deeplob"
 
     @classmethod
     def from_env(cls) -> "PostMarketAnalysisSettings":
@@ -41,6 +43,9 @@ class PostMarketAnalysisSettings:
             sideways_bps=max(
                 0.1, float(os.getenv("DEEPLOB_POST_MARKET_SIDEWAYS_BPS", "5"))
             ),
+            trade_prefix=os.getenv(
+                "DEEPLOB_TRADE_SUMMARY_S3_PREFIX", "paper-trades/deeplob"
+            ).strip().strip("/"),
         )
 
 
@@ -123,6 +128,7 @@ class PostMarketAnalysisRuntime:
         expiry = "unknown"
         rows = 0
         imbalance_sum = 0.0
+        price_timeline = []
         for key in sorted(objects):
             body = self._client().get_object(
                 Bucket=self.settings.bucket, Key=key
@@ -152,6 +158,7 @@ class PostMarketAnalysisRuntime:
                 ask_total = sum(int(value or 0) for value in asks[:20])
                 total = bid_total + ask_total
                 imbalance_sum += (bid_total - ask_total) / total if total else 0.0
+                price_timeline.append((int(received_ns), price))
                 rows += 1
             if "expiry=" in key:
                 expiry = key.split("expiry=", 1)[1].split("/", 1)[0]
@@ -165,6 +172,18 @@ class PostMarketAnalysisRuntime:
             else "DOWN"
             if return_bps < -self.settings.sideways_bps
             else "SIDEWAYS"
+        )
+        price_timeline.sort(key=lambda row: row[0])
+        trade_ledger = self._load_trade_ledger(trade_date)
+        option_expiries = [
+            str(row.get("option_expiry", ""))[:10]
+            for row in trade_ledger.get("trades", [])
+            if row.get("option_expiry")
+        ]
+        if option_expiries:
+            expiry = max(set(option_expiries), key=option_expiries.count)
+        prediction_evaluation = self._evaluate_trades(
+            trade_ledger.get("trades", []), price_timeline
         )
         cycle = {}
         try:
@@ -193,6 +212,8 @@ class PostMarketAnalysisRuntime:
             "mean_top20_imbalance": round(imbalance_sum / rows, 6),
             "realized_trend": trend,
             "expiry_cycle": cycle,
+            "prediction_evaluation": prediction_evaluation,
+            "paper_trade_summary": trade_ledger.get("summary", {}),
             "cycle_history": cycle_history,
             "next_session_outlook": {
                 "cycle_label": next_cycle_label,
@@ -220,6 +241,88 @@ class PostMarketAnalysisRuntime:
             return_bps,
             key,
         )
+
+    def _load_trade_ledger(self, trade_date: str) -> dict:
+        key = (
+            f"{self.settings.trade_prefix}/schema=v2/trade_date={trade_date}/"
+            "index=NIFTY/daily-trades.json"
+        )
+        try:
+            body = self._client().get_object(
+                Bucket=self.settings.bucket, Key=key
+            )["Body"].read()
+            ledger = json.loads(body.decode("utf-8"))
+            return ledger if isinstance(ledger, dict) else {}
+        except Exception as exc:
+            logger.warning(
+                "DEEPLOB_POST_MARKET_TRADE_LEDGER_UNAVAILABLE | trade_date=%s | error=%s",
+                trade_date,
+                exc,
+            )
+            return {}
+
+    @staticmethod
+    def _evaluate_trades(
+        trades: list[dict], timeline: list[tuple[int, float]]
+    ) -> dict:
+        if not trades or not timeline:
+            return {"evaluated": 0, "missing": len(trades), "by_profile_horizon": {}}
+        timestamps = [row[0] for row in timeline]
+        grouped: dict[str, dict] = {}
+        missing = 0
+        for trade in trades:
+            entry_ts = float(trade.get("entry_ts", 0.0) or 0.0)
+            horizon = int(trade.get("model_horizon_sec", 0) or 0)
+            if entry_ts <= 0 or horizon <= 0:
+                missing += 1
+                continue
+            entry_ns = int(entry_ts * 1_000_000_000)
+            future_ns = entry_ns + horizon * 1_000_000_000
+            start_index = bisect.bisect_left(timestamps, entry_ns)
+            future_index = bisect.bisect_left(timestamps, future_ns)
+            if start_index >= len(timeline) or future_index >= len(timeline):
+                missing += 1
+                continue
+            start_price = timeline[start_index][1]
+            future_price = timeline[future_index][1]
+            if start_price <= 0:
+                missing += 1
+                continue
+            move_bps = (future_price - start_price) / start_price * 10_000.0
+            tag = str(trade.get("tag", ""))
+            predicted_up = tag.endswith("_CE")
+            correct = move_bps > 0 if predicted_up else move_bps < 0
+            probability = float(
+                trade.get("probability_up" if predicted_up else "probability_down", 0.5)
+                or 0.5
+            )
+            key = f"{trade.get('profile', 'dynamic')}:{horizon}s"
+            stats = grouped.setdefault(
+                key,
+                {"evaluated": 0, "correct": 0, "move_bps_sum": 0.0, "brier_sum": 0.0},
+            )
+            stats["evaluated"] += 1
+            stats["correct"] += int(correct)
+            stats["move_bps_sum"] += move_bps
+            stats["brier_sum"] += (probability - float(correct)) ** 2
+        for stats in grouped.values():
+            count = stats["evaluated"]
+            stats["accuracy_pct"] = round(stats["correct"] / count * 100.0, 2)
+            stats["mean_future_move_bps"] = round(stats.pop("move_bps_sum") / count, 4)
+            stats["brier_score"] = round(stats.pop("brier_sum") / count, 6)
+        evaluated = sum(row["evaluated"] for row in grouped.values())
+        correct = sum(row["correct"] for row in grouped.values())
+        weighted_brier = sum(
+            row["brier_score"] * row["evaluated"] for row in grouped.values()
+        )
+        return {
+            "evaluated": evaluated,
+            "missing": missing,
+            "accuracy_pct": round(correct / evaluated * 100.0, 2) if evaluated else None,
+            "brier_score": round(weighted_brier / evaluated, 6) if evaluated else None,
+            "by_profile_horizon": grouped,
+            "note": "Directional outcome at the signal horizon; Brier score lower is better.",
+        }
 
     @staticmethod
     def _empty_cycle_stats() -> dict:
@@ -305,4 +408,5 @@ class PostMarketAnalysisRuntime:
             "completed_dates": sorted(self._completed_dates),
             "failures": self._failures,
         }
+
 
