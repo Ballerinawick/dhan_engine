@@ -58,6 +58,8 @@ class DeepLobOptionPaperSettings:
             "MARKET_START": "09:15",
             "ENTRY_CUTOFF": "15:25",
             "MARKET_END": "15:30",
+            "ROUND_TRIP_FEE": "60",
+            "MIN_COST_MULTIPLE": "2",
         }
         values.update(dict(defaults or {}))
 
@@ -89,6 +91,8 @@ class DeepLobOptionPaperSettings:
             market_start=parse_clock("MARKET_START"),
             entry_cutoff=parse_clock("ENTRY_CUTOFF"),
             market_end=parse_clock("MARKET_END"),
+            round_trip_fee=max(0.0, float(read("ROUND_TRIP_FEE"))),
+            minimum_cost_multiple=max(0.0, float(read("MIN_COST_MULTIPLE"))),
         )
 
     @classmethod
@@ -309,17 +313,23 @@ class DeepLobOptionPaperExecutor:
         expected_gross = (
             entry_price * lot_size * expected_premium_move_pct / 100.0
         )
+        planned_take_profit_gross = (
+            entry_price * lot_size * self.settings.take_profit_pct / 100.0
+        )
+        cost_evidence_gross = (
+            expected_gross if expected_gross > 0 else planned_take_profit_gross
+        )
         required_gross = (
             self.settings.round_trip_fee * self.settings.minimum_cost_multiple
         )
-        if required_gross > 0 and expected_gross < required_gross:
+        if required_gross > 0 and cost_evidence_gross < required_gross:
             self._blocks += 1
             logger.info(
                 "DEEPLOB_SCALP_ENTRY_BLOCKED | reason=EXPECTED_GROSS_BELOW_COST_BUFFER | "
-                "side=%s | expected_gross=%.2f | required_gross=%.2f | "
+                "side=%s | cost_evidence_gross=%.2f | required_gross=%.2f | "
                 "expected_premium_pct=%.3f",
                 side,
-                expected_gross,
+                cost_evidence_gross,
                 required_gross,
                 expected_premium_move_pct,
             )
@@ -356,6 +366,8 @@ class DeepLobOptionPaperExecutor:
             "entry_quote_age_sec": quote_age,
             "entry_execution_side": "ASK",
             "expected_gross": expected_gross,
+            "cost_evidence_gross": cost_evidence_gross,
+            "planned_take_profit_gross": planned_take_profit_gross,
             "required_gross": required_gross,
             **cycle,
             **signal_metadata,
@@ -474,6 +486,8 @@ class DeepLobOptionPaperExecutor:
                 "entry_execution_side",
                 "profile",
                 "expected_gross",
+                "cost_evidence_gross",
+                "planned_take_profit_gross",
                 "required_gross",
                 "cycle_day",
                 "cycle_label",
@@ -602,6 +616,7 @@ class ParallelDeepLobOptionPaperExecutor:
                 executor.profile: executor.health() for executor in self.executors
             }
         }
+
 
 
 
