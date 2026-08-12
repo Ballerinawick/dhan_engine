@@ -783,7 +783,7 @@ class DeepLobFoundationTest(unittest.TestCase):
         pq.write_table(
             pa.table(
                 {
-                    "received_ns": [1, 2],
+                    "received_ns": [1_000_000_000, 11_000_000_000],
                     "ltp": [24000.0, 24024.0],
                     "mid_price": [24000.0, 24024.0],
                     "bid_qty": [[10] * 20, [12] * 20],
@@ -793,13 +793,16 @@ class DeepLobFoundationTest(unittest.TestCase):
             buffer,
         )
         parquet_key = (
-            "market-data/deeplob/schema=v1/index=NIFTY/expiry=2026-08-11/"
+            "market-data/deeplob/schema=v1/index=NIFTY/expiry=2026-08-25/"
             "trade_date=2026-08-11/instrument=NIFTY_FUT/hour=15/depth.parquet"
         )
 
         class Body:
+            def __init__(self, value):
+                self.value = value
+
             def read(self):
-                return buffer.getvalue()
+                return self.value
 
         class S3:
             def __init__(self):
@@ -809,7 +812,22 @@ class DeepLobFoundationTest(unittest.TestCase):
                 return {"Contents": [{"Key": parquet_key}], "IsTruncated": False}
 
             def get_object(self, **kwargs):
-                return {"Body": Body()}
+                if kwargs["Key"].endswith("daily-trades.json"):
+                    ledger = {
+                        "summary": {"trade_count": 1, "net_pnl": 5.0},
+                        "trades": [
+                            {
+                                "entry_ts": 1.0,
+                                "model_horizon_sec": 10,
+                                "tag": "NIFTY_CE",
+                                "profile": "scalp",
+                                "probability_up": 0.8,
+                                "option_expiry": "2026-08-11",
+                            }
+                        ],
+                    }
+                    return {"Body": Body(json.dumps(ledger).encode("utf-8"))}
+                return {"Body": Body(buffer.getvalue())}
 
             def put_object(self, **kwargs):
                 self.report = kwargs
@@ -830,10 +848,24 @@ class DeepLobFoundationTest(unittest.TestCase):
         report = json.loads(client.report["Body"])
         self.assertEqual(report["realized_trend"], "UP")
         self.assertEqual(report["expiry_cycle"]["cycle_label"], "DAY_5")
+        self.assertEqual(report["expiry_cycle"]["expiry_date"], "2026-08-11")
+        evaluation = report["prediction_evaluation"]
+        self.assertEqual(evaluation["evaluated"], 1)
+        self.assertEqual(evaluation["accuracy_pct"], 100.0)
+        self.assertAlmostEqual(evaluation["brier_score"], 0.04)
+        self.assertEqual(
+            evaluation["by_profile_horizon"]["scalp:10s"]["accuracy_pct"],
+            100.0,
+        )
+        self.assertAlmostEqual(
+            evaluation["by_profile_horizon"]["scalp:10s"]["brier_score"],
+            0.04,
+        )
 
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
