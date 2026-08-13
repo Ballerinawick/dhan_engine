@@ -1,7 +1,8 @@
+
 from __future__ import annotations
 
-import bisect
 import io
+import bisect
 import json
 import logging
 import os
@@ -116,12 +117,17 @@ class PostMarketAnalysisRuntime:
                 item["Key"]
                 for item in response.get("Contents", [])
                 if f"trade_date={trade_date}/" in item["Key"]
+                and "/instrument=NIFTY_FUT/" in item["Key"]
                 and item["Key"].endswith(".parquet")
             )
             if not response.get("IsTruncated"):
                 break
             token = response.get("NextContinuationToken")
 
+        expected_symbol = None
+        expected_security_id = None
+        accepted_objects = []
+        rejected_objects = []
         first = last = None
         low = high = None
         first_ns = last_ns = 0
@@ -133,11 +139,53 @@ class PostMarketAnalysisRuntime:
             body = self._client().get_object(
                 Bucket=self.settings.bucket, Key=key
             )["Body"].read()
-            table = parquet.read_table(
-                io.BytesIO(body),
-                columns=["received_ns", "ltp", "mid_price", "bid_qty", "ask_qty"],
-            )
+            parquet_file = parquet.ParquetFile(io.BytesIO(body))
+            available_columns = set(parquet_file.schema_arrow.names)
+            selected_columns = [
+                name
+                for name in (
+                    "received_ns",
+                    "ltp",
+                    "mid_price",
+                    "bid_qty",
+                    "ask_qty",
+                    "symbol",
+                    "security_id",
+                )
+                if name in available_columns
+            ]
+            table = parquet_file.read(columns=selected_columns)
             data = table.to_pydict()
+            symbols = {str(value) for value in data.get("symbol", []) if value}
+            security_ids = {
+                int(value) for value in data.get("security_id", []) if value is not None
+            }
+            key_symbol = (
+                key.split("/symbol=", 1)[1].split("/", 1)[0]
+                if "/symbol=" in key
+                else ""
+            )
+            file_symbol = next(iter(symbols), key_symbol or None)
+            file_security_id = next(iter(security_ids), None)
+            invalid_root = (
+                (key_symbol and not key_symbol.upper().startswith("NIFTY-"))
+                or any(not value.upper().startswith("NIFTY-") for value in symbols)
+            )
+            if expected_symbol is None and not invalid_root:
+                expected_symbol = file_symbol
+                expected_security_id = file_security_id
+            identity_changed = (
+                (file_symbol and expected_symbol and file_symbol != expected_symbol)
+                or (
+                    file_security_id is not None
+                    and expected_security_id is not None
+                    and file_security_id != expected_security_id
+                )
+            )
+            if invalid_root or identity_changed:
+                rejected_objects.append(key)
+                continue
+            accepted_objects.append(key)
             for received_ns, ltp, mid, bids, asks in zip(
                 data["received_ns"],
                 data["ltp"],
@@ -202,7 +250,10 @@ class PostMarketAnalysisRuntime:
             "generated_at": datetime.now(self._timezone).isoformat(),
             "source": "S3_SYNCHRONIZED_FULLQUOTE_200_DEPTH",
             "instrument": "NIFTY_FUT",
-            "files": len(objects),
+            "symbol": expected_symbol,
+            "security_id": expected_security_id,
+            "files": len(accepted_objects),
+            "rejected_files": len(rejected_objects),
             "rows": rows,
             "open": first,
             "high": high,
@@ -235,7 +286,7 @@ class PostMarketAnalysisRuntime:
             "DEEPLOB_POST_MARKET_REPORT_OK | trade_date=%s | files=%s | rows=%s | "
             "trend=%s | return_bps=%+.3f | key=%s",
             trade_date,
-            len(objects),
+            len(accepted_objects),
             rows,
             trend,
             return_bps,
@@ -262,9 +313,7 @@ class PostMarketAnalysisRuntime:
             return {}
 
     @staticmethod
-    def _evaluate_trades(
-        trades: list[dict], timeline: list[tuple[int, float]]
-    ) -> dict:
+    def _evaluate_trades(trades: list[dict], timeline: list[tuple[int, float]]) -> dict:
         if not trades or not timeline:
             return {"evaluated": 0, "missing": len(trades), "by_profile_horizon": {}}
         timestamps = [row[0] for row in timeline]
@@ -408,5 +457,3 @@ class PostMarketAnalysisRuntime:
             "completed_dates": sorted(self._completed_dates),
             "failures": self._failures,
         }
-
-

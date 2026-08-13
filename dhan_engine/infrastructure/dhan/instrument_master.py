@@ -1,3 +1,4 @@
+
 # instrument_master.py
 import pandas as pd
 
@@ -6,23 +7,23 @@ class InstrumentMaster:
     """
     InstrumentMaster v3.1 (SAFE + DEBUG + EXPIRY FIX)
 
-    ✅ Keeps existing public methods (so other modules won't break)
-    ✅ Adds missing methods your logs show:
+    âœ… Keeps existing public methods (so other modules won't break)
+    âœ… Adds missing methods your logs show:
        - get_nearest_option_expiry()
        - get_index_security_id()
-    ✅ Expiry selection updated for NSE circular change (post Aug-2025):
+    âœ… Expiry selection updated for NSE circular change (post Aug-2025):
        - NIFTY weekly expiry = Tuesday (prefer weekly, avoid monthly last-Tuesday when asked)
        - BANKNIFTY / FINNIFTY = monthly only (prefer last Tuesday of month)
-    ✅ Debug logs are inside this class only (not in main)
+    âœ… Debug logs are inside this class only (not in main)
     """
 
     def __init__(self, csv_path: str, debug: bool = True):
         self.debug = bool(debug)
 
-        self._log(f"📦 Loading Instrument Master CSV: {csv_path}")
+        self._log(f"ðŸ“¦ Loading Instrument Master CSV: {csv_path}")
         self.df = pd.read_csv(csv_path, low_memory=False)
         self.df.columns = self.df.columns.astype(str).str.strip()
-        self._log(f"✅ CSV LOADED | rows: {len(self.df)}")
+        self._log(f"âœ… CSV LOADED | rows: {len(self.df)}")
 
         # Normalize string columns
         obj_cols = self.df.select_dtypes(include=["object"]).columns
@@ -94,21 +95,26 @@ class InstrumentMaster:
         if idx in self._opt_cache:
             return self._opt_cache[idx]
 
-        self._log(f"🔎 Filtering OPTIDX for {idx}")
+        self._log(f"ðŸ”Ž Filtering OPTIDX for {idx}")
 
         df = self.df
         opts = df[
             (df["SEM_EXM_EXCH_ID"] == "NSE")
             & (df["SEM_SEGMENT"] == "D")
             & (df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == "OPTIDX")
-            & (df["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.startswith(idx, na=False))
+            & (
+                df["SEM_TRADING_SYMBOL"]
+                .astype(str)
+                .str.upper()
+                .str.startswith(f"{idx}-", na=False)
+            )
         ].copy()
 
         opts = opts.dropna(
             subset=["SEM_EXPIRY_DATE", "SEM_STRIKE_PRICE", "SEM_SMST_SECURITY_ID", "SEM_OPTION_TYPE"]
         )
 
-        self._log(f"   ➜ Found {len(opts)} OPTIDX rows")
+        self._log(f"   âžœ Found {len(opts)} OPTIDX rows")
         self._opt_cache[idx] = opts
         return opts
 
@@ -120,24 +126,29 @@ class InstrumentMaster:
         if idx in self._fut_cache:
             return self._fut_cache[idx]
 
-        self._log(f"🔎 Filtering FUTIDX for {idx}")
+        self._log(f"ðŸ”Ž Filtering FUTIDX for {idx}")
 
         df = self.df
         fut = df[
             (df["SEM_EXM_EXCH_ID"] == "NSE")
             & (df["SEM_SEGMENT"] == "D")
             & (df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == "FUTIDX")
-            & (df["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.startswith(idx, na=False))
+            & (
+                df["SEM_TRADING_SYMBOL"]
+                .astype(str)
+                .str.upper()
+                .str.startswith(f"{idx}-", na=False)
+            )
         ].copy()
 
         fut = fut.dropna(subset=["SEM_EXPIRY_DATE", "SEM_SMST_SECURITY_ID"])
 
-        self._log(f"   ➜ Found {len(fut)} FUTIDX rows")
+        self._log(f"   âžœ Found {len(fut)} FUTIDX rows")
         self._fut_cache[idx] = fut
         return fut
 
     # ---------------------------------------------------
-    # ✅ FUT: Nearest active Index Future
+    # âœ… FUT: Nearest active Index Future
     # ---------------------------------------------------
     def get_nearest_future(self, index_name: str):
         idx = str(index_name).upper().strip()
@@ -147,12 +158,17 @@ class InstrumentMaster:
         fut2 = fut[fut["SEM_EXPIRY_DATE"] >= now].copy()
 
         if fut2.empty:
-            raise Exception(f"❌ No ACTIVE FUT found for {idx}")
+            raise Exception(f"âŒ No ACTIVE FUT found for {idx}")
 
         row = fut2.sort_values("SEM_EXPIRY_DATE").iloc[0]
         symbol = str(row["SEM_TRADING_SYMBOL"])
 
-        self._log(f"✅ {idx} FUT selected: {symbol}")
+        if not symbol.upper().startswith(f"{idx}-"):
+            raise RuntimeError(
+                f"Resolved FUTIDX symbol {symbol!r} does not belong to exact root {idx!r}"
+            )
+
+        self._log(f"âœ… {idx} FUT selected: {symbol}")
 
         return {
             "security_id": str(row["SEM_SMST_SECURITY_ID"]),
@@ -249,7 +265,7 @@ class InstrumentMaster:
         return resolved
 
     # ---------------------------------------------------
-    # ✅ Nearest option expiry (UPDATED RULES)
+    # âœ… Nearest option expiry (UPDATED RULES)
     # ---------------------------------------------------
     def get_nearest_option_expiry(self, index: str, prefer_weekly: bool = True):
         """
@@ -265,28 +281,28 @@ class InstrumentMaster:
         opts2 = opts[opts["SEM_EXPIRY_DATE"] >= now].copy()
 
         if opts2.empty:
-            raise Exception(f"❌ No OPTIDX expiry >= now for {idx}")
+            raise Exception(f"âŒ No OPTIDX expiry >= now for {idx}")
 
         expiries = opts2["SEM_EXPIRY_DATE"].dropna().drop_duplicates().sort_values()
 
         if expiries.empty:
-            raise Exception(f"❌ No valid expiries for {idx}")
+            raise Exception(f"âŒ No valid expiries for {idx}")
 
         # NIFTY -> always pick nearest available expiry
         if idx == "NIFTY":
             chosen = expiries.iloc[0]
-            self._log(f"📅 {idx} nearest expiry selected: {chosen.date()}")
+            self._log(f"ðŸ“… {idx} nearest expiry selected: {chosen.date()}")
             return chosen
 
         # BANKNIFTY / FINNIFTY -> monthly only (prefer last Tuesday)
         monthly = [d for d in expiries.tolist() if self._is_last_tuesday(d)]
         if monthly:
             chosen = monthly[0]
-            self._log(f"📅 {idx} monthly expiry selected: {chosen.date()} (last Tue)")
+            self._log(f"ðŸ“… {idx} monthly expiry selected: {chosen.date()} (last Tue)")
             return chosen
 
         chosen = expiries.iloc[0]
-        self._log(f"📅 {idx} nearest expiry selected (fallback): {chosen.date()}")
+        self._log(f"ðŸ“… {idx} nearest expiry selected (fallback): {chosen.date()}")
         return chosen
 
     # Backward-compatible aliases (so other files won't break)
@@ -297,7 +313,7 @@ class InstrumentMaster:
         return self.get_nearest_option_expiry(index, prefer_weekly=True)
 
     # ---------------------------------------------------
-    # ✅ Find option SecurityId (exact strike required)
+    # âœ… Find option SecurityId (exact strike required)
     # ---------------------------------------------------
     def find_option_security_id(self, index: str, expiry_dt, strike, opt_type: str):
         idx = str(index).upper().strip()
@@ -307,7 +323,7 @@ class InstrumentMaster:
 
         exp = pd.to_datetime(expiry_dt, errors="coerce")
         if pd.isna(exp):
-            raise Exception(f"❌ Invalid expiry: {expiry_dt}")
+            raise Exception(f"âŒ Invalid expiry: {expiry_dt}")
 
         strike_f = float(strike)
         exp_date = exp.date()
@@ -319,20 +335,20 @@ class InstrumentMaster:
         ].copy()
 
         if df.empty:
-            raise Exception(f"❌ No option rows for {idx} {exp_date} {ot}")
+            raise Exception(f"âŒ No option rows for {idx} {exp_date} {ot}")
 
         df["__strike_diff"] = (df["SEM_STRIKE_PRICE"] - strike_f).abs()
         best = df.sort_values("__strike_diff").iloc[0]
 
         if float(best["__strike_diff"]) > 0.001:
-            raise Exception(f"❌ No exact strike match for {idx} {exp_date} {strike_f} {ot}")
+            raise Exception(f"âŒ No exact strike match for {idx} {exp_date} {strike_f} {ot}")
 
         secid = int(float(best["SEM_SMST_SECURITY_ID"]))
-        self._log(f"🎯 {idx} {ot} strike={strike_f:.2f} exp={exp_date} => secid={secid}")
+        self._log(f"ðŸŽ¯ {idx} {ot} strike={strike_f:.2f} exp={exp_date} => secid={secid}")
         return secid
 
     # ---------------------------------------------------
-    # ✅ INDEX (SPOT) security id for OptionChain REST
+    # âœ… INDEX (SPOT) security id for OptionChain REST
     # ---------------------------------------------------
     def get_index_security_id(self, index_name: str) -> int:
         """
@@ -344,7 +360,7 @@ class InstrumentMaster:
         if idx in self._index_cache:
             return self._index_cache[idx]
 
-        self._log(f"🔎 Finding INDEX security id for {idx}")
+        self._log(f"ðŸ”Ž Finding INDEX security id for {idx}")
 
         df = self.df[
             (self.df["SEM_EXM_EXCH_ID"] == "NSE")
@@ -353,14 +369,14 @@ class InstrumentMaster:
         ].copy()
 
         if df.empty:
-            raise Exception("❌ No INDEX rows found in CSV (segment=I, instrument=INDEX)")
+            raise Exception("âŒ No INDEX rows found in CSV (segment=I, instrument=INDEX)")
 
         # Try strict match first
         d1 = df[df["SEM_TRADING_SYMBOL"].astype(str).str.upper() == idx]
         if not d1.empty:
             secid = int(float(d1.iloc[0]["SEM_SMST_SECURITY_ID"]))
             self._index_cache[idx] = secid
-            self._log(f"✅ INDEX_SID | {idx} => {secid} (TRADING_SYMBOL exact)")
+            self._log(f"âœ… INDEX_SID | {idx} => {secid} (TRADING_SYMBOL exact)")
             return secid
 
         # Try custom symbol contains index name
@@ -368,7 +384,7 @@ class InstrumentMaster:
         if not d2.empty:
             secid = int(float(d2.iloc[0]["SEM_SMST_SECURITY_ID"]))
             self._index_cache[idx] = secid
-            self._log(f"✅ INDEX_SID | {idx} => {secid} (CUSTOM_SYMBOL contains)")
+            self._log(f"âœ… INDEX_SID | {idx} => {secid} (CUSTOM_SYMBOL contains)")
             return secid
 
         # Last fallback: startswith
@@ -376,7 +392,7 @@ class InstrumentMaster:
         if not d3.empty:
             secid = int(float(d3.iloc[0]["SEM_SMST_SECURITY_ID"]))
             self._index_cache[idx] = secid
-            self._log(f"✅ INDEX_SID | {idx} => {secid} (TRADING_SYMBOL startswith)")
+            self._log(f"âœ… INDEX_SID | {idx} => {secid} (TRADING_SYMBOL startswith)")
             return secid
 
-        raise Exception(f"❌ No INDEX security id found for {idx}")
+        raise Exception(f"âŒ No INDEX security id found for {idx}")

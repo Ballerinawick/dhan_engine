@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import logging
@@ -5,6 +6,8 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from dhan_engine.analytics.deeplob_recorder import DepthRecorderSettings, ParquetDepthRecorder
 from dhan_engine.application.deeplob.inference_runtime import (
@@ -108,6 +111,13 @@ class DeepLobLiveRuntime:
             5.0,
             float(os.getenv("DEEPLOB_OPTION_SELECTION_RETRY_SEC", "60")),
         )
+        self._timezone = ZoneInfo("Asia/Kolkata")
+        self._health_interval_sec = max(
+            30.0,
+            float(os.getenv("DEEPLOB_HEALTH_INTERVAL_SEC", "60")),
+        )
+        self._option_selection_date = None
+        self._future_subscriptions = []
 
     @staticmethod
     def _pick(raw, *names, default=0):
@@ -227,10 +237,20 @@ class DeepLobLiveRuntime:
         )
         if not executors or self.option_selector is None:
             return False
+        trade_date = datetime.now(self._timezone).date()
+        daily_refresh = self._option_selection_date != trade_date
+        if daily_refresh and not force:
+            clock = datetime.now(self._timezone).time()
+            market_open = any(
+                executor.settings.market_start <= clock < executor.settings.market_end
+                for executor in executors
+            )
+            if not market_open:
+                return False
         if all(
             executor.contracts.get("CE") and executor.contracts.get("PE")
             for executor in executors
-        ):
+        ) and not force and not daily_refresh:
             return True
         now = time.monotonic()
         if not force and now - self._last_option_selection_mono < self._option_selection_retry_sec:
@@ -257,8 +277,21 @@ class DeepLobLiveRuntime:
                 raise RuntimeError(
                     f"expected 2 option subscriptions, received {len(subscriptions)}"
                 )
+            previous_selection_date = self._option_selection_date
             self.option_selection = selection
-            self.fullquote_feed.subscribe_full(subscriptions)
+            self.fullquote_feed.replace_subscriptions(
+                [*self._future_subscriptions, *subscriptions],
+                reason="deeplob_daily_option_selection",
+            )
+            if previous_selection_date is None:
+                self.fullquote_feed.refresh_full_subscriptions(
+                    reason="deeplob_initial_option_selection",
+                )
+            else:
+                self.fullquote_feed.reconnect(
+                    reason="deeplob_daily_option_selection",
+                )
+            self._option_selection_date = trade_date
             logger.info(
                 "DEEPLOB_OPTION_SELECTION_READY | attempts=%s | ce_id=%s | pe_id=%s",
                 self._option_selection_attempts,
@@ -283,18 +316,23 @@ class DeepLobLiveRuntime:
         for index in self.settings.inference.indexes:
             future = self.master.get_nearest_future(index)
             tag = f"{index}_FUT"
+            symbol = str(future["symbol"])
+            if not symbol.upper().startswith(f"{index.upper()}-"):
+                raise RuntimeError(
+                    f"DEEPLOB_INSTRUMENT_IDENTITY_REJECTED index={index} symbol={symbol}"
+                )
             expiry = future["expiry"]
             expiry_text = expiry.strftime("%Y-%m-%d") if hasattr(expiry, "strftime") else str(expiry)
             self.instrument_metadata[tag] = {
                 "index": index,
-                "symbol": future["symbol"],
+                "symbol": symbol,
                 "expiry": expiry_text,
             }
             instruments.append(("NSE_FNO", int(future["security_id"]), tag))
             logger.info(
                 "DEEPLOB_LIVE_INSTRUMENT | index=%s | symbol=%s | secid=%s | expiry=%s",
                 index,
-                future["symbol"],
+                symbol,
                 future["security_id"],
                 expiry_text,
             )
@@ -305,16 +343,15 @@ class DeepLobLiveRuntime:
             self.scalp_inference.start_worker()
         if self.trade_summary_sink is not None:
             self.trade_summary_sink.start()
-        self.fullquote_feed.subscribe_full(
-            [
-                {
-                    "ExchangeSegment": segment,
-                    "SecurityId": str(secid),
-                    "tag": tag,
-                }
-                for segment, secid, tag in instruments
-            ]
-        )
+        self._future_subscriptions = [
+            {
+                "ExchangeSegment": segment,
+                "SecurityId": str(secid),
+                "tag": tag,
+            }
+            for segment, secid, tag in instruments
+        ]
+        self.fullquote_feed.subscribe_full(self._future_subscriptions)
         self.fullquote_feed.connect()
         self.depth_adapter.subscribe(instruments)
         self._ensure_option_contracts(force=True)
@@ -340,7 +377,7 @@ class DeepLobLiveRuntime:
         )
         try:
             while True:
-                time.sleep(10)
+                time.sleep(self._health_interval_sec)
                 logger.info(
                     "DEEPLOB_LIVE_PIPELINE_HEALTH | received=%s | recorder_dispatch_failures=%s | "
                     "inference_dispatch_failures=%s | fullquote_received=%s | "
@@ -356,26 +393,27 @@ class DeepLobLiveRuntime:
                 )
                 if self.option_paper is not None or self.scalp_option_paper is not None:
                     self._ensure_option_contracts()
+                dynamic_health = None
+                scalp_health = None
                 if self.option_paper is not None:
                     self.option_paper.heartbeat()
-                    logger.info(
-                        "DEEPLOB_OPTION_PAPER_HEALTH | state=%s",
-                        {
-                            **self.option_paper.health(),
-                            "selection_attempts": self._option_selection_attempts,
-                            "selection_failures": self._option_selection_failures,
-                            "trade_summary_s3": (
-                                self.trade_summary_sink.health()
-                                if self.trade_summary_sink is not None
-                                else None
-                            ),
-                        },
-                    )
+                    dynamic_health = self.option_paper.health()
                 if self.scalp_option_paper is not None:
                     self.scalp_option_paper.heartbeat()
+                    scalp_health = self.scalp_option_paper.health()
+                if dynamic_health is not None or scalp_health is not None:
                     logger.info(
-                        "DEEPLOB_SCALP_PAPER_HEALTH | state=%s",
-                        self.scalp_option_paper.health(),
+                        "DEEPLOB_PAPER_HEALTH | dynamic=%s | scalp=%s | "
+                        "selection_attempts=%s | selection_failures=%s | trade_summary_s3=%s",
+                        dynamic_health,
+                        scalp_health,
+                        self._option_selection_attempts,
+                        self._option_selection_failures,
+                        (
+                            self.trade_summary_sink.health()
+                            if self.trade_summary_sink is not None
+                            else None
+                        ),
                     )
                 self.recorder.log_health()
                 self.inference.log_health()
@@ -383,10 +421,6 @@ class DeepLobLiveRuntime:
                     self.scalp_inference.log_health()
                 if self.post_market_analysis is not None:
                     self.post_market_analysis.maybe_start()
-                    logger.info(
-                        "DEEPLOB_POST_MARKET_HEALTH | state=%s",
-                        self.post_market_analysis.health(),
-                    )
         except KeyboardInterrupt:
             logger.info("DEEPLOB_LIVE_PIPELINE_STOPPED")
         finally:
@@ -566,6 +600,5 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
         post_market_analysis=post_market_analysis,
     )
     return runtime
-
 
 

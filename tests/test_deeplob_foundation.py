@@ -1,8 +1,10 @@
+
 import json
 import io
 import tempfile
 import time
 import unittest
+import os
 from datetime import time as market_time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -45,6 +47,7 @@ from dhan_engine.domain.market.market_by_price_execution import (
     estimate_market_execution,
     validate_composite_snapshot,
 )
+from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
 
 
 def snapshot(name="NIFTY_FUT"):
@@ -59,6 +62,41 @@ def snapshot(name="NIFTY_FUT"):
 
 
 class DeepLobFoundationTest(unittest.TestCase):
+    def test_nifty_resolution_excludes_similarly_named_index(self):
+        import pandas as pd
+
+        future_expiry = (pd.Timestamp.now() + pd.Timedelta(days=30)).date().isoformat()
+        option_expiry = (pd.Timestamp.now() + pd.Timedelta(days=7)).date().isoformat()
+        rows = []
+        for symbol, secid, expiry, instrument in (
+            ("NIFTYFPI-Test-FUT", "35937", future_expiry, "FUTIDX"),
+            ("NIFTY-Test-FUT", "61093", future_expiry, "FUTIDX"),
+            ("NIFTYFPI-Test-24000-CE", "1", option_expiry, "OPTIDX"),
+            ("NIFTY-Test-24000-CE", "2", option_expiry, "OPTIDX"),
+        ):
+            rows.append(
+                {
+                    "SEM_EXM_EXCH_ID": "NSE",
+                    "SEM_SEGMENT": "D",
+                    "SEM_SMST_SECURITY_ID": secid,
+                    "SEM_INSTRUMENT_NAME": instrument,
+                    "SEM_TRADING_SYMBOL": symbol,
+                    "SEM_CUSTOM_SYMBOL": symbol,
+                    "SEM_OPTION_TYPE": "CE" if instrument == "OPTIDX" else "NA",
+                    "SEM_STRIKE_PRICE": "24000",
+                    "SEM_LOT_UNITS": "65",
+                    "SEM_EXPIRY_DATE": expiry,
+                }
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "master.csv")
+            pd.DataFrame(rows).to_csv(path, index=False)
+            master = InstrumentMaster(path, debug=False)
+            future = master.get_nearest_future("NIFTY")
+            options = master._get_optidx_df("NIFTY")
+        self.assertEqual(future["symbol"], "NIFTY-Test-FUT")
+        self.assertEqual(options["SEM_TRADING_SYMBOL"].tolist(), ["NIFTY-Test-24000-CE"])
+
     def test_encoder_has_fixed_shape_and_finite_values(self):
         values = encode_book(snapshot(), levels=4)
         self.assertEqual(len(values), 4 * 3 * 2)
@@ -352,8 +390,16 @@ class DeepLobFoundationTest(unittest.TestCase):
             def register_contracts(self, selection):
                 self.contracts = dict(selection)
                 return [
-                    (selection["CE"]["security_id"], selection["CE"]["tag"]),
-                    (selection["PE"]["security_id"], selection["PE"]["tag"]),
+                    {
+                        "ExchangeSegment": "NSE_FNO",
+                        "SecurityId": str(selection["CE"]["security_id"]),
+                        "tag": selection["CE"]["tag"],
+                    },
+                    {
+                        "ExchangeSegment": "NSE_FNO",
+                        "SecurityId": str(selection["PE"]["security_id"]),
+                        "tag": selection["PE"]["tag"],
+                    },
                 ]
 
         class Feed:
@@ -362,6 +408,13 @@ class DeepLobFoundationTest(unittest.TestCase):
 
             def subscribe_full(self, items):
                 self.subscriptions.append(list(items))
+
+            def replace_subscriptions(self, items, **_kwargs):
+                self.subscriptions.append(list(items))
+                return True
+
+            def refresh_full_subscriptions(self, **_kwargs):
+                return True
 
         selector = Selector()
         paper = Paper()
@@ -380,7 +433,13 @@ class DeepLobFoundationTest(unittest.TestCase):
         self.assertFalse(runtime._ensure_option_contracts(force=True))
         self.assertEqual(feed.subscriptions, [])
         self.assertTrue(runtime._ensure_option_contracts(force=True))
-        self.assertEqual(feed.subscriptions, [[(101, "NIFTY_CE"), (102, "NIFTY_PE")]])
+        self.assertEqual(
+            feed.subscriptions,
+            [[
+                {"ExchangeSegment": "NSE_FNO", "SecurityId": "101", "tag": "NIFTY_CE"},
+                {"ExchangeSegment": "NSE_FNO", "SecurityId": "102", "tag": "NIFTY_PE"},
+            ]],
+        )
         self.assertEqual(runtime._option_selection_attempts, 2)
         self.assertEqual(runtime._option_selection_failures, 1)
 
@@ -788,13 +847,36 @@ class DeepLobFoundationTest(unittest.TestCase):
                     "mid_price": [24000.0, 24024.0],
                     "bid_qty": [[10] * 20, [12] * 20],
                     "ask_qty": [[8] * 20, [9] * 20],
+                    "symbol": ["NIFTY-Aug2026-FUT"] * 2,
+                    "security_id": [61093] * 2,
                 }
             ),
             buffer,
         )
+        rejected_buffer = io.BytesIO()
+        pq.write_table(
+            pa.table(
+                {
+                    "received_ns": [5_000_000_000],
+                    "ltp": [1600.0],
+                    "mid_price": [1600.0],
+                    "bid_qty": [[100] * 20],
+                    "ask_qty": [[100] * 20],
+                    "symbol": ["NIFTYFPI-Aug2026-FUT"],
+                    "security_id": [35937],
+                }
+            ),
+            rejected_buffer,
+        )
         parquet_key = (
             "market-data/deeplob/schema=v1/index=NIFTY/expiry=2026-08-25/"
-            "trade_date=2026-08-11/instrument=NIFTY_FUT/hour=15/depth.parquet"
+            "trade_date=2026-08-11/instrument=NIFTY_FUT/"
+            "symbol=NIFTY-Aug2026-FUT/hour=15/depth.parquet"
+        )
+        rejected_key = (
+            "market-data/deeplob/schema=v1/index=NIFTY/expiry=2026-08-25/"
+            "trade_date=2026-08-11/instrument=NIFTY_FUT/"
+            "symbol=NIFTYFPI-Aug2026-FUT/hour=15/depth.parquet"
         )
 
         class Body:
@@ -809,7 +891,10 @@ class DeepLobFoundationTest(unittest.TestCase):
                 self.report = None
 
             def list_objects_v2(self, **kwargs):
-                return {"Contents": [{"Key": parquet_key}], "IsTruncated": False}
+                return {
+                    "Contents": [{"Key": parquet_key}, {"Key": rejected_key}],
+                    "IsTruncated": False,
+                }
 
             def get_object(self, **kwargs):
                 if kwargs["Key"].endswith("daily-trades.json"):
@@ -827,6 +912,8 @@ class DeepLobFoundationTest(unittest.TestCase):
                         ],
                     }
                     return {"Body": Body(json.dumps(ledger).encode("utf-8"))}
+                if "NIFTYFPI" in kwargs["Key"]:
+                    return {"Body": Body(rejected_buffer.getvalue())}
                 return {"Body": Body(buffer.getvalue())}
 
             def put_object(self, **kwargs):
@@ -847,6 +934,11 @@ class DeepLobFoundationTest(unittest.TestCase):
         runtime._analyze("2026-08-11")
         report = json.loads(client.report["Body"])
         self.assertEqual(report["realized_trend"], "UP")
+        self.assertEqual(report["symbol"], "NIFTY-Aug2026-FUT")
+        self.assertEqual(report["security_id"], 61093)
+        self.assertEqual(report["files"], 1)
+        self.assertEqual(report["rejected_files"], 1)
+        self.assertGreater(report["low"], 20_000)
         self.assertEqual(report["expiry_cycle"]["cycle_label"], "DAY_5")
         self.assertEqual(report["expiry_cycle"]["expiry_date"], "2026-08-11")
         evaluation = report["prediction_evaluation"]
@@ -865,7 +957,5 @@ class DeepLobFoundationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
 
 
