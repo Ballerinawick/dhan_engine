@@ -22,9 +22,22 @@ class MarketByPricePaperSettings:
     stale_after_sec: float
     queue_size: int
     horizon_sec: int
+    horizons_sec: tuple[int, ...] = (30, 60, 120, 300)
+    option_beta_pct_per_future_bps: float = 0.10
 
     @classmethod
     def from_env(cls) -> "MarketByPricePaperSettings":
+        horizons = tuple(
+            sorted(
+                {
+                    max(5, min(600, int(value.strip())))
+                    for value in os.getenv(
+                        "DEEPLOB_PREMODEL_HORIZONS_SEC", "30,60,120,300"
+                    ).split(",")
+                    if value.strip()
+                }
+            )
+        )
         return cls(
             sample_interval_ms=max(
                 50, int(os.getenv("DEEPLOB_PREMODEL_SAMPLE_INTERVAL_MS", "250"))
@@ -47,6 +60,15 @@ class MarketByPricePaperSettings:
             ),
             queue_size=max(8, int(os.getenv("DEEPLOB_INFERENCE_QUEUE_SIZE", "64"))),
             horizon_sec=max(1, int(os.getenv("DEEPLOB_PREMODEL_HORIZON_SEC", "600"))),
+            horizons_sec=horizons or (30, 60, 120, 300),
+            option_beta_pct_per_future_bps=max(
+                0.0,
+                float(
+                    os.getenv(
+                        "DEEPLOB_PREMODEL_OPTION_BETA_PCT_PER_FUTURE_BPS", "0.10"
+                    )
+                ),
+            ),
         )
 
 
@@ -70,6 +92,10 @@ class MarketByPricePaperRuntime:
         self._scores = defaultdict(
             lambda: deque(maxlen=self.settings.sequence_length)
         )
+        self._mids = defaultdict(lambda: deque(maxlen=self.settings.sequence_length))
+        self._sample_times = defaultdict(
+            lambda: deque(maxlen=self.settings.sequence_length)
+        )
         self._last_sample = defaultdict(lambda: float("-inf"))
         self._last_signal = defaultdict(lambda: float("-inf"))
         self._received = 0
@@ -83,12 +109,12 @@ class MarketByPricePaperRuntime:
             self._worker.start()
         logger.info(
             "MBP_PREMODEL_PAPER_ACTIVE | version=%s | sequence=%s | sample_ms=%s | "
-            "threshold=%.4f | horizon_sec=%s | orders=false",
+            "threshold=%.4f | horizons=%s | depth_levels=200 | orders=false",
             self.version,
             self.settings.sequence_length,
             self.settings.sample_interval_ms,
             self.settings.signal_threshold,
-            self.settings.horizon_sec,
+            ",".join(map(str, self.settings.horizons_sec)),
         )
 
     def close_worker(self, timeout: float = 10.0) -> None:
@@ -148,12 +174,20 @@ class MarketByPricePaperRuntime:
     @staticmethod
     def _evidence_score(composite: CompositeMarketSnapshot) -> float:
         features = composite.features
-        microprice = max(-1.0, min(1.0, features.microprice_bps / 2.0))
+        value = lambda name, default=0.0: float(getattr(features, name, default))
+        microprice = max(-1.0, min(1.0, value("microprice_bps") / 2.0))
         raw = (
-            0.60 * features.pressure_score
-            + 0.20 * features.weighted_imbalance_20
-            + 0.10 * features.imbalance_20
-            + 0.10 * microprice
+            0.46 * value("pressure_score")
+            + 0.10 * value("weighted_imbalance_20")
+            + 0.08 * value("weighted_imbalance_50", value("weighted_imbalance_20"))
+            + 0.06 * value("weighted_imbalance_100", value("weighted_imbalance_20"))
+            + 0.05 * value("weighted_imbalance_200", value("weighted_imbalance_20"))
+            + 0.05 * value("depth_flow_20")
+            + 0.04 * value("depth_flow_50")
+            + 0.03 * value("depth_flow_100")
+            + 0.03 * value("depth_flow_200")
+            + 0.05 * value("depth_consensus", value("imbalance_20"))
+            + 0.05 * microprice
         )
         return max(-1.0, min(1.0, raw))
 
@@ -170,6 +204,13 @@ class MarketByPricePaperRuntime:
                     continue
                 scores = self._scores[tag]
                 scores.append(self._evidence_score(composite))
+                mids = self._mids[tag]
+                sample_times = self._sample_times[tag]
+                fallback_mid = (
+                    float(snapshot.bids[0].price) + float(snapshot.asks[0].price)
+                ) / 2.0
+                mids.append(float(getattr(composite.features, "mid", fallback_mid)))
+                sample_times.append(float(snapshot.received_mono))
                 if len(scores) < self.settings.sequence_length:
                     continue
                 now = time.monotonic()
@@ -201,6 +242,59 @@ class MarketByPricePaperRuntime:
                     down, flat, up = directional, residual * 0.65, residual * 0.35
                 else:
                     down, flat, up = 0.1, 0.8, 0.1
+                elapsed = max(sample_times[-1] - sample_times[0], 0.001)
+                current_mid = max(mids[-1], 0.001)
+                velocity_bps_sec = (
+                    (mids[-1] - mids[0]) / current_mid * 10_000.0 / elapsed
+                )
+                horizon_scores = {
+                    str(horizon): max(
+                        -50.0,
+                        min(
+                            50.0,
+                            velocity_bps_sec * horizon
+                            + mean_score * 6.0 * (horizon / 30.0) ** 0.5,
+                        ),
+                    )
+                    for horizon in self.settings.horizons_sec
+                }
+                aligned_horizons = [
+                    horizon
+                    for horizon in self.settings.horizons_sec
+                    if horizon_scores[str(horizon)] * mean_score > 0
+                ]
+                selected_horizon = (
+                    min(
+                        aligned_horizons,
+                        key=lambda horizon: (
+                            abs(horizon_scores[str(horizon)]) < 2.0,
+                            horizon,
+                        ),
+                    )
+                    if aligned_horizons
+                    else self.settings.horizon_sec
+                )
+                expected_future_bps = abs(
+                    horizon_scores.get(str(selected_horizon), 0.0)
+                )
+                expected_premium_move_pct = (
+                    expected_future_bps
+                    * self.settings.option_beta_pct_per_future_bps
+                )
+                metadata = {
+                    "profile": "dynamic",
+                    "edge_active": strong,
+                    "edge_strength": abs(mean_score),
+                    "depth_alignment": aligned,
+                    "depth_consensus": float(
+                        getattr(composite.features, "depth_consensus", 0.0)
+                    ),
+                    "mid_velocity_bps_sec": velocity_bps_sec,
+                    "horizon_scores_bps": horizon_scores,
+                    "expected_future_move_bps": expected_future_bps,
+                    "expected_premium_move_pct": expected_premium_move_pct,
+                    "estimate_kind": "MBP_HEURISTIC_NOT_CALIBRATED",
+                }
                 self._signals += 1
                 if self.prediction_sink is not None:
                     self.prediction_sink(
@@ -211,12 +305,14 @@ class MarketByPricePaperRuntime:
                         probability_flat=flat,
                         probability_up=up,
                         model_version=self.version,
-                        horizon_sec=self.settings.horizon_sec,
+                        horizon_sec=selected_horizon,
+                        signal_metadata=metadata,
                     )
                 logger.info(
                     "MBP_PREMODEL_SIGNAL | instrument=%s | action=%s | confidence=%.4f | "
                     "evidence=%.4f | alignment=%.3f | pressure=%.4f | quote_age_ms=%.1f | "
-                    "orders=false",
+                    "depth_consensus=%+.3f | expected_future_bps=%.3f | "
+                    "horizon_sec=%s | orders=false",
                     tag,
                     action,
                     confidence,
@@ -224,6 +320,9 @@ class MarketByPricePaperRuntime:
                     aligned,
                     composite.features.pressure_score,
                     composite.quote_age_ms,
+                    float(getattr(composite.features, "depth_consensus", 0.0)),
+                    expected_future_bps,
+                    selected_horizon,
                 )
             except Exception:
                 logger.exception("MBP_PREMODEL_SIGNAL_FAILED | instrument=%s", tag)
