@@ -144,23 +144,37 @@ class LiquidityPulseScalpRuntime:
     @staticmethod
     def _pulse(composite: CompositeMarketSnapshot) -> float:
         f = composite.features
+        value = lambda name, default=0.0: float(getattr(f, name, default))
         microprice = max(-1.0, min(1.0, f.microprice_bps / 2.0))
         depletion = max(-1.0, min(1.0, f.ask_depletion - f.bid_depletion))
         replenishment = max(
             -1.0, min(1.0, f.bid_replenishment - f.ask_replenishment)
         )
         deep_confirmation = max(-1.0, min(1.0, f.imbalance_50))
+        far_depth = max(
+            -1.0,
+            min(
+                1.0,
+                0.35 * value("weighted_imbalance_100", f.weighted_imbalance_20)
+                + 0.25 * value("weighted_imbalance_200", f.weighted_imbalance_20)
+                + 0.20 * value("depth_flow_100")
+                + 0.20 * value("depth_flow_200"),
+            ),
+        )
         return max(
             -1.0,
             min(
                 1.0,
-                0.24 * f.weighted_imbalance_20
-                + 0.18 * f.imbalance_5
-                + 0.16 * f.ofi_top
-                + 0.14 * microprice
-                + 0.12 * depletion
-                + 0.10 * replenishment
-                + 0.06 * deep_confirmation,
+                0.18 * f.weighted_imbalance_20
+                + 0.13 * f.imbalance_5
+                + 0.12 * f.ofi_top
+                + 0.10 * microprice
+                + 0.10 * depletion
+                + 0.08 * replenishment
+                + 0.08 * deep_confirmation
+                + 0.09 * value("depth_consensus", f.imbalance_50)
+                + 0.07 * value("depth_flow_50")
+                + 0.05 * far_depth,
             ),
         )
 
@@ -246,6 +260,10 @@ class LiquidityPulseScalpRuntime:
                     "horizon_scores_bps": horizon_scores,
                     "expected_future_move_bps": expected_future_bps,
                     "expected_premium_move_pct": expected_premium_move_pct,
+                    "depth_consensus": float(
+                        getattr(composite.features, "depth_consensus", 0.0)
+                    ),
+                    "estimate_kind": "MBP_HEURISTIC_NOT_CALIBRATED",
                 }
                 if self.prediction_sink is not None:
                     self.prediction_sink(
@@ -295,4 +313,3 @@ class LiquidityPulseScalpRuntime:
             self.settings.queue_size,
             self.worker_alive,
         )
-

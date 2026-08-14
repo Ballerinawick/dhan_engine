@@ -1,4 +1,3 @@
-
 import json
 import io
 import tempfile
@@ -485,6 +484,187 @@ class DeepLobFoundationTest(unittest.TestCase):
         features = derive_market_by_price_features(current, old, probe_quantity=20)
         self.assertGreater(features.pressure_score, 0)
         self.assertLessEqual(abs(features.pressure_score), 1.0)
+
+    def test_far_depth_levels_materially_change_pressure(self):
+        old_bids = [(100.0 - level * 0.05, 100, 5) for level in range(200)]
+        old_asks = [(100.05 + level * 0.05, 100, 5) for level in range(200)]
+        current_bids = list(old_bids)
+        current_asks = list(old_asks)
+        for level in range(100, 200):
+            price, _, orders = current_bids[level]
+            current_bids[level] = (price, 500, orders + 10)
+            price, _, orders = current_asks[level]
+            current_asks[level] = (price, 20, max(1, orders - 3))
+
+        old = BookSnapshot.build(
+            123,
+            "NIFTY_FUT",
+            old_bids,
+            old_asks,
+            received_ts=1_700_000_000.0,
+            received_mono=10.0,
+        )
+        current = BookSnapshot.build(
+            123,
+            "NIFTY_FUT",
+            current_bids,
+            current_asks,
+            received_ts=1_700_000_000.25,
+            received_mono=10.25,
+        )
+
+        features = derive_market_by_price_features(current, old)
+
+        self.assertAlmostEqual(features.weighted_imbalance_50, 0.0, places=6)
+        self.assertGreater(features.weighted_imbalance_200, 0.20)
+        self.assertGreater(features.depth_flow_200, 0.25)
+        self.assertGreater(features.pressure_score, 0.05)
+
+    def test_option_paper_blocks_edge_that_does_not_clear_spread_and_fees(self):
+        class Paper:
+            positions = {}
+            LOT_SIZES = {"NIFTY": 65}
+
+            @staticmethod
+            def has_open_position():
+                return False
+
+            @staticmethod
+            def on_entry(*args, **kwargs):
+                raise AssertionError("uneconomic entry must not be accepted")
+
+            @staticmethod
+            def on_tick(*args, **kwargs):
+                return None
+
+        settings = DeepLobOptionPaperSettings(
+            enabled=True,
+            capital=500000,
+            confidence_threshold=0.65,
+            pressure_threshold=0.05,
+            confirmation_count=1,
+            entry_cooldown_sec=0,
+            max_quote_age_sec=2,
+            take_profit_pct=2,
+            stop_loss_pct=1.5,
+            max_hold_sec=600,
+            enforce_market_hours=False,
+            market_start=market_time(9, 15),
+            entry_cutoff=market_time(15, 25),
+            market_end=market_time(15, 30),
+            round_trip_fee=60,
+            minimum_cost_multiple=2,
+        )
+        executor = DeepLobOptionPaperExecutor(settings, Paper())
+        executor.register_contracts({"CE": {"security_id": 201, "tag": "NIFTY_CE"}})
+        executor.on_quote(
+            201,
+            "NIFTY_CE",
+            100.5,
+            bid=100.0,
+            ask=101.0,
+            received_ts=time.time(),
+        )
+        composite = SimpleNamespace(
+            features=SimpleNamespace(pressure_score=0.5, mid=100.25),
+            full_quote={"ltp": 100.25},
+        )
+
+        executor.on_prediction(
+            paper_action="BUY_CE",
+            confidence=0.8,
+            composite=composite,
+            probability_down=0.1,
+            probability_flat=0.1,
+            probability_up=0.8,
+            model_version="test",
+            horizon_sec=60,
+            signal_metadata={"expected_premium_move_pct": 1.0},
+        )
+
+        self.assertEqual(executor.health()["entries"], 0)
+        self.assertEqual(executor.health()["blocks"], 1)
+
+    def test_depth_edge_decay_requires_repeated_confirmation_before_exit(self):
+        class Paper:
+            LOT_SIZES = {"NIFTY": 65}
+
+            def __init__(self):
+                self.positions = {
+                    201: {
+                        "tag": "NIFTY_CE",
+                        "entry": 101.0,
+                        "entry_ts": time.time() - 10,
+                    }
+                }
+                self.exits = []
+
+            def has_open_position(self):
+                return bool(self.positions)
+
+            def on_tick(self, secid, ltp):
+                return None
+
+            def on_exit(self, secid, price, reason):
+                self.exits.append((secid, price, reason))
+                self.positions.pop(secid)
+
+        settings = DeepLobOptionPaperSettings(
+            enabled=True,
+            capital=500000,
+            confidence_threshold=0.65,
+            pressure_threshold=0.05,
+            confirmation_count=1,
+            entry_cooldown_sec=0,
+            max_quote_age_sec=2,
+            take_profit_pct=10,
+            stop_loss_pct=10,
+            max_hold_sec=600,
+            enforce_market_hours=False,
+            market_start=market_time(9, 15),
+            entry_cutoff=market_time(15, 25),
+            market_end=market_time(15, 30),
+            round_trip_fee=60,
+            minimum_cost_multiple=2,
+            depth_exit_enabled=True,
+            exit_confirmation_count=2,
+            minimum_hold_sec=5,
+        )
+        paper = Paper()
+        executor = DeepLobOptionPaperExecutor(settings, paper)
+        executor.quotes[201] = {
+            "tag": "NIFTY_CE",
+            "ltp": 101.0,
+            "bid": 100.5,
+            "ask": 101.0,
+            "received_ts": time.time(),
+        }
+        prediction = {
+            "paper_action": "BUY_CE",
+            "confidence": 0.8,
+            "composite": SimpleNamespace(
+                features=SimpleNamespace(pressure_score=0.5, mid=100.25),
+                full_quote={"ltp": 100.25},
+            ),
+            "probability_down": 0.1,
+            "probability_flat": 0.1,
+            "probability_up": 0.8,
+            "model_version": "test",
+            "horizon_sec": 60,
+            "signal_metadata": {
+                "edge_active": False,
+                "expected_premium_move_pct": 0.0,
+            },
+        }
+
+        executor.on_prediction(**prediction)
+        self.assertEqual(paper.exits, [])
+        executor.on_prediction(**prediction)
+
+        self.assertEqual(len(paper.exits), 1)
+        self.assertEqual(
+            paper.exits[0][2], "DEEPLOB_MBP_EXIT:COST_ADJUSTED_EDGE_DECAY"
+        )
 
     def test_option_paper_entry_uses_ask_and_exit_uses_bid(self):
         class Paper:
