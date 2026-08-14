@@ -26,8 +26,21 @@ class MarketByPriceFeatures:
     imbalance_5: float
     imbalance_20: float
     imbalance_50: float
+    imbalance_100: float
+    imbalance_200: float
     weighted_imbalance_20: float
+    weighted_imbalance_50: float
+    weighted_imbalance_100: float
+    weighted_imbalance_200: float
     order_imbalance_20: float
+    order_imbalance_50: float
+    order_imbalance_100: float
+    order_imbalance_200: float
+    depth_flow_20: float
+    depth_flow_50: float
+    depth_flow_100: float
+    depth_flow_200: float
+    depth_consensus: float
     ofi_top: float
     bid_depletion: float
     ask_depletion: float
@@ -44,8 +57,21 @@ class MarketByPriceFeatures:
             self.imbalance_5,
             self.imbalance_20,
             self.imbalance_50,
+            self.imbalance_100,
+            self.imbalance_200,
             self.weighted_imbalance_20,
+            self.weighted_imbalance_50,
+            self.weighted_imbalance_100,
+            self.weighted_imbalance_200,
             self.order_imbalance_20,
+            self.order_imbalance_50,
+            self.order_imbalance_100,
+            self.order_imbalance_200,
+            self.depth_flow_20,
+            self.depth_flow_50,
+            self.depth_flow_100,
+            self.depth_flow_200,
+            self.depth_consensus,
             self.ofi_top,
             self.bid_depletion,
             self.ask_depletion,
@@ -158,6 +184,42 @@ def _weighted_imbalance(bids: Sequence, asks: Sequence, levels: int) -> float:
     return (bid - ask) / total if total else 0.0
 
 
+def _price_matched_depth_flow(
+    current_bids: Sequence,
+    current_asks: Sequence,
+    previous_bids: Sequence,
+    previous_asks: Sequence,
+    levels: int,
+) -> float:
+    """Measure displayed-liquidity change at the same prices.
+
+    Dhan's 200-depth feed is market-by-price, so this deliberately avoids
+    pretending that individual order IDs or FIFO queue positions are known.
+    """
+
+    def quantities(rows: Sequence) -> dict[float, int]:
+        return {
+            float(row.price): max(0, int(row.qty))
+            for row in rows[:levels]
+            if float(row.price) > 0
+        }
+
+    current_bid = quantities(current_bids)
+    current_ask = quantities(current_asks)
+    previous_bid = quantities(previous_bids)
+    previous_ask = quantities(previous_asks)
+    bid_delta = sum(
+        current_bid.get(price, 0) - previous_bid.get(price, 0)
+        for price in current_bid.keys() | previous_bid.keys()
+    )
+    ask_delta = sum(
+        current_ask.get(price, 0) - previous_ask.get(price, 0)
+        for price in current_ask.keys() | previous_ask.keys()
+    )
+    scale = max(abs(bid_delta) + abs(ask_delta), 1)
+    return max(-1.0, min(1.0, (bid_delta - ask_delta) / scale))
+
+
 def derive_market_by_price_features(
     current: BookSnapshot,
     previous: BookSnapshot | None = None,
@@ -195,20 +257,75 @@ def derive_market_by_price_features(
     imbalance_5 = _imbalance(current.bids, current.asks, 5)
     imbalance_20 = _imbalance(current.bids, current.asks, 20)
     imbalance_50 = _imbalance(current.bids, current.asks, 50)
-    weighted = _weighted_imbalance(current.bids, current.asks, 20)
-    order_imbalance = _imbalance(current.bids, current.asks, 20, use_orders=True)
+    imbalance_100 = _imbalance(current.bids, current.asks, 100)
+    imbalance_200 = _imbalance(current.bids, current.asks, 200)
+    weighted_20 = _weighted_imbalance(current.bids, current.asks, 20)
+    weighted_50 = _weighted_imbalance(current.bids, current.asks, 50)
+    weighted_100 = _weighted_imbalance(current.bids, current.asks, 100)
+    weighted_200 = _weighted_imbalance(current.bids, current.asks, 200)
+    order_20 = _imbalance(current.bids, current.asks, 20, use_orders=True)
+    order_50 = _imbalance(current.bids, current.asks, 50, use_orders=True)
+    order_100 = _imbalance(current.bids, current.asks, 100, use_orders=True)
+    order_200 = _imbalance(current.bids, current.asks, 200, use_orders=True)
+    flow_20 = flow_50 = flow_100 = flow_200 = 0.0
+    if previous:
+        flow_20 = _price_matched_depth_flow(
+            current.bids, current.asks, previous.bids, previous.asks, 20
+        )
+        flow_50 = _price_matched_depth_flow(
+            current.bids, current.asks, previous.bids, previous.asks, 50
+        )
+        flow_100 = _price_matched_depth_flow(
+            current.bids, current.asks, previous.bids, previous.asks, 100
+        )
+        flow_200 = _price_matched_depth_flow(
+            current.bids, current.asks, previous.bids, previous.asks, 200
+        )
+    depth_signals = (
+        imbalance_20,
+        imbalance_50,
+        imbalance_100,
+        imbalance_200,
+        weighted_20,
+        weighted_50,
+        weighted_100,
+        weighted_200,
+        order_20,
+        order_50,
+        order_100,
+        order_200,
+    )
+    directional = [value for value in depth_signals if abs(value) >= 0.02]
+    depth_consensus = (
+        sum(1.0 if value > 0 else -1.0 for value in directional) / len(directional)
+        if directional
+        else 0.0
+    )
     pressure_score = max(
         -1.0,
         min(
             1.0,
-            0.20 * imbalance_5
-            + 0.20 * imbalance_20
-            + 0.10 * imbalance_50
-            + 0.20 * weighted
-            + 0.10 * order_imbalance
-            + 0.10 * ofi_top
-            + 0.05 * (ask_depletion - bid_depletion)
-            + 0.05 * (bid_replenishment - ask_replenishment),
+            0.12 * imbalance_5
+            + 0.10 * imbalance_20
+            + 0.07 * imbalance_50
+            + 0.05 * imbalance_100
+            + 0.04 * imbalance_200
+            + 0.10 * weighted_20
+            + 0.07 * weighted_50
+            + 0.05 * weighted_100
+            + 0.04 * weighted_200
+            + 0.05 * order_20
+            + 0.03 * order_50
+            + 0.02 * order_100
+            + 0.02 * order_200
+            + 0.06 * ofi_top
+            + 0.06 * flow_20
+            + 0.04 * flow_50
+            + 0.03 * flow_100
+            + 0.02 * flow_200
+            + 0.02 * depth_consensus
+            + 0.04 * (ask_depletion - bid_depletion)
+            + 0.03 * (bid_replenishment - ask_replenishment),
         ),
     )
     return MarketByPriceFeatures(
@@ -218,8 +335,21 @@ def derive_market_by_price_features(
         imbalance_5=imbalance_5,
         imbalance_20=imbalance_20,
         imbalance_50=imbalance_50,
-        weighted_imbalance_20=weighted,
-        order_imbalance_20=order_imbalance,
+        imbalance_100=imbalance_100,
+        imbalance_200=imbalance_200,
+        weighted_imbalance_20=weighted_20,
+        weighted_imbalance_50=weighted_50,
+        weighted_imbalance_100=weighted_100,
+        weighted_imbalance_200=weighted_200,
+        order_imbalance_20=order_20,
+        order_imbalance_50=order_50,
+        order_imbalance_100=order_100,
+        order_imbalance_200=order_200,
+        depth_flow_20=flow_20,
+        depth_flow_50=flow_50,
+        depth_flow_100=flow_100,
+        depth_flow_200=flow_200,
+        depth_consensus=depth_consensus,
         ofi_top=ofi_top,
         bid_depletion=bid_depletion,
         ask_depletion=ask_depletion,
