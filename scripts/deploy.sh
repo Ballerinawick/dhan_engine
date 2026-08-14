@@ -10,6 +10,14 @@ REGION="ap-south-1"
 
 cd "${ROOT_DIR}"
 
+# Identify the exact source artifact executed by CodePipeline. This fingerprint
+# changes whenever the deploy script, image definition, or runtime template changes.
+SOURCE_FINGERPRINT="$(sha256sum \
+  Dockerfile \
+  scripts/deploy.sh \
+  deploy/aws/ec2/dhan-engine.env.example | sha256sum | awk '{print $1}')"
+echo "DEPLOY_SOURCE_FINGERPRINT | sha256=${SOURCE_FINGERPRINT}"
+
 # Install and start Docker on Amazon Linux 2023.
 sudo dnf install -y docker jq
 sudo systemctl enable --now docker
@@ -128,3 +136,5 @@ sudo systemctl daemon-reload
 sudo systemctl enable dhan-engine
 sudo systemctl restart dhan-engine
 sudo systemctl --no-pager --full status dhan-engine
+IMAGE_CREATED="$(sudo docker image inspect dhan-engine:latest --format '{{.Created}}')"
+echo "DEPLOY_RUNTIME_VERIFIED | source_sha256=${SOURCE_FINGERPRINT} | image_created=${IMAGE_CREATED} | service=${DHAN_SERVICE}"
