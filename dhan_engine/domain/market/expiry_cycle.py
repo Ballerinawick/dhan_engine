@@ -68,4 +68,3 @@ def expiry_cycle_context(
         sessions_to_expiry=sessions_to_expiry,
         premium_regime=regimes[cycle_day],
     )
-

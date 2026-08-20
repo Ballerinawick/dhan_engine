@@ -403,3 +403,4 @@ class ParquetDepthRecorder:
             self._uploaded,
             self._failures,
         )
+

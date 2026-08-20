@@ -268,4 +268,3 @@ class TradeSummaryS3Sink:
             "net_pnl": round(sum(net_values), 2),
             "by_profile": by_profile,
         }
-
