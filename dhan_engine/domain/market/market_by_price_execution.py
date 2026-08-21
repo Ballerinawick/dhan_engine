@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 from dhan_engine.domain.market.full_depth_microstructure import BookSnapshot
+from dhan_engine.domain.market.liquidity_event_state import LiquidityEventEvidence
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,7 @@ class CompositeMarketSnapshot:
     full_quote: Mapping[str, object]
     quote_age_ms: float
     features: MarketByPriceFeatures
+    event_evidence: LiquidityEventEvidence | None = None
 
 
 def validate_composite_snapshot(

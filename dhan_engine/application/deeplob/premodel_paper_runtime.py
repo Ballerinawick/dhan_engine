@@ -9,6 +9,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from dhan_engine.domain.market.market_by_price_execution import CompositeMarketSnapshot
+from dhan_engine.domain.market.liquidity_event_state import adaptive_horizon_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -176,8 +177,11 @@ class MarketByPricePaperRuntime:
         features = composite.features
         value = lambda name, default=0.0: float(getattr(features, name, default))
         microprice = max(-1.0, min(1.0, value("microprice_bps") / 2.0))
+        event = getattr(composite, "event_evidence", None)
+        event_score = event.score if event is not None else 0.0
         raw = (
-            0.46 * value("pressure_score")
+            0.21 * value("pressure_score")
+            + 0.25 * event_score
             + 0.10 * value("weighted_imbalance_20")
             + 0.08 * value("weighted_imbalance_50", value("weighted_imbalance_20"))
             + 0.06 * value("weighted_imbalance_100", value("weighted_imbalance_20"))
@@ -258,21 +262,19 @@ class MarketByPricePaperRuntime:
                     )
                     for horizon in self.settings.horizons_sec
                 }
-                aligned_horizons = [
-                    horizon
-                    for horizon in self.settings.horizons_sec
-                    if horizon_scores[str(horizon)] * mean_score > 0
-                ]
-                selected_horizon = (
+                selected_horizon = adaptive_horizon_seconds(
+                    getattr(composite, "event_evidence", None),
+                    minimum=min(self.settings.horizons_sec),
+                    maximum=max(self.settings.horizons_sec),
+                    profile="dynamic",
+                )
+                horizon_scores[str(selected_horizon)] = max(
+                    -50.0,
                     min(
-                        aligned_horizons,
-                        key=lambda horizon: (
-                            abs(horizon_scores[str(horizon)]) < 2.0,
-                            horizon,
-                        ),
-                    )
-                    if aligned_horizons
-                    else self.settings.horizon_sec
+                        50.0,
+                        velocity_bps_sec * selected_horizon
+                        + mean_score * 6.0 * (selected_horizon / 30.0) ** 0.5,
+                    ),
                 )
                 expected_future_bps = abs(
                     horizon_scores.get(str(selected_horizon), 0.0)
@@ -294,6 +296,20 @@ class MarketByPricePaperRuntime:
                     "expected_future_move_bps": expected_future_bps,
                     "expected_premium_move_pct": expected_premium_move_pct,
                     "estimate_kind": "MBP_HEURISTIC_NOT_CALIBRATED",
+                    "adaptive_horizon": True,
+                    "mbp_event_score": getattr(
+                        getattr(composite, "event_evidence", None), "score", 0.0
+                    ),
+                    "mbp_event_quality": getattr(
+                        getattr(composite, "event_evidence", None),
+                        "evidence_quality",
+                        0.0,
+                    ),
+                    "mbp_event_persistence": getattr(
+                        getattr(composite, "event_evidence", None),
+                        "persistence",
+                        0.0,
+                    ),
                 }
                 self._signals += 1
                 if self.prediction_sink is not None:
@@ -312,7 +328,8 @@ class MarketByPricePaperRuntime:
                     "MBP_PREMODEL_SIGNAL | instrument=%s | action=%s | confidence=%.4f | "
                     "evidence=%.4f | alignment=%.3f | pressure=%.4f | quote_age_ms=%.1f | "
                     "depth_consensus=%+.3f | expected_future_bps=%.3f | "
-                    "horizon_sec=%s | orders=false",
+                    "horizon_sec=%s | event_score=%+.3f | event_quality=%.3f | "
+                    "event_persistence=%.3f | orders=false",
                     tag,
                     action,
                     confidence,
@@ -323,6 +340,9 @@ class MarketByPricePaperRuntime:
                     float(getattr(composite.features, "depth_consensus", 0.0)),
                     expected_future_bps,
                     selected_horizon,
+                    metadata["mbp_event_score"],
+                    metadata["mbp_event_quality"],
+                    metadata["mbp_event_persistence"],
                 )
             except Exception:
                 logger.exception("MBP_PREMODEL_SIGNAL_FAILED | instrument=%s", tag)

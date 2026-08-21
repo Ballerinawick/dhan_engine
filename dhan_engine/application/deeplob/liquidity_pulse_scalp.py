@@ -9,6 +9,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from dhan_engine.domain.market.market_by_price_execution import CompositeMarketSnapshot
+from dhan_engine.domain.market.liquidity_event_state import adaptive_horizon_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -161,20 +162,23 @@ class LiquidityPulseScalpRuntime:
                 + 0.20 * value("depth_flow_200"),
             ),
         )
+        event = getattr(composite, "event_evidence", None)
+        event_score = event.score if event is not None else 0.0
         return max(
             -1.0,
             min(
                 1.0,
-                0.18 * f.weighted_imbalance_20
-                + 0.13 * f.imbalance_5
-                + 0.12 * f.ofi_top
-                + 0.10 * microprice
-                + 0.10 * depletion
-                + 0.08 * replenishment
+                0.10 * f.weighted_imbalance_20
+                + 0.09 * f.imbalance_5
+                + 0.08 * f.ofi_top
+                + 0.07 * microprice
+                + 0.07 * depletion
+                + 0.06 * replenishment
                 + 0.08 * deep_confirmation
                 + 0.09 * value("depth_consensus", f.imbalance_50)
                 + 0.07 * value("depth_flow_50")
-                + 0.05 * far_depth,
+                + 0.05 * far_depth
+                + 0.24 * event_score,
             ),
         )
 
@@ -220,6 +224,10 @@ class LiquidityPulseScalpRuntime:
                     and alignment >= self.settings.minimum_alignment
                     and aligned_velocity
                     and composite.features.spread_bps <= 10.0
+                    and (
+                        getattr(composite, "event_evidence", None) is None
+                        or composite.event_evidence.evidence_quality >= 0.20
+                    )
                 )
                 action = "BUY_CE" if active and strength > 0 else (
                     "BUY_PE" if active else "NO_TRADE"
@@ -236,9 +244,19 @@ class LiquidityPulseScalpRuntime:
                     )
                     for horizon in self.settings.horizons_sec
                 }
-                selected_horizon = max(
-                    self.settings.horizons_sec,
-                    key=lambda horizon: abs(horizon_scores[str(horizon)]),
+                selected_horizon = adaptive_horizon_seconds(
+                    getattr(composite, "event_evidence", None),
+                    minimum=min(self.settings.horizons_sec),
+                    maximum=max(self.settings.horizons_sec),
+                    profile="scalp",
+                )
+                horizon_scores[str(selected_horizon)] = max(
+                    -50.0,
+                    min(
+                        50.0,
+                        velocity_bps_sec * selected_horizon
+                        + strength * (2.0 + selected_horizon / 15.0),
+                    ),
                 )
                 expected_future_bps = abs(horizon_scores[str(selected_horizon)])
                 expected_premium_move_pct = min(
@@ -264,6 +282,20 @@ class LiquidityPulseScalpRuntime:
                         getattr(composite.features, "depth_consensus", 0.0)
                     ),
                     "estimate_kind": "MBP_HEURISTIC_NOT_CALIBRATED",
+                    "adaptive_horizon": True,
+                    "mbp_event_score": getattr(
+                        getattr(composite, "event_evidence", None), "score", 0.0
+                    ),
+                    "mbp_event_quality": getattr(
+                        getattr(composite, "event_evidence", None),
+                        "evidence_quality",
+                        0.0,
+                    ),
+                    "mbp_event_persistence": getattr(
+                        getattr(composite, "event_evidence", None),
+                        "persistence",
+                        0.0,
+                    ),
                 }
                 if self.prediction_sink is not None:
                     self.prediction_sink(
@@ -282,7 +314,9 @@ class LiquidityPulseScalpRuntime:
                 logger.info(
                     "DEEPLOB_SCALP_SIGNAL | instrument=%s | action=%s | horizon_sec=%s | "
                     "strength=%.4f | alignment=%.3f | velocity_bps_sec=%+.4f | "
-                    "expected_future_bps=%.3f | expected_premium_pct=%.3f | paper=true",
+                    "expected_future_bps=%.3f | expected_premium_pct=%.3f | "
+                    "event_score=%+.3f | event_quality=%.3f | "
+                    "event_persistence=%.3f | paper=true",
                     tag,
                     action,
                     selected_horizon,
@@ -291,6 +325,9 @@ class LiquidityPulseScalpRuntime:
                     velocity_bps_sec,
                     expected_future_bps,
                     expected_premium_move_pct,
+                    metadata["mbp_event_score"],
+                    metadata["mbp_event_quality"],
+                    metadata["mbp_event_persistence"],
                 )
             except Exception:
                 logger.exception(

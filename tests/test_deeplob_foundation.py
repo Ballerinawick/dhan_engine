@@ -775,6 +775,55 @@ class DeepLobFoundationTest(unittest.TestCase):
         self.assertEqual(paper.exits[0][1], 103.1)
         self.assertEqual(paper.exits[0][2], "DEEPLOB_MBP_EXIT:TAKE_PROFIT")
 
+    def test_option_paper_timeout_uses_selected_model_horizon(self):
+        class Paper:
+            def __init__(self):
+                self.positions = {
+                    201: {
+                        "tag": "NIFTY_CE",
+                        "entry": 100.0,
+                        "entry_ts": time.time() - 15.0,
+                        "model_horizon_sec": 10,
+                    }
+                }
+                self.exits = []
+
+            def on_exit(self, secid, price, reason):
+                self.exits.append((secid, price, reason))
+                self.positions.pop(secid)
+
+        settings = DeepLobOptionPaperSettings(
+            enabled=True,
+            capital=500000,
+            confidence_threshold=0.65,
+            pressure_threshold=0.05,
+            confirmation_count=2,
+            entry_cooldown_sec=0,
+            max_quote_age_sec=2,
+            take_profit_pct=10.0,
+            stop_loss_pct=10.0,
+            minimum_hold_sec=5,
+            max_hold_sec=600,
+            enforce_market_hours=False,
+            market_start=market_time(9, 15),
+            entry_cutoff=market_time(15, 25),
+            market_end=market_time(15, 30),
+        )
+        paper = Paper()
+        executor = DeepLobOptionPaperExecutor(settings, paper)
+        executor.quotes[201] = {
+            "bid": 100.0,
+            "ask": 100.1,
+            "received_ts": time.time(),
+        }
+
+        executor._evaluate_price_exit(201)
+
+        self.assertEqual(
+            paper.exits,
+            [(201, 100.0, "DEEPLOB_MBP_EXIT:TIMEOUT")],
+        )
+
     def test_option_paper_blocks_stale_option_quote(self):
         class Paper:
             positions = {}

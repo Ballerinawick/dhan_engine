@@ -520,11 +520,19 @@ class DeepLobOptionPaperExecutor:
         entry = float(position["entry"])
         pnl_pct = (executable_bid - entry) / entry * 100.0
         hold_sec = time.time() - float(position["entry_ts"])
+        forecast_horizon = float(
+            position.get("model_horizon_sec", self.settings.max_hold_sec)
+            or self.settings.max_hold_sec
+        )
+        adaptive_hold_sec = min(
+            self.settings.max_hold_sec,
+            max(self.settings.minimum_hold_sec, forecast_horizon),
+        )
         if pnl_pct >= self.settings.take_profit_pct:
             self._exit(secid, "DEEPLOB_MBP_EXIT:TAKE_PROFIT")
         elif pnl_pct <= -self.settings.stop_loss_pct:
             self._exit(secid, "DEEPLOB_MBP_EXIT:STOP_LOSS")
-        elif hold_sec >= self.settings.max_hold_sec:
+        elif hold_sec >= adaptive_hold_sec:
             self._exit(secid, "DEEPLOB_MBP_EXIT:TIMEOUT")
 
     def _exit(self, secid: int, reason: str) -> None:
