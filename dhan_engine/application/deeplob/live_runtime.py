@@ -27,6 +27,11 @@ from dhan_engine.application.deeplob.post_market_analysis import (
     PostMarketAnalysisRuntime,
     PostMarketAnalysisSettings,
 )
+from dhan_engine.application.deeplob.percentage_reversal import (
+    HistoricalReversalPrior,
+    PercentageReversalRuntime,
+    PercentageReversalSettings,
+)
 from dhan_engine.application.deeplob.trade_summary_s3 import (
     TradeSummaryS3Settings,
     TradeSummaryS3Sink,
@@ -77,6 +82,8 @@ class DeepLobLiveRuntime:
         option_selector=None,
         scalp_inference=None,
         scalp_option_paper=None,
+        reversal_inference=None,
+        reversal_option_paper=None,
         post_market_analysis=None,
     ):
         self.settings = settings
@@ -91,6 +98,8 @@ class DeepLobLiveRuntime:
         self.trade_summary_sink = trade_summary_sink
         self.scalp_inference = scalp_inference
         self.scalp_option_paper = scalp_option_paper
+        self.reversal_inference = reversal_inference
+        self.reversal_option_paper = reversal_option_paper
         self.post_market_analysis = post_market_analysis
         self.instrument_metadata = {}
         self._received = 0
@@ -152,7 +161,11 @@ class DeepLobLiveRuntime:
         with self._quote_lock:
             self._latest_fullquote[int(secid)] = quote
             self._fullquote_received += 1
-        for executor in (self.option_paper, self.scalp_option_paper):
+        for executor in (
+            self.option_paper,
+            self.scalp_option_paper,
+            self.reversal_option_paper,
+        ):
             if executor is not None:
                 executor.on_quote(
                     int(secid),
@@ -231,11 +244,23 @@ class DeepLobLiveRuntime:
                 logger.exception(
                     "DEEPLOB_SCALP_DISPATCH_FAILED | instrument=%s", tag
                 )
+        if self.reversal_inference is not None:
+            try:
+                self.reversal_inference.on_book(tag, snapshot, composite)
+            except Exception:
+                self._inference_dispatch_failures += 1
+                logger.exception(
+                    "DEEPLOB_REVERSAL_DISPATCH_FAILED | instrument=%s", tag
+                )
 
     def _ensure_option_contracts(self, *, force: bool = False) -> bool:
         executors = tuple(
             executor
-            for executor in (self.option_paper, self.scalp_option_paper)
+            for executor in (
+                self.option_paper,
+                self.scalp_option_paper,
+                self.reversal_option_paper,
+            )
             if executor is not None
         )
         if not executors or self.option_selector is None:
@@ -344,6 +369,8 @@ class DeepLobLiveRuntime:
         self.inference.start_worker()
         if self.scalp_inference is not None:
             self.scalp_inference.start_worker()
+        if self.reversal_inference is not None:
+            self.reversal_inference.start_worker()
         if self.trade_summary_sink is not None:
             self.trade_summary_sink.start()
         self._future_subscriptions = [
@@ -394,22 +421,37 @@ class DeepLobLiveRuntime:
                     self.inference.worker_alive,
                     self._quality_rejections,
                 )
-                if self.option_paper is not None or self.scalp_option_paper is not None:
+                if any(
+                    executor is not None
+                    for executor in (
+                        self.option_paper,
+                        self.scalp_option_paper,
+                        self.reversal_option_paper,
+                    )
+                ):
                     self._ensure_option_contracts()
                 dynamic_health = None
                 scalp_health = None
+                reversal_health = None
                 if self.option_paper is not None:
                     self.option_paper.heartbeat()
                     dynamic_health = self.option_paper.health()
                 if self.scalp_option_paper is not None:
                     self.scalp_option_paper.heartbeat()
                     scalp_health = self.scalp_option_paper.health()
-                if dynamic_health is not None or scalp_health is not None:
+                if self.reversal_option_paper is not None:
+                    self.reversal_option_paper.heartbeat()
+                    reversal_health = self.reversal_option_paper.health()
+                if any(
+                    health is not None
+                    for health in (dynamic_health, scalp_health, reversal_health)
+                ):
                     logger.info(
-                        "DEEPLOB_PAPER_HEALTH | dynamic=%s | scalp=%s | "
+                        "DEEPLOB_PAPER_HEALTH | dynamic=%s | scalp=%s | reversal=%s | "
                         "selection_attempts=%s | selection_failures=%s | trade_summary_s3=%s",
                         dynamic_health,
                         scalp_health,
+                        reversal_health,
                         self._option_selection_attempts,
                         self._option_selection_failures,
                         (
@@ -422,6 +464,8 @@ class DeepLobLiveRuntime:
                 self.inference.log_health()
                 if self.scalp_inference is not None:
                     self.scalp_inference.log_health()
+                if self.reversal_inference is not None:
+                    self.reversal_inference.log_health()
                 if self.post_market_analysis is not None:
                     self.post_market_analysis.maybe_start()
         except KeyboardInterrupt:
@@ -432,6 +476,8 @@ class DeepLobLiveRuntime:
             self.inference.close_worker()
             if self.scalp_inference is not None:
                 self.scalp_inference.close_worker()
+            if self.reversal_inference is not None:
+                self.reversal_inference.close_worker()
             self.recorder.close()
             if self.trade_summary_sink is not None:
                 self.trade_summary_sink.close()
@@ -473,15 +519,43 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
     option_paper = None
     scalp_option_paper = None
     scalp_inference = None
+    reversal_option_paper = None
+    reversal_inference = None
     trade_summary_sink = None
     post_market_analysis = PostMarketAnalysisRuntime(
         PostMarketAnalysisSettings.from_env()
     )
     adaptive_scalp_settings = DeepLobOptionPaperSettings.scalp_from_env()
+    reversal_runtime_settings = PercentageReversalSettings.from_env()
+    reversal_paper_settings = DeepLobOptionPaperSettings.from_env(
+        "DEEPLOB_REVERSAL_PAPER",
+        defaults={
+            "ENABLED": "1",
+            "CAPITAL": "500000",
+            "CONFIDENCE": "0.70",
+            "PRESSURE": "0",
+            "CONFIRMATIONS": "2",
+            "COOLDOWN_SEC": "30",
+            "MAX_QUOTE_AGE_SEC": "2",
+            "TAKE_PROFIT_PCT": "1.5",
+            "STOP_LOSS_PCT": "0.8",
+            "MAX_HOLD_SEC": "120",
+            "ENFORCE_MARKET_HOURS": "1",
+            "MARKET_START": "09:15",
+            "ENTRY_CUTOFF": "15:24",
+            "MARKET_END": "15:25",
+            "ROUND_TRIP_FEE": "60",
+            "MIN_COST_MULTIPLE": "2",
+            "DEPTH_EXIT_ENABLED": "1",
+            "EXIT_CONFIRMATIONS": "3",
+            "MIN_HOLD_SEC": "5",
+        },
+    )
     if (
         option_paper_settings.enabled
         or scalp_paper_settings.enabled
         or adaptive_scalp_settings.enabled
+        or (reversal_runtime_settings.enabled and reversal_paper_settings.enabled)
     ):
         option_selector = OptionChainSelector(
             access_token=inference_settings.access_token,
@@ -534,6 +608,23 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
             scalp_inference = LiquidityPulseScalpRuntime(
                 LiquidityPulseScalpSettings.from_env(),
                 prediction_sink=scalp_option_paper.on_prediction,
+            )
+        if reversal_runtime_settings.enabled and reversal_paper_settings.enabled:
+            reversal_option_paper = DeepLobOptionPaperExecutor(
+                reversal_paper_settings,
+                PaperTradeManager(capital=reversal_paper_settings.capital),
+                trade_summary_sink=trade_summary_sink,
+                profile="reversal",
+                strategy="deeplob_mbp_percentage_reversal_v1",
+            )
+            reversal_inference = PercentageReversalRuntime(
+                reversal_runtime_settings,
+                prediction_sink=reversal_option_paper.on_prediction,
+                historical_prior=HistoricalReversalPrior(reversal_runtime_settings),
+            )
+            logger.warning(
+                "DEEPLOB_REVERSAL_PAPER_CONFIGURED | isolated_portfolio=true | "
+                "extra_broker_connections=0 | historical_s3_tick_reads=0"
             )
     runtime = None
     adapter = FullDepth200Adapter(
@@ -600,6 +691,8 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
         option_selector=option_selector,
         scalp_inference=scalp_inference,
         scalp_option_paper=scalp_option_paper,
+        reversal_inference=reversal_inference,
+        reversal_option_paper=reversal_option_paper,
         post_market_analysis=post_market_analysis,
     )
     return runtime
