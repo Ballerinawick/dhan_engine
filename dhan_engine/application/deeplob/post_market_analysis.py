@@ -134,6 +134,7 @@ class PostMarketAnalysisRuntime:
         rows = 0
         imbalance_sum = 0.0
         price_timeline = []
+        reversal_timeline = []
         for key in sorted(objects):
             body = self._client().get_object(
                 Bucket=self.settings.bucket, Key=key
@@ -205,7 +206,19 @@ class PostMarketAnalysisRuntime:
                 ask_total = sum(int(value or 0) for value in asks[:20])
                 total = bid_total + ask_total
                 imbalance_sum += (bid_total - ask_total) / total if total else 0.0
+                full_bid_total = sum(int(value or 0) for value in bids[:200])
+                full_ask_total = sum(int(value or 0) for value in asks[:200])
+                full_total = full_bid_total + full_ask_total
                 price_timeline.append((int(received_ns), price))
+                reversal_timeline.append(
+                    (
+                        int(received_ns),
+                        price,
+                        (full_bid_total - full_ask_total) / full_total
+                        if full_total
+                        else 0.0,
+                    )
+                )
                 rows += 1
             if "expiry=" in key:
                 expiry = key.split("expiry=", 1)[1].split("/", 1)[0]
@@ -231,6 +244,10 @@ class PostMarketAnalysisRuntime:
             expiry = max(set(option_expiries), key=option_expiries.count)
         prediction_evaluation = self._evaluate_trades(
             trade_ledger.get("trades", []), price_timeline
+        )
+        reversal_calibration = self._reversal_calibration(reversal_timeline)
+        cumulative_reversal_prior = self._merge_reversal_prior(
+            trade_date, reversal_calibration
         )
         cycle = {}
         try:
@@ -263,6 +280,7 @@ class PostMarketAnalysisRuntime:
             "realized_trend": trend,
             "expiry_cycle": cycle,
             "prediction_evaluation": prediction_evaluation,
+            "reversal_calibration": reversal_calibration,
             "paper_trade_summary": trade_ledger.get("summary", {}),
             "cycle_history": cycle_history,
             "next_session_outlook": {
@@ -281,6 +299,22 @@ class PostMarketAnalysisRuntime:
             Body=json.dumps(report, separators=(",", ":"), sort_keys=True).encode(),
             ContentType="application/json",
         )
+        prior_key = f"{self.settings.report_prefix}/reversal-prior/latest.json"
+        self._client().put_object(
+            Bucket=self.settings.bucket,
+            Key=prior_key,
+            Body=json.dumps(
+                {
+                    "schema_version": 1,
+                    "trade_date": trade_date,
+                    **cumulative_reversal_prior,
+                    "note": "Historical MBP calibration only; live confirmation remains mandatory.",
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode(),
+            ContentType="application/json",
+        )
         logger.info(
             "DEEPLOB_POST_MARKET_REPORT_OK | trade_date=%s | files=%s | rows=%s | "
             "trend=%s | return_bps=%+.3f | key=%s",
@@ -291,6 +325,132 @@ class PostMarketAnalysisRuntime:
             return_bps,
             key,
         )
+
+    def _merge_reversal_prior(self, trade_date: str, current: dict) -> dict:
+        """Accumulate session evidence without allowing one day to replace history."""
+        prior_key = f"{self.settings.report_prefix}/reversal-prior/latest.json"
+        previous = {}
+        try:
+            body = self._client().get_object(
+                Bucket=self.settings.bucket, Key=prior_key
+            )["Body"].read()
+            decoded = json.loads(body.decode("utf-8"))
+            if isinstance(decoded, dict) and decoded.get("trade_date") != trade_date:
+                previous = decoded
+        except Exception:
+            previous = {}
+
+        def merge_side(side: str) -> tuple[int, int, float]:
+            samples_key = f"{side}_samples"
+            correct_key = f"{side}_correct"
+            probability_key = f"{side}_probability"
+            previous_samples = max(0, int(previous.get(samples_key, 0) or 0))
+            current_samples = max(0, int(current.get(samples_key, 0) or 0))
+            previous_correct = max(
+                0,
+                int(
+                    previous.get(
+                        correct_key,
+                        round(
+                            float(previous.get(probability_key, 0.5))
+                            * previous_samples
+                        ),
+                    )
+                    or 0
+                ),
+            )
+            current_correct = max(0, int(current.get(correct_key, 0) or 0))
+            combined_samples = previous_samples + current_samples
+            if not combined_samples:
+                return 0, 0, 0.5
+            combined_correct = min(
+                combined_samples, previous_correct + current_correct
+            )
+            probability = (combined_correct + 1) / (combined_samples + 2)
+            return combined_samples, combined_correct, round(probability, 6)
+
+        bullish_samples, bullish_correct, bullish_probability = merge_side("bullish")
+        bearish_samples, bearish_correct, bearish_probability = merge_side("bearish")
+        session_count = int(previous.get("session_count", 0) or 0) + 1
+        return {
+            "sample_count": bullish_samples + bearish_samples,
+            "bullish_samples": bullish_samples,
+            "bearish_samples": bearish_samples,
+            "bullish_correct": bullish_correct,
+            "bearish_correct": bearish_correct,
+            "bullish_probability": bullish_probability,
+            "bearish_probability": bearish_probability,
+            "session_count": session_count,
+            "latest_session_sample_count": int(current.get("sample_count", 0) or 0),
+            "lookback_sec": current.get("lookback_sec", 30),
+            "horizon_sec": current.get("horizon_sec", 60),
+            "minimum_move_bps": current.get("minimum_move_bps", 1.5),
+        }
+
+    @staticmethod
+    def _reversal_calibration(
+        timeline: list[tuple[int, float, float]],
+        *,
+        lookback_sec: int = 30,
+        horizon_sec: int = 60,
+        minimum_move_bps: float = 1.5,
+    ) -> dict:
+        """Estimate how often imbalance turns preceded a same-direction move."""
+        if len(timeline) < 3:
+            return {
+                "sample_count": 0,
+                "bullish_samples": 0,
+                "bearish_samples": 0,
+                "bullish_correct": 0,
+                "bearish_correct": 0,
+                "bullish_probability": 0.5,
+                "bearish_probability": 0.5,
+            }
+        timeline.sort(key=lambda row: row[0])
+        times = [row[0] for row in timeline]
+        bullish_total = bullish_correct = bearish_total = bearish_correct = 0
+        previous_sign = 0
+        for index, (received_ns, price, imbalance) in enumerate(timeline):
+            sign = 1 if imbalance >= 0.08 else -1 if imbalance <= -0.08 else 0
+            if not sign or sign == previous_sign:
+                if sign:
+                    previous_sign = sign
+                continue
+            before_ns = received_ns - lookback_sec * 1_000_000_000
+            future_ns = received_ns + horizon_sec * 1_000_000_000
+            before_index = max(0, bisect.bisect_left(times, before_ns))
+            future_index = bisect.bisect_left(times, future_ns)
+            if future_index >= len(timeline) or before_index >= index:
+                previous_sign = sign
+                continue
+            before_price = timeline[before_index][1]
+            future_price = timeline[future_index][1]
+            prior_bps = (price - before_price) / max(before_price, 0.001) * 10_000
+            forward_bps = (future_price - price) / max(price, 0.001) * 10_000
+            if sign > 0 and prior_bps <= -minimum_move_bps:
+                bullish_total += 1
+                bullish_correct += int(forward_bps > 0)
+            elif sign < 0 and prior_bps >= minimum_move_bps:
+                bearish_total += 1
+                bearish_correct += int(forward_bps < 0)
+            previous_sign = sign
+        # Laplace smoothing prevents a tiny session sample from becoming 0% or 100%.
+        return {
+            "sample_count": bullish_total + bearish_total,
+            "bullish_samples": bullish_total,
+            "bearish_samples": bearish_total,
+            "bullish_correct": bullish_correct,
+            "bearish_correct": bearish_correct,
+            "bullish_probability": round(
+                (bullish_correct + 1) / (bullish_total + 2), 6
+            ),
+            "bearish_probability": round(
+                (bearish_correct + 1) / (bearish_total + 2), 6
+            ),
+            "lookback_sec": lookback_sec,
+            "horizon_sec": horizon_sec,
+            "minimum_move_bps": minimum_move_bps,
+        }
 
     def _load_trade_ledger(self, trade_date: str) -> dict:
         key = (
