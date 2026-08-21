@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -35,6 +36,7 @@ from dhan_engine.domain.market.market_by_price_execution import (
     derive_market_by_price_features,
     validate_composite_snapshot,
 )
+from dhan_engine.domain.market.liquidity_event_state import LiquidityEventTracker
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,7 @@ class DeepLobLiveRuntime:
         self._latest_fullquote = {}
         self._fullquote_received = 0
         self._previous_book = {}
+        self._liquidity_events = defaultdict(LiquidityEventTracker)
         self._quality_rejections = {}
         self._max_quote_age_ms = float(os.getenv("DEEPLOB_MAX_FULLQUOTE_AGE_MS", "1500"))
         self._max_spread_bps = float(os.getenv("DEEPLOB_MAX_FUTURE_SPREAD_BPS", "25"))
@@ -213,6 +216,7 @@ class DeepLobLiveRuntime:
             full_quote=latest_quote,
             quote_age_ms=quote_age_ms,
             features=features,
+            event_evidence=self._liquidity_events[tag].update(snapshot, latest_quote),
         )
         try:
             self.inference.on_book(tag, snapshot, composite)
