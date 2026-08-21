@@ -10,6 +10,8 @@ from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
 SLOW_BROADCAST_MS = float(os.getenv("TRIWAVE_BROADCAST_SLOW_MS", "50") or 50)
+_deeplob_dashboard = None
+_deeplob_dashboard_lock = threading.Lock()
 
 
 def start_session_viewer_server() -> None:
@@ -24,6 +26,29 @@ def start_session_viewer_server() -> None:
     thread = threading.Thread(target=server.serve_forever, name="TriWaveSessionViewer", daemon=True)
     thread.start()
     logger.info("TRIWAVE_VIEWER_ACTIVE | host=%s | port=%s", host, port)
+
+
+def _get_deeplob_dashboard():
+    global _deeplob_dashboard
+    if _deeplob_dashboard is not None:
+        return _deeplob_dashboard
+    with _deeplob_dashboard_lock:
+        if _deeplob_dashboard is None:
+            from dhan_engine.interfaces.web.deeplob_s3_dashboard import (
+                DeepLobDashboardSettings,
+                DeepLobS3Dashboard,
+            )
+
+            _deeplob_dashboard = DeepLobS3Dashboard(
+                DeepLobDashboardSettings.from_env()
+            )
+            logger.info(
+                "DEEPLOB_DASHBOARD_SOURCE_READY | enabled=%s | bucket=%s | prefix=%s",
+                _deeplob_dashboard.enabled,
+                _deeplob_dashboard.settings.bucket,
+                _deeplob_dashboard.settings.market_prefix,
+            )
+    return _deeplob_dashboard
 
 
 class SessionViewerHandler(BaseHTTPRequestHandler):
@@ -45,6 +70,20 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
             return
 
         query = parse_qs(parsed.query)
+        if parsed.path == "/api/deeplob/sessions":
+            self._deeplob_json(lambda dashboard: {"sessions": dashboard.list_sessions()})
+            return
+        if parsed.path == "/api/deeplob/session":
+            trade_date = (query.get("date") or [""])[0]
+            bucket_sec = _positive_int((query.get("bucket_sec") or ["5"])[0], 5)
+            self._deeplob_json(
+                lambda dashboard: dashboard.session_payload(trade_date, bucket_sec)
+            )
+            return
+        if parsed.path == "/api/deeplob/live":
+            bucket_sec = _positive_int((query.get("bucket_sec") or ["5"])[0], 5)
+            self._deeplob_json(lambda dashboard: dashboard.latest_payload(bucket_sec))
+            return
         if parsed.path == "/api/live/stream":
             self._stream_live_session(query)
             return
@@ -70,6 +109,23 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
             self._download_session_file(session, query)
             return
         self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    def _deeplob_json(self, build_payload) -> None:
+        try:
+            dashboard = _get_deeplob_dashboard()
+            if not dashboard.enabled:
+                self._json(
+                    {"error": "DeepLOB S3 dashboard is disabled: DEEPLOB_S3_BUCKET is empty"},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+            self._json(build_payload(dashboard))
+        except Exception as exc:
+            logger.exception("DEEPLOB_DASHBOARD_API_ERROR | path=%s", self.path)
+            self._json(
+                {"error": "DeepLOB dashboard read failed", "detail": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def _authorized(self, parsed) -> bool:
         token = os.getenv("TRIWAVE_VIEWER_TOKEN", "").strip()
