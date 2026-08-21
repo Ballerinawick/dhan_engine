@@ -10,6 +10,10 @@ from dataclasses import dataclass
 
 from dhan_engine.domain.market.market_by_price_execution import CompositeMarketSnapshot
 from dhan_engine.domain.market.liquidity_event_state import adaptive_horizon_seconds
+from dhan_engine.domain.market.ltp_execution_path import (
+    sample_ltp_execution_path,
+    summarize_ltp_execution_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +198,11 @@ class LiquidityPulseScalpRuntime:
                     continue
                 history = self._history[tag]
                 history.append(
-                    (snapshot.received_mono, composite.features.mid, self._pulse(composite))
+                    (
+                        snapshot.received_mono,
+                        self._pulse(composite),
+                        sample_ltp_execution_path(snapshot.received_mono, composite),
+                    )
                 )
                 if len(history) < self.settings.sequence_length:
                     continue
@@ -204,21 +212,22 @@ class LiquidityPulseScalpRuntime:
                 self._last_signal[tag] = now
 
                 rows = list(history)
-                elapsed = max(rows[-1][0] - rows[0][0], 0.001)
-                mid = max(rows[-1][1], 0.001)
-                velocity_bps_sec = (rows[-1][1] - rows[0][1]) / mid * 10_000 / elapsed
-                pulse_mean = sum(row[2] for row in rows) / len(rows)
+                pulse_mean = sum(row[1] for row in rows) / len(rows)
+                ltp_path = summarize_ltp_execution_path([row[2] for row in rows])
                 direction = 1.0 if pulse_mean > 0 else -1.0 if pulse_mean < 0 else 0.0
                 alignment = (
-                    sum(1 for row in rows if row[2] * direction > 0) / len(rows)
+                    sum(1 for row in rows if row[1] * direction > 0) / len(rows)
                     if direction
                     else 0.0
                 )
-                velocity_component = max(-1.0, min(1.0, velocity_bps_sec / 1.5))
                 strength = max(
-                    -1.0, min(1.0, 0.78 * pulse_mean + 0.22 * velocity_component)
+                    -1.0, min(1.0, 0.50 * pulse_mean + 0.50 * ltp_path.strength)
                 )
-                aligned_velocity = strength == 0 or velocity_bps_sec * strength >= 0
+                aligned_velocity = (
+                    strength == 0
+                    or abs(ltp_path.recent_velocity_bps_sec) < 0.02
+                    or ltp_path.recent_velocity_bps_sec * strength >= 0
+                )
                 active = (
                     abs(strength) >= self.settings.minimum_strength
                     and alignment >= self.settings.minimum_alignment
@@ -234,14 +243,7 @@ class LiquidityPulseScalpRuntime:
                 )
                 confidence = min(0.99, 0.50 + 0.45 * abs(strength))
                 horizon_scores = {
-                    str(horizon): max(
-                        -50.0,
-                        min(
-                            50.0,
-                            velocity_bps_sec * horizon
-                            + strength * (2.0 + horizon / 15.0),
-                        ),
-                    )
+                    str(horizon): ltp_path.forecast_bps(horizon, pressure=strength)
                     for horizon in self.settings.horizons_sec
                 }
                 selected_horizon = adaptive_horizon_seconds(
@@ -250,13 +252,8 @@ class LiquidityPulseScalpRuntime:
                     maximum=max(self.settings.horizons_sec),
                     profile="scalp",
                 )
-                horizon_scores[str(selected_horizon)] = max(
-                    -50.0,
-                    min(
-                        50.0,
-                        velocity_bps_sec * selected_horizon
-                        + strength * (2.0 + selected_horizon / 15.0),
-                    ),
+                horizon_scores[str(selected_horizon)] = ltp_path.forecast_bps(
+                    selected_horizon, pressure=strength
                 )
                 expected_future_bps = abs(horizon_scores[str(selected_horizon)])
                 expected_premium_move_pct = min(
@@ -274,14 +271,25 @@ class LiquidityPulseScalpRuntime:
                     "edge_active": active,
                     "pulse_strength": strength,
                     "pulse_alignment": alignment,
-                    "mid_velocity_bps_sec": velocity_bps_sec,
+                    "ltp_now": ltp_path.ltp_now,
+                    "ltp_return_bps": ltp_path.ltp_return_bps,
+                    "ltp_velocity_bps_sec": ltp_path.velocity_bps_sec,
+                    "ltp_recent_velocity_bps_sec": ltp_path.recent_velocity_bps_sec,
+                    "ltp_acceleration_bps_sec2": ltp_path.acceleration_bps_sec2,
+                    "classified_buy_qty": ltp_path.classified_buy_qty,
+                    "classified_sell_qty": ltp_path.classified_sell_qty,
+                    "execution_imbalance": ltp_path.execution_imbalance,
+                    "liquidity_imbalance": ltp_path.liquidity_imbalance,
+                    "ltp_path_alignment": ltp_path.path_alignment,
+                    "ltp_path_quality": ltp_path.evidence_quality,
+                    "ltp_path_strength": ltp_path.strength,
                     "horizon_scores_bps": horizon_scores,
                     "expected_future_move_bps": expected_future_bps,
                     "expected_premium_move_pct": expected_premium_move_pct,
                     "depth_consensus": float(
                         getattr(composite.features, "depth_consensus", 0.0)
                     ),
-                    "estimate_kind": "MBP_HEURISTIC_NOT_CALIBRATED",
+                    "estimate_kind": "LTP_ANCHORED_MBP_NOT_CALIBRATED",
                     "adaptive_horizon": True,
                     "mbp_event_score": getattr(
                         getattr(composite, "event_evidence", None), "score", 0.0
@@ -313,7 +321,8 @@ class LiquidityPulseScalpRuntime:
                 self._no_trade += int(not active)
                 logger.info(
                     "DEEPLOB_SCALP_SIGNAL | instrument=%s | action=%s | horizon_sec=%s | "
-                    "strength=%.4f | alignment=%.3f | velocity_bps_sec=%+.4f | "
+                    "strength=%.4f | alignment=%.3f | ltp=%0.2f | "
+                    "ltp_velocity_bps_sec=%+.4f | execution_imbalance=%+.3f | "
                     "expected_future_bps=%.3f | expected_premium_pct=%.3f | "
                     "event_score=%+.3f | event_quality=%.3f | "
                     "event_persistence=%.3f | paper=true",
@@ -322,7 +331,9 @@ class LiquidityPulseScalpRuntime:
                     selected_horizon,
                     strength,
                     alignment,
-                    velocity_bps_sec,
+                    ltp_path.ltp_now,
+                    ltp_path.recent_velocity_bps_sec,
+                    ltp_path.execution_imbalance,
                     expected_future_bps,
                     expected_premium_move_pct,
                     metadata["mbp_event_score"],

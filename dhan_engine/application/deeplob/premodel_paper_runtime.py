@@ -10,6 +10,10 @@ from dataclasses import dataclass
 
 from dhan_engine.domain.market.market_by_price_execution import CompositeMarketSnapshot
 from dhan_engine.domain.market.liquidity_event_state import adaptive_horizon_seconds
+from dhan_engine.domain.market.ltp_execution_path import (
+    sample_ltp_execution_path,
+    summarize_ltp_execution_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +97,7 @@ class MarketByPricePaperRuntime:
         self._scores = defaultdict(
             lambda: deque(maxlen=self.settings.sequence_length)
         )
-        self._mids = defaultdict(lambda: deque(maxlen=self.settings.sequence_length))
-        self._sample_times = defaultdict(
+        self._ltp_paths = defaultdict(
             lambda: deque(maxlen=self.settings.sequence_length)
         )
         self._last_sample = defaultdict(lambda: float("-inf"))
@@ -208,13 +211,8 @@ class MarketByPricePaperRuntime:
                     continue
                 scores = self._scores[tag]
                 scores.append(self._evidence_score(composite))
-                mids = self._mids[tag]
-                sample_times = self._sample_times[tag]
-                fallback_mid = (
-                    float(snapshot.bids[0].price) + float(snapshot.asks[0].price)
-                ) / 2.0
-                mids.append(float(getattr(composite.features, "mid", fallback_mid)))
-                sample_times.append(float(snapshot.received_mono))
+                ltp_paths = self._ltp_paths[tag]
+                ltp_paths.append(sample_ltp_execution_path(snapshot.received_mono, composite))
                 if len(scores) < self.settings.sequence_length:
                     continue
                 now = time.monotonic()
@@ -223,42 +221,44 @@ class MarketByPricePaperRuntime:
                 self._last_signal[tag] = now
                 recent = list(scores)
                 mean_score = sum(recent) / len(recent)
+                ltp_path = summarize_ltp_execution_path(list(ltp_paths))
+                directional_score = max(
+                    -1.0, min(1.0, 0.55 * mean_score + 0.45 * ltp_path.strength)
+                )
                 aligned = sum(1 for value in recent if value * mean_score > 0) / len(
                     recent
                 )
                 threshold = self.settings.signal_threshold
-                strong = abs(mean_score) >= threshold and aligned >= 0.75
+                ltp_confirms = (
+                    abs(ltp_path.strength) < 0.02
+                    or ltp_path.strength * directional_score > 0
+                )
+                strong = (
+                    abs(directional_score) >= threshold
+                    and aligned >= 0.75
+                    and ltp_confirms
+                )
                 action = (
                     "BUY_CE"
-                    if strong and mean_score > 0
+                    if strong and directional_score > 0
                     else ("BUY_PE" if strong else "NO_TRADE")
                 )
                 confidence = min(
                     0.99,
                     0.50
-                    + 0.50 * min(1.0, abs(mean_score) / (threshold * 2.0)),
+                    + 0.50 * min(1.0, abs(directional_score) / (threshold * 2.0)),
                 )
                 directional = max(0.0, min(0.99, confidence))
                 residual = max(0.01, 1.0 - directional)
-                if mean_score > 0:
+                if directional_score > 0:
                     down, flat, up = residual * 0.35, residual * 0.65, directional
-                elif mean_score < 0:
+                elif directional_score < 0:
                     down, flat, up = directional, residual * 0.65, residual * 0.35
                 else:
                     down, flat, up = 0.1, 0.8, 0.1
-                elapsed = max(sample_times[-1] - sample_times[0], 0.001)
-                current_mid = max(mids[-1], 0.001)
-                velocity_bps_sec = (
-                    (mids[-1] - mids[0]) / current_mid * 10_000.0 / elapsed
-                )
                 horizon_scores = {
-                    str(horizon): max(
-                        -50.0,
-                        min(
-                            50.0,
-                            velocity_bps_sec * horizon
-                            + mean_score * 6.0 * (horizon / 30.0) ** 0.5,
-                        ),
+                    str(horizon): ltp_path.forecast_bps(
+                        horizon, pressure=directional_score
                     )
                     for horizon in self.settings.horizons_sec
                 }
@@ -268,13 +268,8 @@ class MarketByPricePaperRuntime:
                     maximum=max(self.settings.horizons_sec),
                     profile="dynamic",
                 )
-                horizon_scores[str(selected_horizon)] = max(
-                    -50.0,
-                    min(
-                        50.0,
-                        velocity_bps_sec * selected_horizon
-                        + mean_score * 6.0 * (selected_horizon / 30.0) ** 0.5,
-                    ),
+                horizon_scores[str(selected_horizon)] = ltp_path.forecast_bps(
+                    selected_horizon, pressure=directional_score
                 )
                 expected_future_bps = abs(
                     horizon_scores.get(str(selected_horizon), 0.0)
@@ -286,16 +281,27 @@ class MarketByPricePaperRuntime:
                 metadata = {
                     "profile": "dynamic",
                     "edge_active": strong,
-                    "edge_strength": abs(mean_score),
+                    "edge_strength": abs(directional_score),
                     "depth_alignment": aligned,
                     "depth_consensus": float(
                         getattr(composite.features, "depth_consensus", 0.0)
                     ),
-                    "mid_velocity_bps_sec": velocity_bps_sec,
+                    "ltp_now": ltp_path.ltp_now,
+                    "ltp_return_bps": ltp_path.ltp_return_bps,
+                    "ltp_velocity_bps_sec": ltp_path.velocity_bps_sec,
+                    "ltp_recent_velocity_bps_sec": ltp_path.recent_velocity_bps_sec,
+                    "ltp_acceleration_bps_sec2": ltp_path.acceleration_bps_sec2,
+                    "classified_buy_qty": ltp_path.classified_buy_qty,
+                    "classified_sell_qty": ltp_path.classified_sell_qty,
+                    "execution_imbalance": ltp_path.execution_imbalance,
+                    "liquidity_imbalance": ltp_path.liquidity_imbalance,
+                    "ltp_path_alignment": ltp_path.path_alignment,
+                    "ltp_path_quality": ltp_path.evidence_quality,
+                    "ltp_path_strength": ltp_path.strength,
                     "horizon_scores_bps": horizon_scores,
                     "expected_future_move_bps": expected_future_bps,
                     "expected_premium_move_pct": expected_premium_move_pct,
-                    "estimate_kind": "MBP_HEURISTIC_NOT_CALIBRATED",
+                    "estimate_kind": "LTP_ANCHORED_MBP_NOT_CALIBRATED",
                     "adaptive_horizon": True,
                     "mbp_event_score": getattr(
                         getattr(composite, "event_evidence", None), "score", 0.0
@@ -327,17 +333,23 @@ class MarketByPricePaperRuntime:
                 logger.info(
                     "MBP_PREMODEL_SIGNAL | instrument=%s | action=%s | confidence=%.4f | "
                     "evidence=%.4f | alignment=%.3f | pressure=%.4f | quote_age_ms=%.1f | "
-                    "depth_consensus=%+.3f | expected_future_bps=%.3f | "
+                    "depth_consensus=%+.3f | ltp=%0.2f | ltp_return_bps=%+.3f | "
+                    "execution_imbalance=%+.3f | path_strength=%+.3f | "
+                    "expected_future_bps=%.3f | "
                     "horizon_sec=%s | event_score=%+.3f | event_quality=%.3f | "
                     "event_persistence=%.3f | orders=false",
                     tag,
                     action,
                     confidence,
-                    mean_score,
+                    directional_score,
                     aligned,
                     composite.features.pressure_score,
                     composite.quote_age_ms,
                     float(getattr(composite.features, "depth_consensus", 0.0)),
+                    ltp_path.ltp_now,
+                    ltp_path.ltp_return_bps,
+                    ltp_path.execution_imbalance,
+                    ltp_path.strength,
                     expected_future_bps,
                     selected_horizon,
                     metadata["mbp_event_score"],
