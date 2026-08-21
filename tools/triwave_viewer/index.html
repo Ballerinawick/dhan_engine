@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TriWave Live Dashboard</title>
+  <title>DeepLOB Market Observatory</title>
   <link rel="stylesheet" href="./styles.css">
   <link rel="stylesheet" href="./compact.css">
 </head>
@@ -12,8 +12,8 @@
     <aside class="sidebar">
       <header class="brand">
         <div>
-          <h1>TriWave</h1>
-          <p>History and live premium flow in one chart.</p>
+          <h1>DeepLOB</h1>
+          <p>NIFTY futures depth, execution signals, and paper trades.</p>
         </div>
         <span id="liveBadge" class="live-badge off">Offline</span>
       </header>
@@ -60,6 +60,17 @@
         </div>
       </section>
 
+      <section class="panel replay-panel">
+        <div class="panel-head"><h2>Session Replay</h2><span id="replayStatus" class="mini-status">Full session</span></div>
+        <div class="replay-controls">
+          <button id="replayToggle" type="button">Play</button>
+          <select id="replaySpeed" aria-label="Replay speed">
+            <option value="1">1x</option><option value="5">5x</option><option value="20">20x</option><option value="60">60x</option>
+          </select>
+        </div>
+        <input id="replayRange" type="range" min="0" max="1000" value="1000" aria-label="Replay position">
+      </section>
+
       <section class="panel local-files">
         <h2>Local Replay</h2>
         <label class="file-control">
@@ -94,6 +105,11 @@
           <span><i class="entry"></i>Entry</span>
           <span><i class="exit"></i>Exit</span>
         </div>
+      </div>
+
+      <div class="source-strip">
+        <span id="sourcePath">Source: waiting</span>
+        <strong id="sourceFreshness">-</strong>
       </div>
 
       <div id="instrumentTabs" class="instrument-tabs"></div>

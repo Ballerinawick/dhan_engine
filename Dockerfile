@@ -7,6 +7,7 @@ WORKDIR /app
 ARG DEEPLOB_INSTALL=base
 COPY requirements.txt requirements-deeplob-recorder.txt requirements-deeplob.txt pyproject.toml ./
 COPY dhan_engine ./dhan_engine
+COPY tools/triwave_viewer ./tools/triwave_viewer
 RUN python -m compileall -q dhan_engine \
     && pip install --no-cache-dir -r requirements.txt \
     && if [ "$DEEPLOB_INSTALL" = "recorder" ]; then pip install --no-cache-dir -r requirements-deeplob-recorder.txt; fi \

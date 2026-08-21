@@ -17,6 +17,11 @@ const state = {
   currentSession: null,
   health: null,
   healthTimer: 0,
+  liveTimer: 0,
+  source: null,
+  sourceMode: "session",
+  replayRatio: 1,
+  replayTimer: 0,
   dragging: null,
 };
 
@@ -59,6 +64,12 @@ const els = {
   downloadPortfolio: document.getElementById("downloadPortfolio"),
   downloadSignals: document.getElementById("downloadSignals"),
   downloadTicks: document.getElementById("downloadTicks"),
+  replayToggle: document.getElementById("replayToggle"),
+  replaySpeed: document.getElementById("replaySpeed"),
+  replayRange: document.getElementById("replayRange"),
+  replayStatus: document.getElementById("replayStatus"),
+  sourcePath: document.getElementById("sourcePath"),
+  sourceFreshness: document.getElementById("sourceFreshness"),
 };
 
 const NUMERIC_SKIP = new Set([
@@ -93,7 +104,8 @@ function parseJsonl(text) {
 
 async function loadCloudSessions() {
   try {
-    const response = await fetch(apiUrl("/api/sessions"), { cache: "no-store" });
+    let response = await fetch(apiUrl("/api/deeplob/sessions"), { cache: "no-store" });
+    if (!response.ok) response = await fetch(apiUrl("/api/sessions"), { cache: "no-store" });
     if (!response.ok) return;
     const payload = await response.json();
     state.sessions = payload.sessions || [];
@@ -106,7 +118,7 @@ async function loadCloudSessions() {
 
 function renderSessionSelect() {
   els.sessionSelect.innerHTML = state.sessions.length
-    ? state.sessions.map((session, index) => `<option value="${index}">${escapeHtml(session.date)} / ${escapeHtml(session.expiry)}</option>`).join("")
+    ? state.sessions.map((session, index) => `<option value="${index}">${escapeHtml(session.date)} / ${escapeHtml(session.symbol || session.expiry || "NIFTY FUT")}</option>`).join("")
     : `<option value="">Local files</option>`;
 }
 
@@ -115,23 +127,50 @@ async function loadCloudSession(session) {
   closeLiveStream();
   setLive(false);
   state.currentSession = session;
+  state.sourceMode = String(session.source || "").startsWith("s3") ? "s3" : "session";
   els.statusText.textContent = `Loading ${session.date} / ${session.expiry}`;
-  const query = new URLSearchParams({ date: session.date, expiry: session.expiry, limit: "100000" });
-  const response = await fetch(apiUrl(`/api/session?${query}`), { cache: "no-store" });
+  const query = new URLSearchParams({ date: session.date, expiry: session.expiry || "", limit: "100000", bucket_sec: String(state.timeframeSec) });
+  const route = state.sourceMode === "s3" ? "/api/deeplob/session" : "/api/session";
+  const response = await fetch(apiUrl(`${route}?${query}`), { cache: "no-store" });
   if (!response.ok) throw new Error(`Session load failed: ${response.status}`);
   const payload = await response.json();
   state.ticks = dedupeTicks((payload.ticks || []).map(normalizeTick));
   state.trades = (payload.trades || []).map(normalizeTrade);
   state.signals = payload.signals || [];
   state.portfolio = (payload.portfolio || []).map(normalizePortfolio);
+  state.source = payload.source || null;
+  state.replayRatio = 1;
+  els.replayRange.value = "1000";
   state.seriesKey = "";
   state.selectedTrade = null;
   state.liveCount = 0;
   resetView(true);
   render();
-  await refreshHealth();
-  startHealthPolling();
-  startLiveStream(session);
+  if (state.sourceMode === "s3") startDeepLobLivePolling();
+  else {
+    await refreshHealth();
+    startHealthPolling();
+    startLiveStream(session);
+  }
+}
+
+function startDeepLobLivePolling() {
+  if (state.liveTimer) clearInterval(state.liveTimer);
+  const poll = async () => {
+    try {
+      const response = await fetch(apiUrl(`/api/deeplob/live?bucket_sec=${state.timeframeSec}`), { cache: "no-store" });
+      if (!response.ok) throw new Error(String(response.status));
+      const payload = await response.json();
+      state.ticks = dedupeTicks((payload.ticks || []).map(normalizeTick));
+      state.trades = (payload.trades || []).map(normalizeTrade);
+      state.signals = payload.signals || [];
+      state.source = payload.source || null;
+      setLive(Number(payload.source?.freshness_sec) <= 360);
+      render();
+    } catch { setLive(false); }
+  };
+  poll();
+  state.liveTimer = setInterval(poll, 15000);
 }
 
 function startLiveStream(session) {
@@ -163,6 +202,8 @@ function startLiveStream(session) {
 function closeLiveStream() {
   if (state.eventSource) state.eventSource.close();
   state.eventSource = null;
+  if (state.liveTimer) clearInterval(state.liveTimer);
+  state.liveTimer = 0;
 }
 
 function startHealthPolling() {
@@ -307,7 +348,8 @@ function renderThrottled() {
 }
 
 function getSeriesTicks() {
-  return state.ticks.filter((tick) => tick.key === state.seriesKey).sort((a, b) => a.ts - b.ts);
+  const ticks = state.ticks.filter((tick) => tick.key === state.seriesKey).sort((a, b) => a.ts - b.ts);
+  return ticks.slice(0, Math.max(1, Math.ceil(ticks.length * state.replayRatio)));
 }
 
 function getSeriesTrades() {
@@ -315,6 +357,7 @@ function getSeriesTrades() {
   if (!firstTick) return [];
   return state.trades.filter((trade) => {
     if (trade.secid && trade.secid === firstTick.secid) return true;
+    if (firstTick.stream === "FUT") return trade.index === firstTick.index;
     return trade.index === firstTick.index && trade.stream === firstTick.stream;
   });
 }
@@ -644,6 +687,7 @@ function render() {
   refreshTrades();
   renderStats(candles, trades);
   renderDashboard();
+  renderSourceStatus();
   syncPanelVisibility();
   const liveAge = state.lastLiveTs ? `${Math.round((Date.now() - state.lastLiveTs) / 1000)}s ago` : "-";
   els.statusText.textContent = ticks.length ? `${labelForSeries(state.seriesKey)} | ${ticks.length} ticks | live ${liveAge}` : "Load session files";
@@ -651,6 +695,17 @@ function render() {
   drawPriceChart(els.priceCanvas, visible, candles, trades);
   drawVolumeChart(els.volumeCanvas, visible);
   drawWaveChart(els.waveCanvas, visible);
+}
+
+function renderSourceStatus() {
+  const source = state.source || {};
+  const path = source.market_prefix || source.prefix || source.key || (state.sourceMode === "s3" ? "S3 DeepLOB" : "session files");
+  els.sourcePath.textContent = `Source: ${path}`;
+  const age = Number(source.freshness_sec ?? source.age_sec);
+  els.sourceFreshness.textContent = Number.isFinite(age)
+    ? `${Math.round(age)}s old${age <= 360 ? " / recent" : " / historical"}`
+    : state.sourceMode.toUpperCase();
+  els.replayStatus.textContent = state.replayRatio >= 1 ? "Full session" : `${Math.round(state.replayRatio * 100)}%`;
 }
 
 function syncPanelVisibility() {
@@ -737,14 +792,17 @@ function drawTradeMarkers(ctx, box, candles, trades, y) {
   const first = candles[0]?.ts || 0;
   const last = candles[candles.length - 1]?.ts || first + 1;
   const tx = (ts) => box.x + ((ts - first) / Math.max(1, last - first)) * box.w;
+  const priceAt = (ts) => candles.reduce((closest, candle) =>
+    Math.abs(candle.ts - ts) < Math.abs(closest.ts - ts) ? candle : closest
+  , candles[0]).close;
   trades.forEach((trade) => {
     if (trade.exit_ts && (trade.exit_ts < first || trade.entry_ts > last)) return;
     if (state.selectedTrade === trade && trade.entry_ts && trade.exit_ts) {
       ctx.fillStyle = "rgba(255, 210, 63, .08)";
       ctx.fillRect(tx(trade.entry_ts), box.y, Math.max(1, tx(trade.exit_ts) - tx(trade.entry_ts)), box.h);
     }
-    if (trade.entry_ts >= first && trade.entry_ts <= last) marker(ctx, tx(trade.entry_ts), y(trade.entry), css("--entry"), "E");
-    if (trade.exit_ts >= first && trade.exit_ts <= last) marker(ctx, tx(trade.exit_ts), y(trade.exit), css("--exit"), "X");
+    if (trade.entry_ts >= first && trade.entry_ts <= last) marker(ctx, tx(trade.entry_ts), y(priceAt(trade.entry_ts)), css("--entry"), "E");
+    if (trade.exit_ts >= first && trade.exit_ts <= last) marker(ctx, tx(trade.exit_ts), y(priceAt(trade.exit_ts)), css("--exit"), "X");
   });
 }
 
@@ -944,6 +1002,16 @@ function emptyTable(text) {
 
 function downloadSessionFile(file) {
   if (!state.currentSession) return;
+  if (state.sourceMode === "s3") {
+    const values = file === "ticks" ? state.ticks : file === "trades" ? state.trades : file === "signals" ? state.signals : state.portfolio;
+    const blob = new Blob([JSON.stringify(values, null, 2)], { type: "application/json" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `${state.currentSession.date}-${file}.json`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+    return;
+  }
   const query = new URLSearchParams({
     date: state.currentSession.date,
     expiry: state.currentSession.expiry,
@@ -1000,10 +1068,48 @@ els.sessionSelect.addEventListener("change", async () => {
   if (Number.isFinite(idx) && state.sessions[idx]) await loadCloudSession(state.sessions[idx]);
 });
 
-els.timeframeSelect.addEventListener("change", () => {
+els.timeframeSelect.addEventListener("change", async () => {
   state.timeframeSec = Number(els.timeframeSelect.value || 5);
+  if (state.sourceMode === "s3" && state.currentSession) {
+    await loadCloudSession(state.currentSession);
+    return;
+  }
   resetView(state.autoFollow);
   render();
+});
+
+els.replayRange.addEventListener("input", () => {
+  state.replayRatio = Number(els.replayRange.value) / 1000;
+  state.autoFollow = false;
+  els.autoFollow.checked = false;
+  resetView(true);
+  render();
+});
+
+els.replayToggle.addEventListener("click", () => {
+  if (state.replayTimer) {
+    clearInterval(state.replayTimer);
+    state.replayTimer = 0;
+    els.replayToggle.textContent = "Play";
+    return;
+  }
+  if (state.replayRatio >= 1) {
+    state.replayRatio = 0.01;
+    els.replayRange.value = "10";
+  }
+  els.replayToggle.textContent = "Pause";
+  state.replayTimer = setInterval(() => {
+    const speed = Number(els.replaySpeed.value || 1);
+    state.replayRatio = Math.min(1, state.replayRatio + speed / Math.max(100, state.ticks.length));
+    els.replayRange.value = String(Math.round(state.replayRatio * 1000));
+    resetView(true);
+    render();
+    if (state.replayRatio >= 1) {
+      clearInterval(state.replayTimer);
+      state.replayTimer = 0;
+      els.replayToggle.textContent = "Play";
+    }
+  }, 250);
 });
 
 [els.showVolume, els.showWave, els.showTrades].forEach((input) => input.addEventListener("change", render));

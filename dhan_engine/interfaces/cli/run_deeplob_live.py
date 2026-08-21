@@ -8,6 +8,7 @@ from dhan_engine.application.deeplob.live_runtime import (
     build_deeplob_live_runtime,
 )
 from dhan_engine.infrastructure.dhan.master_csv import refresh_master_csv
+from dhan_engine.interfaces.web.session_viewer_server import start_session_viewer_server
 
 MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
@@ -21,9 +22,9 @@ def main() -> None:
     csv_path = os.getenv("CSV_FILE", "api-scrip-master.csv").strip()
     refresh_master_csv(MASTER_URL, csv_path)
     settings = DeepLobLiveSettings.from_env()
+    start_session_viewer_server()
     build_deeplob_live_runtime(settings).run()
 
 
 if __name__ == "__main__":
     main()
-

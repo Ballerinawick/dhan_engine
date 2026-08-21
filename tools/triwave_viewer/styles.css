@@ -516,6 +516,26 @@ select {
   overflow: hidden;
 }
 
+.replay-panel .panel-head { margin-bottom: 8px; }
+.replay-controls { display: grid; grid-template-columns: 1fr 72px; gap: 6px; margin-bottom: 8px; }
+.replay-controls button, .replay-controls select { min-height: 32px; }
+.replay-panel input[type="range"] { width: 100%; accent-color: var(--entry); }
+
+.source-strip {
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 11px;
+}
+.source-strip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-strip strong { color: var(--text); white-space: nowrap; }
+
 .chart-stack.hide-volume {
   grid-template-rows: minmax(280px, 1.9fr) 0 minmax(110px, .7fr);
 }

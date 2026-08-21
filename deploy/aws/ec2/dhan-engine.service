@@ -12,6 +12,7 @@ EnvironmentFile=/etc/dhan-engine/dhan-engine.env
 ExecStartPre=-/usr/bin/docker rm -f dhan-engine
 ExecStart=/usr/bin/docker run --name dhan-engine \
   --env-file /etc/dhan-engine/dhan-engine.env \
+  -p 8080:8080 \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=256m \
   -v /var/lib/dhan-engine:/var/lib/dhan-engine \
