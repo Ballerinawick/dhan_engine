@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from dhan_engine.domain.market.ltp_execution_path import (
+    LtpExecutionPath,
     LtpExecutionSample,
     sample_ltp_execution_path,
     summarize_ltp_execution_path,
@@ -67,6 +68,7 @@ class LtpExecutionPathTests(unittest.TestCase):
         self.assertGreater(path.liquidity_imbalance, 0)
         self.assertGreater(path.strength, 0)
         self.assertGreater(path.forecast_bps(30, pressure=path.strength), 0)
+        self.assertGreater(path.forecast_reliability, 0)
 
     def test_bearish_ltp_and_execution_path_forecasts_down(self) -> None:
         path = summarize_ltp_execution_path(
@@ -97,6 +99,46 @@ class LtpExecutionPathTests(unittest.TestCase):
         self.assertLess(path.liquidity_imbalance, 0)
         self.assertLess(path.strength, 0)
         self.assertLess(path.forecast_bps(30, pressure=path.strength), 0)
+
+    def test_long_horizons_do_not_pin_forecast_to_hard_ceiling(self) -> None:
+        path = summarize_ltp_execution_path(
+            [
+                _sample(0.0, 24_200.0, buy_qty=80, event_score=0.4),
+                _sample(1.0, 24_203.0, buy_qty=100, event_score=0.5),
+                _sample(2.0, 24_206.0, buy_qty=120, event_score=0.6),
+                _sample(3.0, 24_209.0, buy_qty=140, event_score=0.7),
+            ]
+        )
+
+        forecast_120 = path.forecast_bps(120, pressure=path.strength)
+        forecast_300 = path.forecast_bps(300, pressure=path.strength)
+
+        self.assertGreater(forecast_120, 0)
+        self.assertLess(forecast_120, 30.0)
+        self.assertAlmostEqual(forecast_120, forecast_300)
+
+    def test_short_low_quality_path_is_reliability_shrunk(self) -> None:
+        weak = LtpExecutionPath(
+            recent_velocity_bps_sec=1.0,
+            velocity_bps_sec=1.0,
+            strength=0.8,
+            elapsed_sec=0.5,
+            evidence_quality=0.0,
+            path_alignment=0.0,
+        )
+        strong = LtpExecutionPath(
+            recent_velocity_bps_sec=1.0,
+            velocity_bps_sec=1.0,
+            strength=0.8,
+            elapsed_sec=4.0,
+            evidence_quality=1.0,
+            path_alignment=1.0,
+        )
+
+        self.assertLess(
+            weak.forecast_bps(30, pressure=0.8),
+            strong.forecast_bps(30, pressure=0.8),
+        )
 
     def test_sample_falls_back_to_mid_when_full_quote_is_absent(self) -> None:
         composite = SimpleNamespace(features=SimpleNamespace(mid=24_200.5))

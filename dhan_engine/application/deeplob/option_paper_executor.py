@@ -38,6 +38,7 @@ class DeepLobOptionPaperSettings:
     depth_exit_enabled: bool = True
     exit_confirmation_count: int = 3
     minimum_hold_sec: float = 5.0
+    market_open_warmup_sec: float = 60.0
 
     @classmethod
     def from_env(
@@ -66,6 +67,7 @@ class DeepLobOptionPaperSettings:
             "DEPTH_EXIT_ENABLED": "1",
             "EXIT_CONFIRMATIONS": "3",
             "MIN_HOLD_SEC": "5",
+            "MARKET_OPEN_WARMUP_SEC": "60",
         }
         values.update(dict(defaults or {}))
 
@@ -103,6 +105,9 @@ class DeepLobOptionPaperSettings:
             in {"1", "true", "yes", "on"},
             exit_confirmation_count=max(1, int(read("EXIT_CONFIRMATIONS"))),
             minimum_hold_sec=max(0.0, float(read("MIN_HOLD_SEC"))),
+            market_open_warmup_sec=max(
+                0.0, float(read("MARKET_OPEN_WARMUP_SEC"))
+            ),
         )
 
     @classmethod
@@ -158,6 +163,10 @@ class DeepLobOptionPaperSettings:
             ),
             minimum_hold_sec=max(
                 0.0, float(os.getenv("DEEPLOB_SCALP_MIN_HOLD_SEC", "5"))
+            ),
+            market_open_warmup_sec=max(
+                0.0,
+                float(os.getenv("DEEPLOB_SCALP_MARKET_OPEN_WARMUP_SEC", "60")),
             ),
         )
 
@@ -273,13 +282,22 @@ class DeepLobOptionPaperExecutor:
         if self.paper_trader.has_open_position():
             self._evaluate_prediction_exit(paper_action, confidence, signal_metadata)
             return
-        clock = datetime.now(self._timezone).time()
+        now_local = datetime.now(self._timezone)
+        clock = now_local.time()
         if self.settings.enforce_market_hours and not (
             self.settings.market_start <= clock < self.settings.entry_cutoff
         ):
             self._blocks += 1
             self._reset_candidate()
             return
+        if self.settings.enforce_market_hours:
+            open_at = datetime.combine(
+                now_local.date(), self.settings.market_start, self._timezone
+            )
+            if (now_local - open_at).total_seconds() < self.settings.market_open_warmup_sec:
+                self._blocks += 1
+                self._reset_candidate()
+                return
 
         pressure = float(composite.features.pressure_score)
         aligned = (
