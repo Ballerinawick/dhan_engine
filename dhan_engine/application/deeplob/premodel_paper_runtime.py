@@ -80,7 +80,7 @@ class MarketByPricePaperSettings:
 class MarketByPricePaperRuntime:
     """Produce paper-only directional evidence before a trained model exists."""
 
-    version = "MBP_PREMODEL_V1"
+    version = "MBP_PREMODEL_V2_CALIBRATED"
 
     def __init__(self, settings: MarketByPricePaperSettings, prediction_sink=None):
         self.settings = settings
@@ -243,10 +243,13 @@ class MarketByPricePaperRuntime:
                     if strong and directional_score > 0
                     else ("BUY_PE" if strong else "NO_TRADE")
                 )
+                normalized_strength = min(
+                    1.0, abs(directional_score) / (threshold * 2.0)
+                )
                 confidence = min(
-                    0.99,
+                    0.95,
                     0.50
-                    + 0.50 * min(1.0, abs(directional_score) / (threshold * 2.0)),
+                    + 0.45 * normalized_strength * ltp_path.forecast_reliability,
                 )
                 directional = max(0.0, min(0.99, confidence))
                 residual = max(0.01, 1.0 - directional)
@@ -298,6 +301,8 @@ class MarketByPricePaperRuntime:
                     "ltp_path_alignment": ltp_path.path_alignment,
                     "ltp_path_quality": ltp_path.evidence_quality,
                     "ltp_path_strength": ltp_path.strength,
+                    "forecast_reliability": ltp_path.forecast_reliability,
+                    "forecast_observation_sec": ltp_path.elapsed_sec,
                     "horizon_scores_bps": horizon_scores,
                     "expected_future_move_bps": expected_future_bps,
                     "expected_premium_move_pct": expected_premium_move_pct,
@@ -334,7 +339,7 @@ class MarketByPricePaperRuntime:
                     "MBP_PREMODEL_SIGNAL | instrument=%s | action=%s | confidence=%.4f | "
                     "evidence=%.4f | alignment=%.3f | pressure=%.4f | quote_age_ms=%.1f | "
                     "depth_consensus=%+.3f | ltp=%0.2f | ltp_return_bps=%+.3f | "
-                    "execution_imbalance=%+.3f | path_strength=%+.3f | "
+                    "execution_imbalance=%+.3f | path_strength=%+.3f | reliability=%.3f | "
                     "expected_future_bps=%.3f | "
                     "horizon_sec=%s | event_score=%+.3f | event_quality=%.3f | "
                     "event_persistence=%.3f | orders=false",
@@ -350,6 +355,7 @@ class MarketByPricePaperRuntime:
                     ltp_path.ltp_return_bps,
                     ltp_path.execution_imbalance,
                     ltp_path.strength,
+                    ltp_path.forecast_reliability,
                     expected_future_bps,
                     selected_horizon,
                     metadata["mbp_event_score"],

@@ -38,20 +38,42 @@ class LtpExecutionPath:
     path_alignment: float = 0.0
     evidence_quality: float = 0.0
     strength: float = 0.0
+    sample_count: int = 0
+    elapsed_sec: float = 0.0
+
+    @property
+    def forecast_reliability(self) -> float:
+        """Shrink projections when the observed LTP/event path is weak or short."""
+        span_quality = min(1.0, self.elapsed_sec / 4.0)
+        return max(
+            0.0,
+            min(
+                1.0,
+                0.15
+                + 0.35 * self.evidence_quality
+                + 0.25 * self.path_alignment
+                + 0.25 * span_quality,
+            ),
+        )
 
     def forecast_bps(self, horizon_sec: int, *, pressure: float) -> float:
         """Causal MBP forecast anchored to traded LTP, not displayed mid alone."""
         horizon = max(1.0, float(horizon_sec))
-        # Recent velocity matters most, but decays as the forecast extends. The
-        # acceleration contribution is intentionally capped because two MBP
-        # snapshots cannot establish a stable second derivative.
-        decay = 1.0 / math.sqrt(max(1.0, horizon / 10.0))
+        # A few seconds of observations cannot support linear extrapolation for
+        # several minutes. Limit the projected path to three observed windows,
+        # then shrink it by evidence quality and directional agreement.
+        projected_horizon = min(horizon, max(2.0, self.elapsed_sec * 3.0))
+        decay = 1.0 / math.sqrt(max(1.0, projected_horizon / 10.0))
         velocity = (0.72 * self.recent_velocity_bps_sec + 0.28 * self.velocity_bps_sec)
-        acceleration = max(-0.08, min(0.08, self.acceleration_bps_sec2))
+        acceleration = max(-0.04, min(0.04, self.acceleration_bps_sec2))
         flow = 0.60 * self.strength + 0.40 * max(-1.0, min(1.0, pressure))
-        forecast = velocity * horizon * decay + 0.5 * acceleration * horizon * horizon * decay
-        forecast += flow * (2.0 + math.sqrt(horizon))
-        return max(-50.0, min(50.0, forecast))
+        forecast = velocity * projected_horizon * decay
+        forecast += 0.5 * acceleration * projected_horizon * projected_horizon * decay
+        forecast += flow * (2.0 + math.sqrt(projected_horizon))
+        forecast *= self.forecast_reliability
+        # Soft saturation preserves ranking between strong observations instead
+        # of pinning unrelated signals to the same hard 50 bps ceiling.
+        return 30.0 * math.tanh(forecast / 30.0)
 
 
 def sample_ltp_execution_path(
@@ -156,4 +178,6 @@ def summarize_ltp_execution_path(
         path_alignment=alignment,
         evidence_quality=quality,
         strength=strength,
+        sample_count=len(rows),
+        elapsed_sec=elapsed,
     )

@@ -306,7 +306,12 @@ class DeepLobFoundationTest(unittest.TestCase):
             time.sleep(0.01)
         runtime.close_worker()
         self.assertEqual(predictions[0]["paper_action"], "BUY_CE")
-        self.assertEqual(predictions[0]["model_version"], "MBP_PREMODEL_V1")
+        self.assertEqual(
+            predictions[0]["model_version"], "MBP_PREMODEL_V2_CALIBRATED"
+        )
+        self.assertIn(
+            "forecast_reliability", predictions[0]["signal_metadata"]
+        )
 
     def test_live_callback_fans_out_to_recorder_and_inference(self):
         class Sink:

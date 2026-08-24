@@ -79,7 +79,7 @@ class LiquidityPulseScalpRuntime:
     velocity over a bounded latest-state queue.
     """
 
-    version = "MBP_LIQUIDITY_PULSE_V1"
+    version = "MBP_LIQUIDITY_PULSE_V2_CALIBRATED"
 
     def __init__(self, settings: LiquidityPulseScalpSettings, prediction_sink=None):
         self.settings = settings
@@ -241,7 +241,11 @@ class LiquidityPulseScalpRuntime:
                 action = "BUY_CE" if active and strength > 0 else (
                     "BUY_PE" if active else "NO_TRADE"
                 )
-                confidence = min(0.99, 0.50 + 0.45 * abs(strength))
+                confidence = min(
+                    0.95,
+                    0.50
+                    + 0.45 * abs(strength) * ltp_path.forecast_reliability,
+                )
                 horizon_scores = {
                     str(horizon): ltp_path.forecast_bps(horizon, pressure=strength)
                     for horizon in self.settings.horizons_sec
@@ -283,6 +287,8 @@ class LiquidityPulseScalpRuntime:
                     "ltp_path_alignment": ltp_path.path_alignment,
                     "ltp_path_quality": ltp_path.evidence_quality,
                     "ltp_path_strength": ltp_path.strength,
+                    "forecast_reliability": ltp_path.forecast_reliability,
+                    "forecast_observation_sec": ltp_path.elapsed_sec,
                     "horizon_scores_bps": horizon_scores,
                     "expected_future_move_bps": expected_future_bps,
                     "expected_premium_move_pct": expected_premium_move_pct,
@@ -322,7 +328,7 @@ class LiquidityPulseScalpRuntime:
                 logger.info(
                     "DEEPLOB_SCALP_SIGNAL | instrument=%s | action=%s | horizon_sec=%s | "
                     "strength=%.4f | alignment=%.3f | ltp=%0.2f | "
-                    "ltp_velocity_bps_sec=%+.4f | execution_imbalance=%+.3f | "
+                    "ltp_velocity_bps_sec=%+.4f | execution_imbalance=%+.3f | reliability=%.3f | "
                     "expected_future_bps=%.3f | expected_premium_pct=%.3f | "
                     "event_score=%+.3f | event_quality=%.3f | "
                     "event_persistence=%.3f | paper=true",
@@ -334,6 +340,7 @@ class LiquidityPulseScalpRuntime:
                     ltp_path.ltp_now,
                     ltp_path.recent_velocity_bps_sec,
                     ltp_path.execution_imbalance,
+                    ltp_path.forecast_reliability,
                     expected_future_bps,
                     expected_premium_move_pct,
                     metadata["mbp_event_score"],
