@@ -11,6 +11,9 @@ def main() -> None:
         "index": "index",
         "stock": "stock",
         "stocks": "stock",
+        "stock-depth-paper": "stock_depth",
+        "stock_depth_paper": "stock_depth",
+        "stock-future-depth-paper": "stock_depth",
         "commodity": "commodity",
         "commodities": "commodity",
         "mcx": "commodity",
@@ -37,6 +40,13 @@ def main() -> None:
         from dhan_engine.interfaces.cli.run_stock_paper import main as run_stock
 
         run_stock()
+        return
+    if selected == "stock_depth":
+        from dhan_engine.interfaces.cli.run_stock_depth_paper import (
+            main as run_stock_depth,
+        )
+
+        run_stock_depth()
         return
     if selected == "commodity":
         from dhan_engine.interfaces.cli.run_commodity_paper import main as run_commodity

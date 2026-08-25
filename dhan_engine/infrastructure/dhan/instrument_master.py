@@ -55,6 +55,7 @@ class InstrumentMaster:
         # Caches for speed
         self._opt_cache = {}
         self._fut_cache = {}
+        self._stock_fut_cache = {}
         self._index_cache = {}
         self._equity_cache = {}
         self._commodity_cache = {}
@@ -182,6 +183,54 @@ class InstrumentMaster:
 
     def get_fut_exchange_segment(self) -> str:
         return "NSE_FNO"
+
+    def get_nearest_stock_future(self, symbol: str):
+        """Resolve the nearest active FUTSTK contract for one exact NSE root."""
+        root = str(symbol).upper().strip()
+        if not root:
+            raise ValueError("Stock future symbol is required")
+        if root in self._stock_fut_cache:
+            return dict(self._stock_fut_cache[root])
+
+        df = self.df
+        futures = df[
+            (df["SEM_EXM_EXCH_ID"].astype(str).str.upper() == "NSE")
+            & (df["SEM_SEGMENT"].astype(str).str.upper() == "D")
+            & (df["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == "FUTSTK")
+            & (
+                df["SEM_TRADING_SYMBOL"]
+                .astype(str)
+                .str.upper()
+                .str.startswith(f"{root}-", na=False)
+            )
+        ].copy()
+        futures = futures.dropna(
+            subset=["SEM_EXPIRY_DATE", "SEM_SMST_SECURITY_ID"]
+        )
+        today = pd.Timestamp.now().normalize()
+        futures = futures[futures["SEM_EXPIRY_DATE"].dt.normalize() >= today]
+        if futures.empty:
+            raise LookupError(f"No active FUTSTK instrument found for {root}")
+
+        row = futures.sort_values("SEM_EXPIRY_DATE").iloc[0]
+        trading_symbol = str(row["SEM_TRADING_SYMBOL"])
+        if not trading_symbol.upper().startswith(f"{root}-"):
+            raise RuntimeError(
+                f"Resolved FUTSTK symbol {trading_symbol!r} does not belong to {root!r}"
+            )
+        resolved = {
+            "security_id": int(float(row["SEM_SMST_SECURITY_ID"])),
+            "symbol": trading_symbol,
+            "expiry": row["SEM_EXPIRY_DATE"],
+            "lot_size": int(float(row["SEM_LOT_UNITS"] or 0)),
+            "exchange_segment": "NSE_FNO",
+        }
+        self._stock_fut_cache[root] = dict(resolved)
+        self._log(
+            f"NSE FUTSTK selected: {root} {trading_symbol} "
+            f"secid={resolved['security_id']}"
+        )
+        return resolved
 
     def get_equity(self, symbol: str):
         """Resolve one exact NSE cash-equity instrument."""

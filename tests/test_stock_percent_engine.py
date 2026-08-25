@@ -385,6 +385,48 @@ class StockPaperPortfolioTests(unittest.TestCase):
 
 
 class EquityInstrumentResolutionTests(unittest.TestCase):
+    def test_nearest_active_stock_future_uses_exact_root(self):
+        today = pd.Timestamp.now().normalize()
+        frame = pd.DataFrame(
+            [
+                {
+                    "SEM_EXM_EXCH_ID": "NSE", "SEM_SEGMENT": "D",
+                    "SEM_SMST_SECURITY_ID": "6001", "SEM_INSTRUMENT_NAME": "FUTSTK",
+                    "SEM_TRADING_SYMBOL": "RELIANCE-OLD-FUT",
+                    "SEM_CUSTOM_SYMBOL": "RELIANCE OLD FUTURE",
+                    "SEM_OPTION_TYPE": "NA", "SEM_STRIKE_PRICE": "0",
+                    "SEM_LOT_UNITS": "250",
+                    "SEM_EXPIRY_DATE": today - pd.Timedelta(days=1),
+                },
+                {
+                    "SEM_EXM_EXCH_ID": "NSE", "SEM_SEGMENT": "D",
+                    "SEM_SMST_SECURITY_ID": "6002", "SEM_INSTRUMENT_NAME": "FUTSTK",
+                    "SEM_TRADING_SYMBOL": "RELIANCE-NEXT-FUT",
+                    "SEM_CUSTOM_SYMBOL": "RELIANCE NEXT FUTURE",
+                    "SEM_OPTION_TYPE": "NA", "SEM_STRIKE_PRICE": "0",
+                    "SEM_LOT_UNITS": "250",
+                    "SEM_EXPIRY_DATE": today + pd.Timedelta(days=30),
+                },
+                {
+                    "SEM_EXM_EXCH_ID": "NSE", "SEM_SEGMENT": "D",
+                    "SEM_SMST_SECURITY_ID": "7001", "SEM_INSTRUMENT_NAME": "FUTSTK",
+                    "SEM_TRADING_SYMBOL": "RELIANCEPP-NEXT-FUT",
+                    "SEM_CUSTOM_SYMBOL": "RELIANCE PARTLY PAID FUTURE",
+                    "SEM_OPTION_TYPE": "NA", "SEM_STRIKE_PRICE": "0",
+                    "SEM_LOT_UNITS": "250",
+                    "SEM_EXPIRY_DATE": today + pd.Timedelta(days=7),
+                },
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "master.csv")
+            frame.to_csv(path, index=False)
+            master = InstrumentMaster(path, debug=False)
+            instrument = master.get_nearest_stock_future("RELIANCE")
+        self.assertEqual(instrument["security_id"], 6002)
+        self.assertEqual(instrument["symbol"], "RELIANCE-NEXT-FUT")
+        self.assertEqual(instrument["exchange_segment"], "NSE_FNO")
+
     def test_exact_nse_equity_resolution(self):
         frame = pd.DataFrame(
             [
