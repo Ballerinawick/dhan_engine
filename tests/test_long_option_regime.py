@@ -1,4 +1,5 @@
-from datetime import time as clock_time
+import time
+from datetime import date, time as clock_time
 from types import SimpleNamespace
 
 from dhan_engine.application.deeplob.long_option_regime import (
@@ -68,7 +69,8 @@ def settings():
         minimum_state_score=0.25,
         fee_buffer_multiple=1.0,
         round_trip_fee=60.0,
-        maximum_loss_pct=10.0,
+        catastrophic_loss_pct=10.0,
+        catastrophic_confirmations=3,
         market_start=clock_time(0, 0),
         entry_cutoff=clock_time(23, 59),
         market_end=clock_time(23, 59),
@@ -80,6 +82,37 @@ def composite(pressure):
         features=SimpleNamespace(pressure_score=pressure),
         full_quote={"ltp": 24350.0},
     )
+
+
+def evidence(*, ce_change=1.0, pe_change=-1.0, pressure=0.2):
+    return {
+        "ce": {
+            "ltp": 101.0,
+            "change_pct": ce_change,
+            "velocity_pct_sec": ce_change / 10.0,
+            "acceleration": ce_change / 100.0,
+            "range_pct": abs(ce_change),
+        },
+        "pe": {
+            "ltp": 99.0,
+            "change_pct": pe_change,
+            "velocity_pct_sec": pe_change / 10.0,
+            "acceleration": pe_change / 100.0,
+            "range_pct": abs(pe_change),
+        },
+        "directional_pct": ce_change - pe_change,
+        "velocity_spread": (ce_change - pe_change) / 10.0,
+        "acceleration_spread": (ce_change - pe_change) / 100.0,
+        "long_vol_pct": ce_change + pe_change,
+        "pressure": pressure,
+        "future_ltp": 24350.0,
+        "model_action": "BUY_CE" if pressure >= 0 else "BUY_PE",
+        "model_confidence": 0.8,
+        "state_score": 0.9,
+        "pair_structure": "STRADDLE",
+        "signal_metadata": {},
+        "expiry_cycle": {},
+    }
 
 
 def publish_pair(executor, timestamp, ce_ltp, pe_ltp, action, pressure):
@@ -164,3 +197,152 @@ def test_pair_structure_reflects_selected_strikes_without_extra_contracts():
     )
     assert len(subscriptions) == 2
     assert executor._pair_structure() == "STRANGLE"
+
+
+def test_executable_spread_alone_does_not_exit_position():
+    trader = FakePaperTrader()
+    executor = LongOptionRegimeExecutor(settings(), trader)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    trader.on_entry(
+        101,
+        "NIFTY_CE",
+        "LONG",
+        100.0,
+        metadata={"entry_option_spread": 0.05},
+    )
+
+    executor.on_quote(
+        101,
+        "NIFTY_CE",
+        99.0,
+        bid=98.0,
+        ask=100.0,
+        received_ts=time.time(),
+    )
+
+    assert list(trader.positions) == [101]
+    assert trader.last_trade_summary is None
+
+
+def test_entry_requires_current_instant_state_to_match_stable_state():
+    trader = FakePaperTrader()
+    executor = LongOptionRegimeExecutor(settings(), trader)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    now = time.time()
+    executor.on_quote(101, "NIFTY_CE", 101.0, bid=100.95, ask=101.0, received_ts=now)
+    executor.on_quote(102, "NIFTY_PE", 99.0, bid=98.95, ask=99.0, received_ts=now)
+    executor._state = "BULLISH_EXPANSION"
+    executor._candidate = "BULLISH_EXPANSION"
+    executor._candidate_count = settings().state_confirmations
+    executor._derive_evidence = lambda *args, **kwargs: evidence()
+    executor._classify = lambda current: "UNCERTAIN"
+
+    executor.on_prediction(
+        paper_action="BUY_CE",
+        confidence=0.8,
+        composite=composite(0.2),
+        probability_down=0.1,
+        probability_flat=0.1,
+        probability_up=0.8,
+        model_version="test",
+        horizon_sec=30,
+    )
+
+    assert executor.health()["v1_state"] == "BULLISH_EXPANSION"
+    assert executor.health()["v1_instant_state"] == "UNCERTAIN"
+    assert trader.positions == {}
+
+
+def test_confirmed_opposite_v1_state_exits_without_second_confirmation_loop():
+    trader = FakePaperTrader()
+    sink = FakeSink()
+    executor = LongOptionRegimeExecutor(settings(), trader, trade_summary_sink=sink)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    trader.on_entry(101, "NIFTY_CE", "LONG", 100.0)
+    executor.on_quote(
+        101,
+        "NIFTY_CE",
+        101.0,
+        bid=100.95,
+        ask=101.0,
+        received_ts=time.time(),
+    )
+    executor._state = "BEARISH_EXPANSION"
+    executor._instant_state = "BEARISH_EXPANSION"
+
+    executor._manage_open_position(
+        evidence(ce_change=-1.0, pe_change=1.0, pressure=-0.2),
+        "BEARISH_EXPANSION",
+    )
+
+    assert trader.positions == {}
+    assert len(sink.records) == 1
+    assert sink.records[0]["exit_reason"] == "DEEPLOB_V2_EXIT:V1_REVERSAL_TO_PE"
+
+
+def test_catastrophic_guard_requires_repeated_aligned_depth_evidence():
+    trader = FakePaperTrader()
+    executor = LongOptionRegimeExecutor(settings(), trader)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    trader.on_entry(
+        101,
+        "NIFTY_CE",
+        "LONG",
+        100.0,
+        metadata={"entry_option_spread": 0.05},
+    )
+    executor.on_quote(
+        101,
+        "NIFTY_CE",
+        89.5,
+        bid=89.0,
+        ask=90.0,
+        received_ts=time.time(),
+    )
+    position = trader.positions[101]
+    adverse = evidence(ce_change=-2.0, pe_change=2.0, pressure=-0.5)
+
+    assert not executor._catastrophic_guard_triggered(
+        "CE", position, adverse, "BEARISH_EXPANSION"
+    )
+    assert not executor._catastrophic_guard_triggered(
+        "CE", position, adverse, "BEARISH_EXPANSION"
+    )
+    assert executor._catastrophic_guard_triggered(
+        "CE", position, adverse, "BEARISH_EXPANSION"
+    )
+
+
+def test_expiry_cycle_marks_tuesday_expiry_as_day_five():
+    executor = LongOptionRegimeExecutor(settings(), FakePaperTrader())
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350, "expiry": "2026-08-25"},
+            "PE": {"security_id": 102, "strike": 24350, "expiry": "2026-08-25"},
+        }
+    )
+
+    executor._refresh_expiry_cycle(date(2026, 8, 25))
+
+    assert executor.health()["expiry_cycle"]["cycle_label"] == "DAY_5"
+    assert executor.health()["expiry_cycle"]["premium_regime"] == "EXPIRY_GAMMA_DECAY"
