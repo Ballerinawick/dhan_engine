@@ -9,6 +9,8 @@ from datetime import datetime, time as clock_time
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
+from dhan_engine.domain.market.expiry_cycle import expiry_cycle_context
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,7 +34,8 @@ class LongOptionRegimeSettings:
     minimum_state_score: float
     fee_buffer_multiple: float
     round_trip_fee: float
-    maximum_loss_pct: float
+    catastrophic_loss_pct: float
+    catastrophic_confirmations: int
     market_start: clock_time
     entry_cutoff: clock_time
     market_end: clock_time
@@ -51,7 +54,12 @@ class LongOptionRegimeSettings:
             minimum_state_score=float(os.getenv(prefix + "MIN_STATE_SCORE", "0.58")),
             fee_buffer_multiple=float(os.getenv(prefix + "FEE_BUFFER_MULTIPLE", "1.25")),
             round_trip_fee=float(os.getenv(prefix + "ROUND_TRIP_FEE", "60")),
-            maximum_loss_pct=float(os.getenv(prefix + "MAX_LOSS_PCT", "1.25")),
+            catastrophic_loss_pct=max(
+                1.0, float(os.getenv(prefix + "CATASTROPHIC_LOSS_PCT", "8.0"))
+            ),
+            catastrophic_confirmations=max(
+                2, int(os.getenv(prefix + "CATASTROPHIC_CONFIRMATIONS", "3"))
+            ),
             market_start=_clock(os.getenv(prefix + "MARKET_START", "09:15")),
             entry_cutoff=_clock(os.getenv(prefix + "ENTRY_CUTOFF", "15:24")),
             market_end=_clock(os.getenv(prefix + "MARKET_END", "15:25")),
@@ -73,10 +81,13 @@ class LongOptionRegimeExecutor:
         self.history = {"CE": deque(maxlen=512), "PE": deque(maxlen=512)}
         self._timezone = ZoneInfo("Asia/Kolkata")
         self._state = "UNCERTAIN"
+        self._instant_state = "UNCERTAIN"
         self._candidate = "UNCERTAIN"
         self._candidate_count = 0
-        self._opposite_candidate = ""
-        self._opposite_count = 0
+        self._catastrophic_side = ""
+        self._catastrophic_count = 0
+        self._entry_rearm_state = ""
+        self._expiry_cycle: dict = {}
         self._entries = 0
         self._exits = 0
         self._blocks = 0
@@ -101,14 +112,17 @@ class LongOptionRegimeExecutor:
         self.quotes = {key: value for key, value in self.quotes.items() if key in selected}
         for values in self.history.values():
             values.clear()
+        self._refresh_expiry_cycle()
         logger.info(
             "DEEPLOB_V1_CONTRACTS | ce_id=%s | ce_strike=%s | pe_id=%s | pe_strike=%s | "
-            "pair_structure=%s | extra_subscriptions=0",
+            "pair_structure=%s | cycle=%s | premium_regime=%s | extra_subscriptions=0",
             self.contracts.get("CE", {}).get("security_id"),
             self.contracts.get("CE", {}).get("strike"),
             self.contracts.get("PE", {}).get("security_id"),
             self.contracts.get("PE", {}).get("strike"),
             self._pair_structure(),
+            self._expiry_cycle.get("cycle_label", "UNKNOWN"),
+            self._expiry_cycle.get("premium_regime", "UNKNOWN"),
         )
         return subscriptions
 
@@ -131,7 +145,6 @@ class LongOptionRegimeExecutor:
         self.history[side].append((float(received_ts), float(ltp)))
         self.paper_trader.on_tick(secid, float(ltp))
         self._prune(side, float(received_ts))
-        self._safety_exit(secid)
 
     def on_prediction(
         self,
@@ -153,18 +166,23 @@ class LongOptionRegimeExecutor:
             return
         self._last_evidence = evidence
         proposed = self._classify(evidence)
+        self._instant_state = self._normalize_state(proposed)
         self._advance_state(proposed)
-        self._log_v1(evidence)
+        self._log_v1(evidence, proposed)
 
         if self.paper_trader.has_open_position():
-            self._manage_open_position(evidence)
+            self._manage_open_position(evidence, self._instant_state)
             return
         now = datetime.now(self._timezone).time()
         if not (self.settings.market_start <= now < self.settings.entry_cutoff):
             return
         if self._state not in {"BULLISH_EXPANSION", "BEARISH_EXPANSION"}:
             return
+        if self._instant_state != self._state:
+            return
         if self._candidate_count < self.settings.state_confirmations:
+            return
+        if self._entry_rearm_state == self._state:
             return
         self._try_entry("CE" if self._state == "BULLISH_EXPANSION" else "PE", evidence)
 
@@ -180,7 +198,10 @@ class LongOptionRegimeExecutor:
             "strategy": self.strategy,
             "enabled": self.settings.enabled,
             "v1_state": self._state,
+            "v1_instant_state": self._instant_state,
             "state_confirmations": self._candidate_count,
+            "entry_rearm_state": self._entry_rearm_state or None,
+            "expiry_cycle": dict(self._expiry_cycle),
             "samples": {side: len(values) for side, values in self.history.items()},
             "open_positions": len(self.paper_trader.positions),
             "entries": self._entries,
@@ -221,6 +242,7 @@ class LongOptionRegimeExecutor:
         }
 
     def _derive_evidence(self, composite, paper_action, confidence, metadata) -> dict | None:
+        self._refresh_expiry_cycle()
         ce = self._leg_metrics("CE")
         pe = self._leg_metrics("PE")
         if ce is None or pe is None:
@@ -251,6 +273,7 @@ class LongOptionRegimeExecutor:
             "state_score": score,
             "pair_structure": self._pair_structure(),
             "signal_metadata": dict(metadata or {}),
+            "expiry_cycle": dict(self._expiry_cycle),
         }
 
     def _classify(self, evidence: dict) -> str:
@@ -286,10 +309,7 @@ class LongOptionRegimeExecutor:
         return "UNCERTAIN"
 
     def _advance_state(self, proposed: str) -> None:
-        normalized = {
-            "REVERSAL_TO_BULLISH": "BULLISH_EXPANSION",
-            "REVERSAL_TO_BEARISH": "BEARISH_EXPANSION",
-        }.get(proposed, proposed)
+        normalized = self._normalize_state(proposed)
         if normalized == self._candidate:
             self._candidate_count += 1
         else:
@@ -299,11 +319,16 @@ class LongOptionRegimeExecutor:
         if self._candidate_count >= required and normalized != self._state:
             previous = self._state
             self._state = normalized
+            if self._entry_rearm_state and self._state != self._entry_rearm_state:
+                self._entry_rearm_state = ""
             logger.info(
-                "DEEPLOB_V1_REGIME_TRANSITION | previous=%s | current=%s | confirmations=%s",
+                "DEEPLOB_V1_REGIME_TRANSITION | previous=%s | current=%s | confirmations=%s | "
+                "cycle=%s | premium_regime=%s",
                 previous,
                 self._state,
                 self._candidate_count,
+                self._expiry_cycle.get("cycle_label", "UNKNOWN"),
+                self._expiry_cycle.get("premium_regime", "UNKNOWN"),
             )
 
     def _try_entry(self, side: str, evidence: dict) -> None:
@@ -349,6 +374,7 @@ class LongOptionRegimeExecutor:
             "required_gross": required,
             "option_strike": contract.get("strike"),
             "option_expiry": contract.get("expiry"),
+            **evidence.get("expiry_cycle", {}),
         }
         accepted = self.paper_trader.on_entry(
             int(contract["security_id"]), contract["tag"], "LONG", ask, lots=1,
@@ -356,46 +382,116 @@ class LongOptionRegimeExecutor:
         )
         if accepted:
             self._entries += 1
+            self._catastrophic_side = ""
+            self._catastrophic_count = 0
             logger.info(
-                "DEEPLOB_V2_ENTRY | side=%s | state=%s | price=%.2f | score=%.3f | "
-                "ce_pct=%+.3f | pe_pct=%+.3f | pressure=%+.3f | expected_gross=%.2f",
-                side, self._state, ask, evidence["state_score"], evidence["ce"]["change_pct"],
+                "DEEPLOB_V2_ENTRY | side=%s | state=%s | instant_state=%s | price=%.2f | "
+                "score=%.3f | ce_pct=%+.3f | pe_pct=%+.3f | pressure=%+.3f | "
+                "expected_gross=%.2f | cycle=%s | premium_regime=%s",
+                side, self._state, self._instant_state, ask, evidence["state_score"], evidence["ce"]["change_pct"],
                 evidence["pe"]["change_pct"], evidence["pressure"], expected_gross,
+                self._expiry_cycle.get("cycle_label", "UNKNOWN"),
+                self._expiry_cycle.get("premium_regime", "UNKNOWN"),
             )
 
-    def _manage_open_position(self, evidence: dict) -> None:
+    def _manage_open_position(self, evidence: dict, instant_state: str) -> None:
         secid, position = next(iter(self.paper_trader.positions.items()))
         side = "CE" if str(position.get("tag", "")).endswith("_CE") else "PE"
-        supporting = (side == "CE" and self._state == "BULLISH_EXPANSION") or (side == "PE" and self._state == "BEARISH_EXPANSION")
+        supporting = (side == "CE" and self._state == "BULLISH_EXPANSION") or (
+            side == "PE" and self._state == "BEARISH_EXPANSION"
+        )
         opposite_state = "BEARISH_EXPANSION" if side == "CE" else "BULLISH_EXPANSION"
         if self._state == opposite_state:
-            if self._opposite_candidate == self._state:
-                self._opposite_count += 1
-            else:
-                self._opposite_candidate = self._state
-                self._opposite_count = 1
-            if self._opposite_count >= self.settings.reversal_confirmations:
-                self._exit(f"DEEPLOB_V2_EXIT:V1_REVERSAL_TO_{'PE' if side == 'CE' else 'CE'}")
+            self._exit(f"DEEPLOB_V2_EXIT:V1_REVERSAL_TO_{'PE' if side == 'CE' else 'CE'}")
             return
-        self._opposite_candidate = ""
-        self._opposite_count = 0
-        if not supporting and self._state in {"VOLATILITY_CONTRACTION", "BULLISH_EXHAUSTION", "BEARISH_EXHAUSTION"}:
+        if not supporting and self._state in {
+            "VOLATILITY_CONTRACTION",
+            "BULLISH_EXHAUSTION",
+            "BEARISH_EXHAUSTION",
+        }:
             self._exit(f"DEEPLOB_V2_EXIT:{self._state}")
+            return
+        if self._catastrophic_guard_triggered(side, position, evidence, instant_state):
+            self._entry_rearm_state = self._state
+            self._exit("DEEPLOB_V2_EXIT:DEPTH_CONFIRMED_CATASTROPHIC_GUARD")
             return
         now_mono = time.monotonic()
         if now_mono - self._last_hold_log_mono >= 5.0:
             self._last_hold_log_mono = now_mono
-            logger.info("DEEPLOB_V2_HOLD | side=%s | state=%s | score=%.3f", side, self._state, evidence["state_score"])
+            logger.info(
+                "DEEPLOB_V2_HOLD | side=%s | state=%s | instant_state=%s | score=%.3f | "
+                "cycle=%s | premium_regime=%s",
+                side,
+                self._state,
+                instant_state,
+                evidence["state_score"],
+                self._expiry_cycle.get("cycle_label", "UNKNOWN"),
+                self._expiry_cycle.get("premium_regime", "UNKNOWN"),
+            )
 
-    def _safety_exit(self, secid: int) -> None:
-        position = self.paper_trader.positions.get(int(secid))
-        quote = self.quotes.get(int(secid))
-        if not position or not quote or float(quote.get("bid", 0.0) or 0.0) <= 0:
-            return
-        entry = float(position["entry"])
-        pnl_pct = (float(quote["bid"]) / entry - 1.0) * 100.0
-        if pnl_pct <= -self.settings.maximum_loss_pct:
-            self._exit("DEEPLOB_V2_EXIT:MAXIMUM_LOSS_GUARD")
+    def _catastrophic_guard_triggered(
+        self, side: str, position: Mapping, evidence: dict, instant_state: str
+    ) -> bool:
+        secid = int(position.get("secid", 0) or 0)
+        quote = self.quotes.get(secid, {})
+        bid = float(quote.get("bid", 0.0) or 0.0)
+        ask = float(quote.get("ask", 0.0) or 0.0)
+        entry = float(position.get("entry", 0.0) or 0.0)
+        if bid <= 0 or ask <= 0 or entry <= 0:
+            self._reset_catastrophic_guard()
+            return False
+
+        loss_pct = max(0.0, (entry - bid) / entry * 100.0)
+        entry_spread_pct = (
+            float(position.get("entry_option_spread", 0.0) or 0.0) / entry * 100.0
+        )
+        current_spread_pct = max(0.0, ask - bid) / max((ask + bid) / 2.0, 0.01) * 100.0
+        loss_floor = max(
+            self.settings.catastrophic_loss_pct,
+            entry_spread_pct * 4.0,
+            current_spread_pct * 3.0,
+        )
+        leg = evidence[side.lower()]
+        adverse = (
+            side == "CE"
+            and instant_state in {"BEARISH_EXPANSION", "BEARISH_EXHAUSTION"}
+            and evidence["pressure"] < 0
+            and evidence["velocity_spread"] < 0
+            and leg["change_pct"] < 0
+        ) or (
+            side == "PE"
+            and instant_state in {"BULLISH_EXPANSION", "BULLISH_EXHAUSTION"}
+            and evidence["pressure"] > 0
+            and evidence["velocity_spread"] > 0
+            and leg["change_pct"] < 0
+        )
+        if loss_pct < loss_floor or not adverse:
+            self._reset_catastrophic_guard()
+            return False
+
+        if self._catastrophic_side == side:
+            self._catastrophic_count += 1
+        else:
+            self._catastrophic_side = side
+            self._catastrophic_count = 1
+        logger.warning(
+            "DEEPLOB_V2_CATASTROPHIC_GUARD_PENDING | side=%s | loss_pct=%.3f | "
+            "loss_floor_pct=%.3f | state=%s | instant_state=%s | pressure=%+.3f | "
+            "confirmations=%s/%s",
+            side,
+            loss_pct,
+            loss_floor,
+            self._state,
+            instant_state,
+            evidence["pressure"],
+            self._catastrophic_count,
+            self.settings.catastrophic_confirmations,
+        )
+        return self._catastrophic_count >= self.settings.catastrophic_confirmations
+
+    def _reset_catastrophic_guard(self) -> None:
+        self._catastrophic_side = ""
+        self._catastrophic_count = 0
 
     def _exit(self, reason: str) -> None:
         if not self.paper_trader.positions:
@@ -411,33 +507,77 @@ class LongOptionRegimeExecutor:
         if summary and self.trade_summary_sink is not None:
             summary.update({key: value for key, value in position.items() if key.startswith("v1_")})
             summary.update(
+                {
+                    key: position.get(key)
+                    for key in (
+                        "cycle_day",
+                        "cycle_label",
+                        "sessions_to_expiry",
+                        "premium_regime",
+                    )
+                    if position.get(key) is not None
+                }
+            )
+            summary.update(
                 schema_version=2, index="NIFTY", runtime="deeplob_live_regime_v2",
                 strategy=self.strategy, profile=self.profile, paper_profile=self.profile,
                 paper=True, exit_execution_side="BID", v1_exit_state=self._state,
+                v1_exit_instant_state=self._instant_state,
                 v1_exit_score=self._last_evidence.get("state_score"),
             )
             self.trade_summary_sink.record(summary)
         self._exits += 1
+        self._reset_catastrophic_guard()
         logger.info(
-            "DEEPLOB_V2_EXIT | tag=%s | price=%.2f | state=%s | reason=%s | s3_profile=%s",
-            position.get("tag"), bid, self._state, reason, self.profile,
+            "DEEPLOB_V2_EXIT | tag=%s | price=%.2f | state=%s | instant_state=%s | "
+            "reason=%s | cycle=%s | premium_regime=%s | s3_profile=%s",
+            position.get("tag"), bid, self._state, self._instant_state, reason,
+            self._expiry_cycle.get("cycle_label", "UNKNOWN"),
+            self._expiry_cycle.get("premium_regime", "UNKNOWN"), self.profile,
         )
 
-    def _log_v1(self, evidence: dict) -> None:
+    def _log_v1(self, evidence: dict, proposed: str) -> None:
         now = time.monotonic()
         if now - self._last_log_mono < 5.0:
             return
         self._last_log_mono = now
         logger.info(
-            "DEEPLOB_V1_STATE | state=%s | score=%.3f | call_pct=%+.3f | put_pct=%+.3f | "
+            "DEEPLOB_V1_STATE | state=%s | instant_state=%s | proposed=%s | score=%.3f | "
+            "call_pct=%+.3f | put_pct=%+.3f | "
             "long_%s_pct=%+.3f | velocity_spread=%+.4f | acceleration=%+.4f | "
-            "future_ltp=%.2f | pressure=%+.3f | confirmations=%s",
-            self._state, evidence["state_score"], evidence["ce"]["change_pct"],
+            "future_ltp=%.2f | pressure=%+.3f | confirmations=%s | cycle=%s | "
+            "premium_regime=%s",
+            self._state, self._instant_state, proposed, evidence["state_score"], evidence["ce"]["change_pct"],
             evidence["pe"]["change_pct"], evidence["pair_structure"].lower(),
             evidence["long_vol_pct"], evidence["velocity_spread"],
             evidence["acceleration_spread"], evidence["future_ltp"],
             evidence["pressure"], self._candidate_count,
+            self._expiry_cycle.get("cycle_label", "UNKNOWN"),
+            self._expiry_cycle.get("premium_regime", "UNKNOWN"),
         )
+
+    @staticmethod
+    def _normalize_state(state: str) -> str:
+        return {
+            "REVERSAL_TO_BULLISH": "BULLISH_EXPANSION",
+            "REVERSAL_TO_BEARISH": "BEARISH_EXPANSION",
+        }.get(state, state)
+
+    def _refresh_expiry_cycle(self, trade_date=None) -> None:
+        expiry = self.contracts.get("CE", {}).get("expiry") or self.contracts.get("PE", {}).get(
+            "expiry"
+        )
+        if not expiry:
+            self._expiry_cycle = {}
+            return
+        trading_day = trade_date or datetime.now(self._timezone).date()
+        if self._expiry_cycle.get("trade_date") == str(trading_day):
+            return
+        try:
+            self._expiry_cycle = expiry_cycle_context(trading_day, expiry).as_dict()
+        except (TypeError, ValueError):
+            self._expiry_cycle = {}
+            logger.warning("DEEPLOB_V1_EXPIRY_CYCLE_UNAVAILABLE | expiry=%s", expiry)
 
     def _pair_structure(self) -> str:
         ce_strike = self.contracts.get("CE", {}).get("strike")
