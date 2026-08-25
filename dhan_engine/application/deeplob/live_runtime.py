@@ -18,6 +18,10 @@ from dhan_engine.application.deeplob.liquidity_pulse_scalp import (
     LiquidityPulseScalpRuntime,
     LiquidityPulseScalpSettings,
 )
+from dhan_engine.application.deeplob.long_option_regime import (
+    LongOptionRegimeExecutor,
+    LongOptionRegimeSettings,
+)
 from dhan_engine.application.deeplob.option_paper_executor import (
     DeepLobOptionPaperExecutor,
     DeepLobOptionPaperSettings,
@@ -495,6 +499,7 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
     master = InstrumentMaster(inference_settings.csv_file, debug=False)
     recorder = ParquetDepthRecorder(settings.recorder)
     option_paper_settings = DeepLobOptionPaperSettings.from_env()
+    regime_v2_settings = LongOptionRegimeSettings.from_env()
     scalp_paper_settings = DeepLobOptionPaperSettings.from_env(
         "DEEPLOB_SCALP_PAPER",
         defaults={
@@ -553,6 +558,7 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
     )
     if (
         option_paper_settings.enabled
+        or regime_v2_settings.enabled
         or scalp_paper_settings.enabled
         or adaptive_scalp_settings.enabled
         or (reversal_runtime_settings.enabled and reversal_paper_settings.enabled)
@@ -579,6 +585,19 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
                     profile="dynamic",
                     strategy="deeplob_mbp_dynamic_v1",
                 )
+            )
+        if regime_v2_settings.enabled:
+            paper_executors.append(
+                LongOptionRegimeExecutor(
+                    regime_v2_settings,
+                    PaperTradeManager(capital=regime_v2_settings.capital),
+                    trade_summary_sink=trade_summary_sink,
+                )
+            )
+            logger.warning(
+                "DEEPLOB_REGIME_V2_CONFIGURED | v1=long_option_virtual_regime | "
+                "v2=long_only_ce_pe_execution | isolated_portfolio=true | "
+                "extra_broker_connections=0 | extra_subscriptions=0 | s3_profile=regime_v2"
             )
         if scalp_paper_settings.enabled:
             paper_executors.append(
