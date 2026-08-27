@@ -79,6 +79,7 @@ class LongOptionRegimeExecutor:
         self.contracts: dict[str, dict] = {}
         self.quotes: dict[int, dict] = {}
         self.history = {"CE": deque(maxlen=512), "PE": deque(maxlen=512)}
+        self.future_history = deque(maxlen=512)
         self._timezone = ZoneInfo("Asia/Kolkata")
         self._state = "UNCERTAIN"
         self._instant_state = "UNCERTAIN"
@@ -94,6 +95,7 @@ class LongOptionRegimeExecutor:
         self._last_log_mono = 0.0
         self._last_hold_log_mono = 0.0
         self._last_evidence: dict = {}
+        self._last_v1_books: dict = {}
 
     def register_contracts(self, selection: Mapping[str, Mapping]) -> list[dict]:
         subscriptions = []
@@ -112,6 +114,8 @@ class LongOptionRegimeExecutor:
         self.quotes = {key: value for key, value in self.quotes.items() if key in selected}
         for values in self.history.values():
             values.clear()
+        self.future_history.clear()
+        self._last_v1_books = {}
         self._refresh_expiry_cycle()
         logger.info(
             "DEEPLOB_V1_CONTRACTS | ce_id=%s | ce_strike=%s | pe_id=%s | pe_strike=%s | "
@@ -142,7 +146,9 @@ class LongOptionRegimeExecutor:
             "received_ts": float(received_ts),
         }
         self.quotes[secid] = quote
-        self.history[side].append((float(received_ts), float(ltp)))
+        self.history[side].append(
+            (float(received_ts), float(ltp), float(bid or 0.0), float(ask or 0.0))
+        )
         self.paper_trader.on_tick(secid, float(ltp))
         self._prune(side, float(received_ts))
 
@@ -203,6 +209,8 @@ class LongOptionRegimeExecutor:
             "entry_rearm_state": self._entry_rearm_state or None,
             "expiry_cycle": dict(self._expiry_cycle),
             "samples": {side: len(values) for side, values in self.history.items()},
+            "future_samples": len(self.future_history),
+            "v1_books": dict(self._last_v1_books),
             "open_positions": len(self.paper_trader.positions),
             "entries": self._entries,
             "exits": self._exits,
@@ -215,11 +223,16 @@ class LongOptionRegimeExecutor:
         while values and values[0][0] < cutoff:
             values.popleft()
 
+    def _prune_future(self, now_ts: float) -> None:
+        cutoff = now_ts - max(60.0, self.settings.observation_sec * 4.0)
+        while self.future_history and self.future_history[0][0] < cutoff:
+            self.future_history.popleft()
+
     def _leg_metrics(self, side: str) -> dict | None:
         values = self.history[side]
         if len(values) < self.settings.minimum_samples:
             return None
-        now_ts, last = values[-1]
+        now_ts, last, last_bid, last_ask = values[-1]
         cutoff = now_ts - self.settings.observation_sec
         window = [item for item in values if item[0] >= cutoff]
         if len(window) < self.settings.minimum_samples or window[0][1] <= 0:
@@ -235,30 +248,148 @@ class LongOptionRegimeExecutor:
         second_velocity = (second[-1][1] / second[0][1] - 1.0) * 100.0 / second_elapsed
         return {
             "ltp": last,
+            "bid": last_bid,
+            "ask": last_ask,
             "change_pct": change_pct,
+            "executable_change_pct": (
+                (last_bid / window[0][3] - 1.0) * 100.0
+                if last_bid > 0 and window[0][3] > 0
+                else change_pct
+            ),
             "velocity_pct_sec": change_pct / elapsed,
             "acceleration": second_velocity - first_velocity,
-            "range_pct": (max(v for _, v in window) - min(v for _, v in window)) / window[0][1] * 100.0,
+            "range_pct": (
+                max(item[1] for item in window) - min(item[1] for item in window)
+            ) / window[0][1] * 100.0,
+            "window_start_bid": window[0][2],
+            "window_start_ask": window[0][3],
+        }
+
+    def _future_metrics(self, composite) -> dict | None:
+        full_quote = composite.full_quote or {}
+        future_ltp = float(full_quote.get("ltp", 0.0) or 0.0)
+        received_ts = float(full_quote.get("received_ts", time.time()) or time.time())
+        if future_ltp <= 0:
+            return None
+        if not self.future_history or (
+            received_ts > self.future_history[-1][0]
+            or future_ltp != self.future_history[-1][1]
+        ):
+            self.future_history.append((received_ts, future_ltp))
+        self._prune_future(received_ts)
+        cutoff = received_ts - self.settings.observation_sec
+        window = [item for item in self.future_history if item[0] >= cutoff]
+        if len(window) < self.settings.minimum_samples or window[0][1] <= 0:
+            return None
+        elapsed = max(window[-1][0] - window[0][0], 0.001)
+        change_pct = (window[-1][1] / window[0][1] - 1.0) * 100.0
+        range_pct = (
+            max(value for _, value in window) - min(value for _, value in window)
+        ) / window[0][1] * 100.0
+        return {
+            "ltp": future_ltp,
+            "change_pct": change_pct,
+            "short_change_pct": -change_pct,
+            "velocity_pct_sec": change_pct / elapsed,
+            "range_pct": range_pct,
+        }
+
+    @staticmethod
+    def _signed_strength(value: float, observed_range: float) -> float:
+        scale = max(abs(observed_range), abs(value), 0.0001)
+        return max(-1.0, min(1.0, value / scale))
+
+    def _derive_v1_books(self, ce: dict, pe: dict, future: dict, pressure: float) -> dict:
+        ce_start_ask = float(ce["window_start_ask"] or 0.0)
+        ce_start_bid = float(ce["window_start_bid"] or 0.0)
+        pe_start_ask = float(pe["window_start_ask"] or 0.0)
+        pe_start_bid = float(pe["window_start_bid"] or 0.0)
+        ce_bid = float(ce["bid"] or 0.0)
+        ce_ask = float(ce["ask"] or 0.0)
+        pe_bid = float(pe["bid"] or 0.0)
+        pe_ask = float(pe["ask"] or 0.0)
+
+        synthetic_long_cost = max(ce_start_ask + pe_start_bid, 0.01)
+        synthetic_short_cost = max(pe_start_ask + ce_start_bid, 0.01)
+        synthetic_long_pct = (
+            (ce_bid - ce_start_ask) + (pe_start_bid - pe_ask)
+        ) / synthetic_long_cost * 100.0
+        synthetic_short_pct = (
+            (pe_bid - pe_start_ask) + (ce_start_bid - ce_ask)
+        ) / synthetic_short_cost * 100.0
+        straddle_cost = max(ce_start_ask + pe_start_ask, 0.01)
+        long_straddle_pct = (
+            (ce_bid + pe_bid) / straddle_cost - 1.0
+        ) * 100.0
+
+        option_range = max(ce["range_pct"] + pe["range_pct"], 0.0001)
+        future_strength = self._signed_strength(
+            future["change_pct"], future["range_pct"]
+        )
+        option_strength = self._signed_strength(
+            ce["executable_change_pct"] - pe["executable_change_pct"],
+            option_range,
+        )
+        synthetic_strength = self._signed_strength(
+            synthetic_long_pct - synthetic_short_pct,
+            option_range * 2.0,
+        )
+        pressure_strength = max(-1.0, min(1.0, pressure))
+        direction_score = (
+            future_strength + option_strength + synthetic_strength + pressure_strength
+        ) / 4.0
+        bull_support = sum(
+            value > 0.0
+            for value in (
+                future["change_pct"],
+                ce["executable_change_pct"] - pe["executable_change_pct"],
+                synthetic_long_pct - synthetic_short_pct,
+                pressure,
+            )
+        )
+        bear_support = sum(
+            value < 0.0
+            for value in (
+                future["change_pct"],
+                ce["executable_change_pct"] - pe["executable_change_pct"],
+                synthetic_long_pct - synthetic_short_pct,
+                pressure,
+            )
+        )
+        return {
+            "future_long_pct": future["change_pct"],
+            "future_short_pct": future["short_change_pct"],
+            "long_ce_pct": ce["executable_change_pct"],
+            "long_pe_pct": pe["executable_change_pct"],
+            "synthetic_long_pct": synthetic_long_pct,
+            "synthetic_short_pct": synthetic_short_pct,
+            "long_straddle_pct": long_straddle_pct,
+            "direction_score": direction_score,
+            "bull_support": bull_support,
+            "bear_support": bear_support,
         }
 
     def _derive_evidence(self, composite, paper_action, confidence, metadata) -> dict | None:
         self._refresh_expiry_cycle()
         ce = self._leg_metrics("CE")
         pe = self._leg_metrics("PE")
-        if ce is None or pe is None:
+        future = self._future_metrics(composite)
+        if ce is None or pe is None or future is None:
             return None
         pressure = float(getattr(composite.features, "pressure_score", 0.0) or 0.0)
-        future_ltp = float((composite.full_quote or {}).get("ltp", 0.0) or 0.0)
+        v1_books = self._derive_v1_books(ce, pe, future, pressure)
+        self._last_v1_books = dict(v1_books)
+        future_ltp = future["ltp"]
         directional = ce["change_pct"] - pe["change_pct"]
         velocity = ce["velocity_pct_sec"] - pe["velocity_pct_sec"]
         acceleration = ce["acceleration"] - pe["acceleration"]
         long_vol = ce["change_pct"] + pe["change_pct"]
         scale = max(ce["range_pct"] + pe["range_pct"], 0.05)
-        depth_direction = 1.0 if pressure > 0 else -1.0 if pressure < 0 else 0.0
-        model_direction = 1.0 if paper_action == "BUY_CE" else -1.0 if paper_action == "BUY_PE" else 0.0
-        direction = 1.0 if directional > 0 else -1.0 if directional < 0 else 0.0
-        alignment = (direction == depth_direction) + (direction == model_direction)
-        score = min(1.0, abs(directional) / scale * 0.55 + abs(pressure) * 1.5 + alignment * 0.12)
+        score = min(
+            1.0,
+            abs(v1_books["direction_score"]) * 0.70
+            + min(1.0, abs(directional) / scale) * 0.30,
+        )
         return {
             "ce": ce,
             "pe": pe,
@@ -268,6 +399,8 @@ class LongOptionRegimeExecutor:
             "long_vol_pct": long_vol,
             "pressure": pressure,
             "future_ltp": future_ltp,
+            "future": future,
+            "v1_books": v1_books,
             "model_action": str(paper_action),
             "model_confidence": float(confidence),
             "state_score": score,
@@ -279,33 +412,52 @@ class LongOptionRegimeExecutor:
     def _classify(self, evidence: dict) -> str:
         ce = evidence["ce"]
         pe = evidence["pe"]
+        books = evidence["v1_books"]
         score = evidence["state_score"]
-        if score < self.settings.minimum_state_score:
-            if ce["change_pct"] < 0 and pe["change_pct"] < 0:
-                return "VOLATILITY_CONTRACTION"
-            return "UNCERTAIN"
         bullish = (
-            ce["change_pct"] > 0
-            and pe["change_pct"] < 0
+            books["bull_support"] >= 3
+            and books["direction_score"] > 0
             and evidence["velocity_spread"] > 0
-            and evidence["pressure"] >= 0
+            and score >= self.settings.minimum_state_score
         )
         bearish = (
-            pe["change_pct"] > 0
-            and ce["change_pct"] < 0
+            books["bear_support"] >= 3
+            and books["direction_score"] < 0
             and evidence["velocity_spread"] < 0
-            and evidence["pressure"] <= 0
+            and score >= self.settings.minimum_state_score
         )
         if bullish:
             return "REVERSAL_TO_BULLISH" if self._state in {"BEARISH_EXPANSION", "BEARISH_EXHAUSTION"} else "BULLISH_EXPANSION"
         if bearish:
             return "REVERSAL_TO_BEARISH" if self._state in {"BULLISH_EXPANSION", "BULLISH_EXHAUSTION"} else "BEARISH_EXPANSION"
-        if ce["change_pct"] > 0 and pe["change_pct"] > 0:
+        if self._state == "BULLISH_EXPANSION":
+            exhausted = sum(
+                value <= 0.0
+                for value in (
+                    books["future_long_pct"],
+                    books["synthetic_long_pct"],
+                    evidence["acceleration_spread"],
+                    evidence["pressure"],
+                )
+            )
+            if exhausted >= 3:
+                return "BULLISH_EXHAUSTION"
+        if self._state == "BEARISH_EXPANSION":
+            exhausted = sum(
+                value <= 0.0
+                for value in (
+                    books["future_short_pct"],
+                    books["synthetic_short_pct"],
+                    -evidence["acceleration_spread"],
+                    -evidence["pressure"],
+                )
+            )
+            if exhausted >= 3:
+                return "BEARISH_EXHAUSTION"
+        if books["long_straddle_pct"] > 0 and ce["change_pct"] > 0 and pe["change_pct"] > 0:
             return "VOLATILITY_EXPANSION"
-        if self._state == "BULLISH_EXPANSION" and evidence["acceleration_spread"] < 0:
-            return "BULLISH_EXHAUSTION"
-        if self._state == "BEARISH_EXPANSION" and evidence["acceleration_spread"] > 0:
-            return "BEARISH_EXHAUSTION"
+        if books["long_straddle_pct"] <= 0 and abs(books["direction_score"]) < self.settings.minimum_state_score:
+            return "VOLATILITY_CONTRACTION"
         return "UNCERTAIN"
 
     def _advance_state(self, proposed: str) -> None:
@@ -341,19 +493,8 @@ class LongOptionRegimeExecutor:
             self._blocks += 1
             logger.info("DEEPLOB_V2_ENTRY_BLOCKED | reason=OPTION_QUOTE_NOT_EXECUTABLE | side=%s", side)
             return
-        leg = evidence[side.lower()]
         lot_size = int(self.paper_trader.LOT_SIZES["NIFTY"])
-        observed_move = max(0.0, leg["change_pct"] / 100.0 * ask)
-        expected_gross = (observed_move - max(0.0, ask - bid)) * lot_size
-        required = self.settings.round_trip_fee * self.settings.fee_buffer_multiple
-        if expected_gross < required:
-            self._blocks += 1
-            logger.info(
-                "DEEPLOB_V2_ENTRY_BLOCKED | reason=V1_EXECUTABLE_EDGE_BELOW_COST | side=%s | "
-                "state=%s | expected_gross=%.2f | required_gross=%.2f | score=%.3f",
-                side, self._state, expected_gross, required, evidence["state_score"],
-            )
-            return
+        spread_cost = max(0.0, ask - bid) * lot_size
         metadata = {
             "strategy": self.strategy,
             "profile": self.profile,
@@ -367,11 +508,11 @@ class LongOptionRegimeExecutor:
             "v1_long_vol_pct": evidence["long_vol_pct"],
             "v1_velocity_spread": evidence["velocity_spread"],
             "v1_acceleration_spread": evidence["acceleration_spread"],
+            "v1_books": dict(evidence["v1_books"]),
             "future_ltp": evidence["future_ltp"],
             "pressure_score": evidence["pressure"],
             "entry_option_spread": ask - bid,
-            "expected_gross": expected_gross,
-            "required_gross": required,
+            "entry_spread_cost": spread_cost,
             "option_strike": contract.get("strike"),
             "option_expiry": contract.get("expiry"),
             **evidence.get("expiry_cycle", {}),
@@ -387,9 +528,10 @@ class LongOptionRegimeExecutor:
             logger.info(
                 "DEEPLOB_V2_ENTRY | side=%s | state=%s | instant_state=%s | price=%.2f | "
                 "score=%.3f | ce_pct=%+.3f | pe_pct=%+.3f | pressure=%+.3f | "
-                "expected_gross=%.2f | cycle=%s | premium_regime=%s",
+                "direction_score=%+.3f | spread_cost=%.2f | cycle=%s | premium_regime=%s",
                 side, self._state, self._instant_state, ask, evidence["state_score"], evidence["ce"]["change_pct"],
-                evidence["pe"]["change_pct"], evidence["pressure"], expected_gross,
+                evidence["pe"]["change_pct"], evidence["pressure"],
+                evidence["v1_books"]["direction_score"], spread_cost,
                 self._expiry_cycle.get("cycle_label", "UNKNOWN"),
                 self._expiry_cycle.get("premium_regime", "UNKNOWN"),
             )
@@ -404,11 +546,10 @@ class LongOptionRegimeExecutor:
         if self._state == opposite_state:
             self._exit(f"DEEPLOB_V2_EXIT:V1_REVERSAL_TO_{'PE' if side == 'CE' else 'CE'}")
             return
-        if not supporting and self._state in {
-            "VOLATILITY_CONTRACTION",
-            "BULLISH_EXHAUSTION",
-            "BEARISH_EXHAUSTION",
-        }:
+        matching_exhaustion = (side == "CE" and self._state == "BULLISH_EXHAUSTION") or (
+            side == "PE" and self._state == "BEARISH_EXHAUSTION"
+        )
+        if matching_exhaustion:
             self._exit(f"DEEPLOB_V2_EXIT:{self._state}")
             return
         if self._catastrophic_guard_triggered(side, position, evidence, instant_state):
@@ -420,11 +561,13 @@ class LongOptionRegimeExecutor:
             self._last_hold_log_mono = now_mono
             logger.info(
                 "DEEPLOB_V2_HOLD | side=%s | state=%s | instant_state=%s | score=%.3f | "
-                "cycle=%s | premium_regime=%s",
+                "supporting=%s | direction_score=%+.3f | cycle=%s | premium_regime=%s",
                 side,
                 self._state,
                 instant_state,
                 evidence["state_score"],
+                supporting,
+                evidence.get("v1_books", {}).get("direction_score", 0.0),
                 self._expiry_cycle.get("cycle_label", "UNKNOWN"),
                 self._expiry_cycle.get("premium_regime", "UNKNOWN"),
             )
@@ -545,12 +688,21 @@ class LongOptionRegimeExecutor:
             "DEEPLOB_V1_STATE | state=%s | instant_state=%s | proposed=%s | score=%.3f | "
             "call_pct=%+.3f | put_pct=%+.3f | "
             "long_%s_pct=%+.3f | velocity_spread=%+.4f | acceleration=%+.4f | "
-            "future_ltp=%.2f | pressure=%+.3f | confirmations=%s | cycle=%s | "
+            "future_ltp=%.2f | future_pct=%+.4f | synthetic_long=%+.3f | "
+            "synthetic_short=%+.3f | straddle=%+.3f | direction_score=%+.3f | "
+            "bull_support=%s | bear_support=%s | pressure=%+.3f | confirmations=%s | cycle=%s | "
             "premium_regime=%s",
             self._state, self._instant_state, proposed, evidence["state_score"], evidence["ce"]["change_pct"],
             evidence["pe"]["change_pct"], evidence["pair_structure"].lower(),
             evidence["long_vol_pct"], evidence["velocity_spread"],
             evidence["acceleration_spread"], evidence["future_ltp"],
+            evidence["v1_books"]["future_long_pct"],
+            evidence["v1_books"]["synthetic_long_pct"],
+            evidence["v1_books"]["synthetic_short_pct"],
+            evidence["v1_books"]["long_straddle_pct"],
+            evidence["v1_books"]["direction_score"],
+            evidence["v1_books"]["bull_support"],
+            evidence["v1_books"]["bear_support"],
             evidence["pressure"], self._candidate_count,
             self._expiry_cycle.get("cycle_label", "UNKNOWN"),
             self._expiry_cycle.get("premium_regime", "UNKNOWN"),
