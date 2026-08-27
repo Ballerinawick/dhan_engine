@@ -77,14 +77,18 @@ def settings():
     )
 
 
-def composite(pressure):
+def composite(pressure, *, future_ltp=24350.0, received_ts=None):
     return SimpleNamespace(
         features=SimpleNamespace(pressure_score=pressure),
-        full_quote={"ltp": 24350.0},
+        full_quote={
+            "ltp": future_ltp,
+            "received_ts": float(received_ts if received_ts is not None else time.time()),
+        },
     )
 
 
 def evidence(*, ce_change=1.0, pe_change=-1.0, pressure=0.2):
+    direction = 1.0 if ce_change > pe_change else -1.0
     return {
         "ce": {
             "ltp": 101.0,
@@ -106,6 +110,25 @@ def evidence(*, ce_change=1.0, pe_change=-1.0, pressure=0.2):
         "long_vol_pct": ce_change + pe_change,
         "pressure": pressure,
         "future_ltp": 24350.0,
+        "future": {
+            "ltp": 24350.0,
+            "change_pct": 0.1 * direction,
+            "short_change_pct": -0.1 * direction,
+            "velocity_pct_sec": 0.01 * direction,
+            "range_pct": 0.1,
+        },
+        "v1_books": {
+            "future_long_pct": 0.1 * direction,
+            "future_short_pct": -0.1 * direction,
+            "long_ce_pct": ce_change,
+            "long_pe_pct": pe_change,
+            "synthetic_long_pct": ce_change - pe_change,
+            "synthetic_short_pct": pe_change - ce_change,
+            "long_straddle_pct": ce_change + pe_change,
+            "direction_score": 0.8 * direction,
+            "bull_support": 4 if direction > 0 else 0,
+            "bear_support": 4 if direction < 0 else 0,
+        },
         "model_action": "BUY_CE" if pressure >= 0 else "BUY_PE",
         "model_confidence": 0.8,
         "state_score": 0.9,
@@ -115,7 +138,16 @@ def evidence(*, ce_change=1.0, pe_change=-1.0, pressure=0.2):
     }
 
 
-def publish_pair(executor, timestamp, ce_ltp, pe_ltp, action, pressure):
+def publish_pair(
+    executor,
+    timestamp,
+    ce_ltp,
+    pe_ltp,
+    action,
+    pressure,
+    *,
+    future_ltp=24350.0,
+):
     executor.on_quote(
         101, "NIFTY_CE", ce_ltp, bid=ce_ltp - 0.05, ask=ce_ltp,
         received_ts=timestamp,
@@ -127,7 +159,11 @@ def publish_pair(executor, timestamp, ce_ltp, pe_ltp, action, pressure):
     executor.on_prediction(
         paper_action=action,
         confidence=0.8,
-        composite=composite(pressure),
+        composite=composite(
+            pressure,
+            future_ltp=future_ltp,
+            received_ts=timestamp,
+        ),
         probability_down=0.1,
         probability_flat=0.1,
         probability_up=0.8,
@@ -158,6 +194,7 @@ def test_v1_bullish_state_drives_v2_ce_entry_and_reversal_exit():
             100.0 - index * 1.0,
             "BUY_CE",
             0.20,
+            future_ltp=24350.0 + index * 2.0,
         )
 
     assert executor.health()["v1_state"] == "BULLISH_EXPANSION"
@@ -171,6 +208,7 @@ def test_v1_bullish_state_drives_v2_ce_entry_and_reversal_exit():
             93.0 + (index - 7) * 2.0,
             "BUY_PE",
             -0.20,
+            future_ltp=24364.0 - (index - 7) * 3.0,
         )
 
     assert list(trader.positions) == [102]
@@ -197,6 +235,109 @@ def test_pair_structure_reflects_selected_strikes_without_extra_contracts():
     )
     assert len(subscriptions) == 2
     assert executor._pair_structure() == "STRANGLE"
+
+
+def test_v1_books_use_future_options_synthetic_straddle_and_depth():
+    executor = LongOptionRegimeExecutor(settings(), FakePaperTrader())
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    base = 1_800_000_000.0
+    for index in range(6):
+        publish_pair(
+            executor,
+            base + index,
+            100.0 + index,
+            100.0 - index * 0.6,
+            "BUY_CE",
+            0.35,
+            future_ltp=24350.0 + index * 1.5,
+        )
+
+    books = executor.health()["v1_books"]
+    assert books["future_long_pct"] > 0
+    assert books["future_short_pct"] < 0
+    assert books["long_ce_pct"] > books["long_pe_pct"]
+    assert books["synthetic_long_pct"] > books["synthetic_short_pct"]
+    assert "long_straddle_pct" in books
+    assert books["bull_support"] >= 3
+    assert books["direction_score"] > 0
+
+
+def test_volatility_disagreement_waits_and_holds_existing_ce():
+    trader = FakePaperTrader()
+    executor = LongOptionRegimeExecutor(settings(), trader)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    trader.on_entry(101, "NIFTY_CE", "LONG", 100.0)
+    executor.on_quote(
+        101,
+        "NIFTY_CE",
+        101.0,
+        bid=100.95,
+        ask=101.0,
+        received_ts=time.time(),
+    )
+
+    for state in ("VOLATILITY_EXPANSION", "VOLATILITY_CONTRACTION", "UNCERTAIN"):
+        executor._state = state
+        executor._instant_state = state
+        executor._manage_open_position(evidence(), state)
+        assert list(trader.positions) == [101]
+
+
+def test_bullish_exhaustion_exits_ce_without_early_pe_entry():
+    trader = FakePaperTrader()
+    sink = FakeSink()
+    executor = LongOptionRegimeExecutor(settings(), trader, trade_summary_sink=sink)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    trader.on_entry(101, "NIFTY_CE", "LONG", 100.0)
+    executor.on_quote(
+        101,
+        "NIFTY_CE",
+        101.0,
+        bid=100.95,
+        ask=101.0,
+        received_ts=time.time(),
+    )
+    executor._state = "BULLISH_EXHAUSTION"
+    executor._instant_state = "BULLISH_EXHAUSTION"
+
+    executor._manage_open_position(evidence(), "BULLISH_EXHAUSTION")
+
+    assert trader.positions == {}
+    assert sink.records[0]["exit_reason"] == "DEEPLOB_V2_EXIT:BULLISH_EXHAUSTION"
+    assert executor.health()["entries"] == 0
+
+
+def test_state_confirmed_entry_does_not_use_fixed_profit_forecast_gate():
+    trader = FakePaperTrader()
+    executor = LongOptionRegimeExecutor(settings(), trader)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    now = time.time()
+    executor.on_quote(101, "NIFTY_CE", 100.0, bid=99.95, ask=100.0, received_ts=now)
+    executor.on_quote(102, "NIFTY_PE", 100.0, bid=99.95, ask=100.0, received_ts=now)
+
+    executor._try_entry("CE", evidence(ce_change=0.01, pe_change=-0.01),)
+
+    assert list(trader.positions) == [101]
 
 
 def test_executable_spread_alone_does_not_exit_position():
