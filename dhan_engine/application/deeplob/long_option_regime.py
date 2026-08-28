@@ -9,6 +9,10 @@ from datetime import datetime, time as clock_time
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
+from dhan_engine.application.deeplob.virtual_strategy_books import (
+    ExecutableStrategyLedger,
+    MarketMark,
+)
 from dhan_engine.domain.market.expiry_cycle import expiry_cycle_context
 
 logger = logging.getLogger(__name__)
@@ -39,6 +43,9 @@ class LongOptionRegimeSettings:
     market_start: clock_time
     entry_cutoff: clock_time
     market_end: clock_time
+    hybrid_enabled: bool = True
+    hybrid_book_weight: float = 0.55
+    hybrid_min_updates: int = 4
 
     @classmethod
     def from_env(cls) -> "LongOptionRegimeSettings":
@@ -63,6 +70,13 @@ class LongOptionRegimeSettings:
             market_start=_clock(os.getenv(prefix + "MARKET_START", "09:15")),
             entry_cutoff=_clock(os.getenv(prefix + "ENTRY_CUTOFF", "15:24")),
             market_end=_clock(os.getenv(prefix + "MARKET_END", "15:25")),
+            hybrid_enabled=_env_bool(prefix + "HYBRID_ENABLED", "1"),
+            hybrid_book_weight=max(
+                0.0, min(1.0, float(os.getenv(prefix + "HYBRID_BOOK_WEIGHT", "0.55")))
+            ),
+            hybrid_min_updates=max(
+                2, int(os.getenv(prefix + "HYBRID_MIN_UPDATES", "4"))
+            ),
         )
 
 
@@ -96,6 +110,7 @@ class LongOptionRegimeExecutor:
         self._last_hold_log_mono = 0.0
         self._last_evidence: dict = {}
         self._last_v1_books: dict = {}
+        self._v1_ledger = ExecutableStrategyLedger()
 
     def register_contracts(self, selection: Mapping[str, Mapping]) -> list[dict]:
         subscriptions = []
@@ -116,6 +131,7 @@ class LongOptionRegimeExecutor:
             values.clear()
         self.future_history.clear()
         self._last_v1_books = {}
+        self._v1_ledger.reset()
         self._refresh_expiry_cycle()
         logger.info(
             "DEEPLOB_V1_CONTRACTS | ce_id=%s | ce_strike=%s | pe_id=%s | pe_strike=%s | "
@@ -263,6 +279,7 @@ class LongOptionRegimeExecutor:
             ) / window[0][1] * 100.0,
             "window_start_bid": window[0][2],
             "window_start_ask": window[0][3],
+            "received_ts": now_ts,
         }
 
     def _future_metrics(self, composite) -> dict | None:
@@ -300,28 +317,29 @@ class LongOptionRegimeExecutor:
         return max(-1.0, min(1.0, value / scale))
 
     def _derive_v1_books(self, ce: dict, pe: dict, future: dict, pressure: float) -> dict:
-        ce_start_ask = float(ce["window_start_ask"] or 0.0)
-        ce_start_bid = float(ce["window_start_bid"] or 0.0)
-        pe_start_ask = float(pe["window_start_ask"] or 0.0)
-        pe_start_bid = float(pe["window_start_bid"] or 0.0)
-        ce_bid = float(ce["bid"] or 0.0)
-        ce_ask = float(ce["ask"] or 0.0)
-        pe_bid = float(pe["bid"] or 0.0)
-        pe_ask = float(pe["ask"] or 0.0)
+        ledger = self._v1_ledger.update(
+            MarketMark(
+                received_ts=max(float(ce["received_ts"]), float(pe["received_ts"])),
+                future_ltp=float(future["ltp"]),
+                ce_bid=float(ce["bid"] or 0.0),
+                ce_ask=float(ce["ask"] or 0.0),
+                pe_bid=float(pe["bid"] or 0.0),
+                pe_ask=float(pe["ask"] or 0.0),
+            )
+        )
+        executable = ledger.get("books", {})
 
-        synthetic_long_cost = max(ce_start_ask + pe_start_bid, 0.01)
-        synthetic_short_cost = max(pe_start_ask + ce_start_bid, 0.01)
-        synthetic_long_pct = (
-            (ce_bid - ce_start_ask) + (pe_start_bid - pe_ask)
-        ) / synthetic_long_cost * 100.0
-        synthetic_short_pct = (
-            (pe_bid - pe_start_ask) + (ce_start_bid - ce_ask)
-        ) / synthetic_short_cost * 100.0
-        straddle_cost = max(ce_start_ask + pe_start_ask, 0.01)
-        long_straddle_pct = (
-            (ce_bid + pe_bid) / straddle_cost - 1.0
-        ) * 100.0
+        def book_pct(name: str, fallback: float = 0.0) -> float:
+            return float(executable.get(name, {}).get("pnl_pct", fallback) or 0.0)
 
+        future_long_pct = book_pct("future_long", future["change_pct"])
+        future_short_pct = book_pct("future_short", future["short_change_pct"])
+        long_ce_pct = book_pct("long_ce", ce["executable_change_pct"])
+        long_pe_pct = book_pct("long_pe", pe["executable_change_pct"])
+        synthetic_long_pct = book_pct("synthetic_long")
+        synthetic_short_pct = book_pct("synthetic_short")
+        long_straddle_pct = book_pct("long_straddle")
+        short_straddle_pct = book_pct("short_straddle")
         option_range = max(ce["range_pct"] + pe["range_pct"], 0.0001)
         future_strength = self._signed_strength(
             future["change_pct"], future["range_pct"]
@@ -335,10 +353,10 @@ class LongOptionRegimeExecutor:
             option_range * 2.0,
         )
         pressure_strength = max(-1.0, min(1.0, pressure))
-        direction_score = (
+        fast_direction_score = (
             future_strength + option_strength + synthetic_strength + pressure_strength
         ) / 4.0
-        bull_support = sum(
+        fast_bull_support = sum(
             value > 0.0
             for value in (
                 future["change_pct"],
@@ -347,7 +365,7 @@ class LongOptionRegimeExecutor:
                 pressure,
             )
         )
-        bear_support = sum(
+        fast_bear_support = sum(
             value < 0.0
             for value in (
                 future["change_pct"],
@@ -356,17 +374,62 @@ class LongOptionRegimeExecutor:
                 pressure,
             )
         )
+        executable_components = (
+            self._signed_strength(
+                future_long_pct - future_short_pct,
+                max(future["range_pct"] * 2.0, 0.0001),
+            ),
+            self._signed_strength(long_ce_pct - long_pe_pct, option_range),
+            self._signed_strength(
+                synthetic_long_pct - synthetic_short_pct,
+                option_range * 2.0,
+            ),
+        )
+        executable_direction_score = sum(executable_components) / len(
+            executable_components
+        )
+        executable_bull_support = sum(value > 0.0 for value in executable_components)
+        executable_bear_support = sum(value < 0.0 for value in executable_components)
+        hybrid_ready = bool(
+            self.settings.hybrid_enabled
+            and ledger.get("ready")
+            and int(ledger.get("updates", 0)) >= self.settings.hybrid_min_updates
+        )
+        hybrid_agreement = bool(
+            fast_direction_score * executable_direction_score > 0.0
+        )
+        if hybrid_ready:
+            weight = self.settings.hybrid_book_weight
+            direction_score = (
+                fast_direction_score * (1.0 - weight)
+                + executable_direction_score * weight
+            )
+        else:
+            direction_score = fast_direction_score
         return {
-            "future_long_pct": future["change_pct"],
-            "future_short_pct": future["short_change_pct"],
-            "long_ce_pct": ce["executable_change_pct"],
-            "long_pe_pct": pe["executable_change_pct"],
+            "future_long_pct": future_long_pct,
+            "future_short_pct": future_short_pct,
+            "long_ce_pct": long_ce_pct,
+            "long_pe_pct": long_pe_pct,
             "synthetic_long_pct": synthetic_long_pct,
             "synthetic_short_pct": synthetic_short_pct,
             "long_straddle_pct": long_straddle_pct,
+            "short_straddle_pct": short_straddle_pct,
+            "fast_direction_score": fast_direction_score,
+            "executable_direction_score": executable_direction_score,
+            "hybrid_direction_score": direction_score,
+            "hybrid_ready": hybrid_ready,
+            "hybrid_agreement": hybrid_agreement,
+            "book_updates": int(ledger.get("updates", 0)),
+            "book_age_sec": float(ledger.get("age_sec", 0.0)),
             "direction_score": direction_score,
-            "bull_support": bull_support,
-            "bear_support": bear_support,
+            "bull_support": fast_bull_support + executable_bull_support,
+            "bear_support": fast_bear_support + executable_bear_support,
+            "fast_bull_support": fast_bull_support,
+            "fast_bear_support": fast_bear_support,
+            "executable_bull_support": executable_bull_support,
+            "executable_bear_support": executable_bear_support,
+            "executable_books": ledger,
         }
 
     def _derive_evidence(self, composite, paper_action, confidence, metadata) -> dict | None:
@@ -414,17 +477,22 @@ class LongOptionRegimeExecutor:
         pe = evidence["pe"]
         books = evidence["v1_books"]
         score = evidence["state_score"]
+        hybrid_direction_confirmed = not books.get("hybrid_ready", False) or bool(
+            books.get("hybrid_agreement", False)
+        )
         bullish = (
             books["bull_support"] >= 3
             and books["direction_score"] > 0
             and evidence["velocity_spread"] > 0
             and score >= self.settings.minimum_state_score
+            and hybrid_direction_confirmed
         )
         bearish = (
             books["bear_support"] >= 3
             and books["direction_score"] < 0
             and evidence["velocity_spread"] < 0
             and score >= self.settings.minimum_state_score
+            and hybrid_direction_confirmed
         )
         if bullish:
             return "REVERSAL_TO_BULLISH" if self._state in {"BEARISH_EXPANSION", "BEARISH_EXHAUSTION"} else "BULLISH_EXPANSION"
@@ -690,6 +758,8 @@ class LongOptionRegimeExecutor:
             "long_%s_pct=%+.3f | velocity_spread=%+.4f | acceleration=%+.4f | "
             "future_ltp=%.2f | future_pct=%+.4f | synthetic_long=%+.3f | "
             "synthetic_short=%+.3f | straddle=%+.3f | direction_score=%+.3f | "
+            "fast_direction=%+.3f | executable_direction=%+.3f | hybrid_ready=%s | "
+            "hybrid_agreement=%s | book_updates=%s | "
             "bull_support=%s | bear_support=%s | pressure=%+.3f | confirmations=%s | cycle=%s | "
             "premium_regime=%s",
             self._state, self._instant_state, proposed, evidence["state_score"], evidence["ce"]["change_pct"],
@@ -701,6 +771,11 @@ class LongOptionRegimeExecutor:
             evidence["v1_books"]["synthetic_short_pct"],
             evidence["v1_books"]["long_straddle_pct"],
             evidence["v1_books"]["direction_score"],
+            evidence["v1_books"].get("fast_direction_score", 0.0),
+            evidence["v1_books"].get("executable_direction_score", 0.0),
+            evidence["v1_books"].get("hybrid_ready", False),
+            evidence["v1_books"].get("hybrid_agreement", False),
+            evidence["v1_books"].get("book_updates", 0),
             evidence["v1_books"]["bull_support"],
             evidence["v1_books"]["bear_support"],
             evidence["pressure"], self._candidate_count,

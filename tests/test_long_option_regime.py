@@ -128,6 +128,8 @@ def evidence(*, ce_change=1.0, pe_change=-1.0, pressure=0.2):
             "direction_score": 0.8 * direction,
             "bull_support": 4 if direction > 0 else 0,
             "bear_support": 4 if direction < 0 else 0,
+            "hybrid_ready": False,
+            "hybrid_agreement": True,
         },
         "model_action": "BUY_CE" if pressure >= 0 else "BUY_PE",
         "model_confidence": 0.8,
@@ -265,6 +267,36 @@ def test_v1_books_use_future_options_synthetic_straddle_and_depth():
     assert "long_straddle_pct" in books
     assert books["bull_support"] >= 3
     assert books["direction_score"] > 0
+    assert books["executable_books"]["valuation"]["options"] == "EXECUTABLE_BID_ASK"
+
+
+def test_warm_hybrid_books_veto_fast_direction_when_executable_pnl_disagrees():
+    executor = LongOptionRegimeExecutor(settings(), FakePaperTrader())
+    snapshot = evidence()
+    snapshot["v1_books"].update(
+        hybrid_ready=True,
+        hybrid_agreement=False,
+        fast_direction_score=0.8,
+        executable_direction_score=-0.7,
+    )
+
+    assert executor._classify(snapshot) not in {
+        "BULLISH_EXPANSION",
+        "REVERSAL_TO_BULLISH",
+    }
+
+
+def test_warm_hybrid_books_allow_direction_when_both_layers_agree():
+    executor = LongOptionRegimeExecutor(settings(), FakePaperTrader())
+    snapshot = evidence()
+    snapshot["v1_books"].update(
+        hybrid_ready=True,
+        hybrid_agreement=True,
+        fast_direction_score=0.8,
+        executable_direction_score=0.6,
+    )
+
+    assert executor._classify(snapshot) == "BULLISH_EXPANSION"
 
 
 def test_volatility_disagreement_waits_and_holds_existing_ce():
