@@ -27,6 +27,8 @@ def main() -> None:
         "deeplob_live": "deeplob_live",
         "deeplob-paper": "deeplob_live",
         "deeplob_paper": "deeplob_live",
+        "stock-option-paper": "stock_option_paper",
+        "stock_option_paper": "stock_option_paper",
     }
     selected = aliases.get(service)
     if selected is None:
@@ -67,6 +69,13 @@ def main() -> None:
         from dhan_engine.interfaces.cli.run_deeplob_live import main as run_deeplob_live
 
         run_deeplob_live()
+        return
+    if selected == "stock_option_paper":
+        from dhan_engine.interfaces.cli.run_stock_option_paper import (
+            main as run_stock_option_paper,
+        )
+
+        run_stock_option_paper()
         return
 
     from dhan_engine.interfaces.cli.run_ws import main as run_index

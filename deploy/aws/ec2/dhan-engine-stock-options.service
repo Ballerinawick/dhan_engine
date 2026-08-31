@@ -1,0 +1,23 @@
+[Unit]
+Description=Dhan Engine Stock Option Paper Service
+After=network-online.target docker.service dhan-engine.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=/etc/dhan-engine/stock-options.env
+ExecStartPre=-/usr/bin/docker rm -f dhan-engine-stock-options
+ExecStart=/usr/bin/docker run --name dhan-engine-stock-options \
+  --env-file /etc/dhan-engine/stock-options.env \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=128m \
+  -v /var/lib/dhan-engine-stock-options:/var/lib/dhan-engine-stock-options \
+  dhan-engine:latest
+ExecStop=/usr/bin/docker stop -t 30 dhan-engine-stock-options
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
