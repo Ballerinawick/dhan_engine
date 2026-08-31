@@ -55,6 +55,7 @@ class InstrumentMaster:
         # Caches for speed
         self._opt_cache = {}
         self._fut_cache = {}
+        self._stock_derivative_cache = {}
         self._index_cache = {}
         self._equity_cache = {}
         self._commodity_cache = {}
@@ -182,6 +183,119 @@ class InstrumentMaster:
 
     def get_fut_exchange_segment(self) -> str:
         return "NSE_FNO"
+
+    def _get_stock_derivative_df(self, symbol: str, instrument_name: str):
+        root = str(symbol).upper().strip()
+        kind = str(instrument_name).upper().strip()
+        if not root:
+            raise ValueError("Stock derivative symbol is required")
+        if kind not in {"FUTSTK", "OPTSTK"}:
+            raise ValueError(f"Unsupported stock derivative type: {kind}")
+        cache_key = (root, kind)
+        if cache_key in self._stock_derivative_cache:
+            return self._stock_derivative_cache[cache_key]
+
+        frame = self.df
+        derivatives = frame[
+            (frame["SEM_EXM_EXCH_ID"].astype(str).str.upper() == "NSE")
+            & (frame["SEM_SEGMENT"].astype(str).str.upper() == "D")
+            & (frame["SEM_INSTRUMENT_NAME"].astype(str).str.upper() == kind)
+            & (
+                frame["SEM_TRADING_SYMBOL"]
+                .astype(str)
+                .str.upper()
+                .str.startswith(f"{root}-", na=False)
+            )
+        ].copy()
+        derivatives = derivatives.dropna(
+            subset=["SEM_EXPIRY_DATE", "SEM_SMST_SECURITY_ID"]
+        )
+        self._stock_derivative_cache[cache_key] = derivatives
+        return derivatives
+
+    def get_nearest_stock_future(self, symbol: str):
+        """Resolve the nearest active FUTSTK contract for one exact NSE root."""
+        root = str(symbol).upper().strip()
+        futures = self._get_stock_derivative_df(root, "FUTSTK")
+        today = pd.Timestamp.now().normalize()
+        active = futures[futures["SEM_EXPIRY_DATE"].dt.normalize() >= today]
+        if active.empty:
+            raise LookupError(f"No active FUTSTK instrument found for {root}")
+
+        row = active.sort_values("SEM_EXPIRY_DATE").iloc[0]
+        trading_symbol = str(row["SEM_TRADING_SYMBOL"])
+        if not trading_symbol.upper().startswith(f"{root}-"):
+            raise RuntimeError(
+                f"Resolved FUTSTK symbol {trading_symbol!r} does not belong to {root!r}"
+            )
+        return {
+            "security_id": int(float(row["SEM_SMST_SECURITY_ID"])),
+            "symbol": trading_symbol,
+            "expiry": row["SEM_EXPIRY_DATE"],
+            "lot_size": int(float(row["SEM_LOT_UNITS"] or 0)),
+            "exchange_segment": "NSE_FNO",
+        }
+
+    def get_nearest_stock_option_pair(
+        self, symbol: str, underlying_ltp: float, *, expiry=None
+    ):
+        """Resolve one same-expiry ATM OPTSTK CE/PE pair from the local master."""
+        root = str(symbol).upper().strip()
+        ltp = float(underlying_ltp or 0.0)
+        if ltp <= 0:
+            raise ValueError(f"A positive {root} underlying LTP is required")
+
+        options = self._get_stock_derivative_df(root, "OPTSTK")
+        options = options.dropna(
+            subset=["SEM_STRIKE_PRICE", "SEM_OPTION_TYPE", "SEM_LOT_UNITS"]
+        )
+        today = pd.Timestamp.now().normalize()
+        active = options[options["SEM_EXPIRY_DATE"].dt.normalize() >= today].copy()
+        if active.empty:
+            raise LookupError(f"No active OPTSTK instruments found for {root}")
+
+        if expiry is None:
+            selected_expiry = active["SEM_EXPIRY_DATE"].min()
+        else:
+            target_expiry = pd.Timestamp(expiry).normalize()
+            matching = active[
+                active["SEM_EXPIRY_DATE"].dt.normalize() == target_expiry
+            ]
+            if matching.empty:
+                raise LookupError(
+                    f"No {root} OPTSTK contracts match FUTSTK expiry {target_expiry.date()}"
+                )
+            selected_expiry = matching["SEM_EXPIRY_DATE"].min()
+        nearest = active[active["SEM_EXPIRY_DATE"] == selected_expiry].copy()
+        nearest["SEM_OPTION_TYPE"] = nearest["SEM_OPTION_TYPE"].astype(str).str.upper()
+        calls = nearest[nearest["SEM_OPTION_TYPE"] == "CE"]
+        puts = nearest[nearest["SEM_OPTION_TYPE"] == "PE"]
+        common_strikes = sorted(
+            set(calls["SEM_STRIKE_PRICE"].astype(float))
+            & set(puts["SEM_STRIKE_PRICE"].astype(float))
+        )
+        if not common_strikes:
+            raise LookupError(
+                f"No common CE/PE strike found for {root} expiry {selected_expiry}"
+            )
+        strike = min(common_strikes, key=lambda value: (abs(value - ltp), value))
+
+        selection = {}
+        for side, frame in (("CE", calls), ("PE", puts)):
+            row = frame[frame["SEM_STRIKE_PRICE"].astype(float) == strike].iloc[0]
+            selection[side] = {
+                "security_id": int(float(row["SEM_SMST_SECURITY_ID"])),
+                "symbol": str(row["SEM_TRADING_SYMBOL"]),
+                "strike": float(strike),
+                "expiry": selected_expiry.strftime("%Y-%m-%d"),
+                "lot_size": int(float(row["SEM_LOT_UNITS"])),
+                "exchange_segment": "NSE_FNO",
+                "selection_source": "LOCAL_MASTER_ATM_STOCK_PAIR",
+                "underlying_ltp": ltp,
+            }
+        if selection["CE"]["lot_size"] != selection["PE"]["lot_size"]:
+            raise RuntimeError(f"{root} CE/PE lot sizes do not match")
+        return selection
 
     def get_equity(self, symbol: str):
         """Resolve one exact NSE cash-equity instrument."""
