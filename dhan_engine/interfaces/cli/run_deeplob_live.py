@@ -1,5 +1,6 @@
 import logging
 import os
+import signal
 
 from dotenv import load_dotenv
 
@@ -13,12 +14,17 @@ from dhan_engine.interfaces.web.session_viewer_server import start_session_viewe
 MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 
+def _graceful_stop(_signum, _frame) -> None:
+    raise KeyboardInterrupt
+
+
 def main() -> None:
     load_dotenv()
     logging.basicConfig(
         level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    signal.signal(signal.SIGTERM, _graceful_stop)
     csv_path = os.getenv("CSV_FILE", "api-scrip-master.csv").strip()
     refresh_master_csv(MASTER_URL, csv_path)
     settings = DeepLobLiveSettings.from_env()
