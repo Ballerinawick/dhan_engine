@@ -89,6 +89,7 @@ class DeepLobLiveRuntime:
         reversal_inference=None,
         reversal_option_paper=None,
         post_market_analysis=None,
+        live_order_canary=None,
     ):
         self.settings = settings
         self.master = master
@@ -105,6 +106,7 @@ class DeepLobLiveRuntime:
         self.reversal_inference = reversal_inference
         self.reversal_option_paper = reversal_option_paper
         self.post_market_analysis = post_market_analysis
+        self.live_order_canary = live_order_canary
         self.instrument_metadata = {}
         self._received = 0
         self._recorder_dispatch_failures = 0
@@ -397,7 +399,7 @@ class DeepLobLiveRuntime:
         logger.info(
             "DEEPLOB_LIVE_PIPELINE_ACTIVE | indexes=%s | depth=200 | connections=%s | "
             "fullquote=true | recorder=true | inference=true | s3_bucket=%s | "
-            "market_data_prefix=%s | paper_trade_prefix=%s | model=%s | orders=false",
+            "market_data_prefix=%s | paper_trade_prefix=%s | model=%s | live_orders=%s",
             ",".join(self.settings.inference.indexes),
             len(instruments) + 1,
             self.settings.recorder.s3_bucket,
@@ -408,6 +410,7 @@ class DeepLobLiveRuntime:
                 else "disabled"
             ),
             inference_version,
+            bool(self.live_order_canary and self.live_order_canary.settings.armed),
         )
         try:
             while True:
@@ -452,7 +455,8 @@ class DeepLobLiveRuntime:
                 ):
                     logger.info(
                         "DEEPLOB_PAPER_HEALTH | dynamic=%s | scalp=%s | reversal=%s | "
-                        "selection_attempts=%s | selection_failures=%s | trade_summary_s3=%s",
+                        "selection_attempts=%s | selection_failures=%s | trade_summary_s3=%s | "
+                        "nifty_live_canary=%s",
                         dynamic_health,
                         scalp_health,
                         reversal_health,
@@ -463,6 +467,7 @@ class DeepLobLiveRuntime:
                             if self.trade_summary_sink is not None
                             else None
                         ),
+                        self.live_order_canary.health() if self.live_order_canary else None,
                     )
                 self.recorder.log_health()
                 self.inference.log_health()
@@ -485,11 +490,17 @@ class DeepLobLiveRuntime:
             self.recorder.close()
             if self.trade_summary_sink is not None:
                 self.trade_summary_sink.close()
+            if self.live_order_canary is not None:
+                self.live_order_canary.close()
 
 
 def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRuntime:
     from dhan_engine.infrastructure.dhan.full_depth_200_adapter import FullDepth200Adapter
     from dhan_engine.infrastructure.dhan.instrument_master import InstrumentMaster
+    from dhan_engine.infrastructure.dhan.live_order_canary import (
+        NiftyLiveOrderCanary,
+        NiftyLiveOrderSettings,
+    )
     from dhan_engine.infrastructure.dhan.marketfeed_ws import DhanLiveMarketFeedWS
     from dhan_engine.infrastructure.dhan.option_chain_selector import OptionChainSelector
     from dhan_engine.simulations.paper_trade_manager import PaperTradeManager
@@ -529,6 +540,12 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
     trade_summary_sink = None
     post_market_analysis = PostMarketAnalysisRuntime(
         PostMarketAnalysisSettings.from_env()
+    )
+    live_order_settings = NiftyLiveOrderSettings.from_env()
+    live_order_canary = (
+        NiftyLiveOrderCanary(live_order_settings)
+        if live_order_settings.enabled
+        else None
     )
     adaptive_scalp_settings = DeepLobOptionPaperSettings.scalp_from_env()
     reversal_runtime_settings = PercentageReversalSettings.from_env()
@@ -592,6 +609,7 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
                     regime_v2_settings,
                     PaperTradeManager(capital=regime_v2_settings.capital),
                     trade_summary_sink=trade_summary_sink,
+                    live_order_canary=live_order_canary,
                 )
             )
             logger.warning(
@@ -713,6 +731,7 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
         reversal_inference=reversal_inference,
         reversal_option_paper=reversal_option_paper,
         post_market_analysis=post_market_analysis,
+        live_order_canary=live_order_canary,
     )
     return runtime
 

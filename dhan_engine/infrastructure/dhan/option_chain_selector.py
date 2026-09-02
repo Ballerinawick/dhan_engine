@@ -222,6 +222,8 @@ class OptionChainSelector:
                     "underlying_ltp": underlying_ltp,
                     "reason": {"final_decision": "master_csv_fallback"},
                     "selection_source": "MASTER_FALLBACK",
+                    "lot_size": int(float(ce_row["SEM_LOT_UNITS"])),
+                    "symbol": str(ce_row["SEM_TRADING_SYMBOL"]),
                 },
                 "PE": {
                     "index": index,
@@ -234,6 +236,8 @@ class OptionChainSelector:
                     "underlying_ltp": underlying_ltp,
                     "reason": {"final_decision": "master_csv_fallback"},
                     "selection_source": "MASTER_FALLBACK",
+                    "lot_size": int(float(pe_row["SEM_LOT_UNITS"])),
+                    "symbol": str(pe_row["SEM_TRADING_SYMBOL"]),
                 },
             }
         except Exception as exc:
@@ -699,6 +703,16 @@ class OptionChainSelector:
             if not obj:
                 return None
             secid = int(self.im.find_option_security_id(index, expiry, obj["strike"], side))
+            contract_rows = opts[
+                (opts["SEM_EXPIRY_DATE"].dt.date == expiry.date())
+                & (opts["SEM_STRIKE_PRICE"].astype(float) == float(obj["strike"]))
+                & (opts["SEM_OPTION_TYPE"].astype(str).str.upper() == side)
+            ]
+            if contract_rows.empty:
+                raise LookupError(
+                    f"Missing master contract metadata for {index} {side} {obj['strike']}"
+                )
+            contract_row = contract_rows.iloc[0]
             live_secid = obj.get("live_security_id")
             if self.debug and live_secid:
                 try:
@@ -720,6 +734,8 @@ class OptionChainSelector:
                 "atm": atm,
                 "underlying_ltp": underlying_ltp,
                 "reason": obj["reason"],
+                "lot_size": int(float(contract_row["SEM_LOT_UNITS"])),
+                "symbol": str(contract_row["SEM_TRADING_SYMBOL"]),
             }
             if self.debug:
                 payload.update({

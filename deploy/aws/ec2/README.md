@@ -62,7 +62,7 @@ sudo journalctl -u dhan-engine -f | grep -E \
 Healthy operation shows:
 
 - `DEEPLOB_LIVE_PIPELINE_ACTIVE` with `fullquote=true`, `recorder=true`,
-  `inference=true`, and `orders=false`.
+  `inference=true`. `live_orders=false` is the default.
 - `DEEPLOB_LIVE_PIPELINE_HEALTH` with both workers alive and dispatch failures
   at zero.
 - `DEEPLOB_RECORDER_HEALTH` with received/written increasing and dropped at
@@ -72,5 +72,39 @@ Healthy operation shows:
   zero.
 - `DEEPLOB_PAPER_PREDICTION` with DOWN/FLAT/UP probabilities.
 
-This service produces paper observations only. It does not place broker orders.
+## NIFTY live-order latency canary
+
+The optional live canary mirrors only a confirmed `regime_v2` paper entry. It
+does not connect dynamic, scalp, reversal, or stock profiles to broker orders.
+It is hard-limited to one NIFTY entry per day and one exchange lot.
+
+Before enabling it:
+
+1. Attach an Elastic IP to EC2 and register that address as the Dhan static IP.
+2. Generate the current Dhan access token. Dhan limits access tokens to 24 hours.
+3. Verify that the Dhan account has no open NIFTY position or pending order.
+4. Add these exact fields to the `trading-bot/dhan` Secrets Manager JSON:
+
+```json
+{
+  "NIFTY_LIVE_ORDERS_ENABLED": "1",
+  "NIFTY_LIVE_ORDERS_CONFIRMATION": "I_ACCEPT_NIFTY_LIVE_ORDER_RISK"
+}
+```
+
+Normal V1 state exits remain manual when
+`NIFTY_LIVE_ORDERS_MIRROR_STATE_EXITS=0`. The service reconciles manual exits
+from the broker positions API. It still submits an automatic exit when
+unrealized loss reaches the configured emergency amount or at `15:20` IST.
+
+Latency evidence is available without exposing credentials:
+
+```bash
+sudo journalctl -u dhan-engine -f -o cat | grep --line-buffered -E \
+  'NIFTY_LIVE_(ENTRY|ORDER|POSITION|EXIT|MANUAL|CANARY)'
+```
+
+`signal_to_ack_ms` measures signal-to-HTTP acknowledgement. `signal_to_fill_ms`
+measures signal-to-confirmed-fill observation through order polling; it is not
+the exchange's internal matching-engine latency.
 

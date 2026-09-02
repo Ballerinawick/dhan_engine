@@ -86,10 +86,18 @@ class LongOptionRegimeExecutor:
     profile = "regime_v2"
     strategy = "deeplob_long_option_regime_v2"
 
-    def __init__(self, settings, paper_trader, *, trade_summary_sink=None):
+    def __init__(
+        self,
+        settings,
+        paper_trader,
+        *,
+        trade_summary_sink=None,
+        live_order_canary=None,
+    ):
         self.settings = settings
         self.paper_trader = paper_trader
         self.trade_summary_sink = trade_summary_sink
+        self.live_order_canary = live_order_canary
         self.contracts: dict[str, dict] = {}
         self.quotes: dict[int, dict] = {}
         self.history = {"CE": deque(maxlen=512), "PE": deque(maxlen=512)}
@@ -133,6 +141,8 @@ class LongOptionRegimeExecutor:
         self._last_v1_books = {}
         self._v1_ledger.reset()
         self._refresh_expiry_cycle()
+        if self.live_order_canary is not None:
+            self.live_order_canary.register_contracts(self.contracts)
         logger.info(
             "DEEPLOB_V1_CONTRACTS | ce_id=%s | ce_strike=%s | pe_id=%s | pe_strike=%s | "
             "pair_structure=%s | cycle=%s | premium_regime=%s | extra_subscriptions=0",
@@ -181,6 +191,8 @@ class LongOptionRegimeExecutor:
         horizon_sec,
         signal_metadata=None,
     ) -> None:
+        if self.live_order_canary is not None:
+            self.live_order_canary.heartbeat()
         if not self.settings.enabled or composite is None:
             return
         evidence = self._derive_evidence(composite, paper_action, confidence, signal_metadata)
@@ -209,6 +221,8 @@ class LongOptionRegimeExecutor:
         self._try_entry("CE" if self._state == "BULLISH_EXPANSION" else "PE", evidence)
 
     def heartbeat(self) -> None:
+        if self.live_order_canary is not None:
+            self.live_order_canary.heartbeat()
         if not self.paper_trader.has_open_position():
             return
         if datetime.now(self._timezone).time() >= self.settings.market_end:
@@ -552,6 +566,7 @@ class LongOptionRegimeExecutor:
             )
 
     def _try_entry(self, side: str, evidence: dict) -> None:
+        signal_ns = time.perf_counter_ns()
         contract = self.contracts.get(side)
         quote = self.quotes.get(int((contract or {}).get("security_id", 0) or 0))
         ask = float((quote or {}).get("ask", 0.0) or 0.0)
@@ -593,6 +608,12 @@ class LongOptionRegimeExecutor:
             self._entries += 1
             self._catastrophic_side = ""
             self._catastrophic_count = 0
+            if self.live_order_canary is not None:
+                self.live_order_canary.submit_entry(
+                    side=side,
+                    state=self._state,
+                    signal_ns=signal_ns,
+                )
             logger.info(
                 "DEEPLOB_V2_ENTRY | side=%s | state=%s | instant_state=%s | price=%.2f | "
                 "score=%.3f | ce_pct=%+.3f | pe_pct=%+.3f | pressure=%+.3f | "
@@ -714,6 +735,11 @@ class LongOptionRegimeExecutor:
             logger.warning("DEEPLOB_V2_EXIT_BLOCKED | reason=NO_EXECUTABLE_BID | secid=%s", secid)
             return
         self.paper_trader.on_exit(int(secid), bid, reason=reason)
+        if self.live_order_canary is not None:
+            if reason.endswith("MARKET_CLOSE") or "CATASTROPHIC" in reason:
+                self.live_order_canary.request_exit(reason=reason)
+            else:
+                self.live_order_canary.notify_paper_exit(reason)
         summary = dict(self.paper_trader.last_trade_summary or {})
         if summary and self.trade_summary_sink is not None:
             summary.update({key: value for key, value in position.items() if key.startswith("v1_")})

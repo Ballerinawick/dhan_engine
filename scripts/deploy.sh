@@ -34,6 +34,8 @@ SECRET_JSON="$(aws secretsmanager get-secret-value \
 
 DHAN_CLIENT_ID="$(printf '%s' "${SECRET_JSON}" | jq -r '.DHAN_CLIENT_ID // empty')"
 DHAN_ACCESS_TOKEN="$(printf '%s' "${SECRET_JSON}" | jq -r '.DHAN_ACCESS_TOKEN // empty')"
+NIFTY_LIVE_ORDERS_ENABLED="$(printf '%s' "${SECRET_JSON}" | jq -r '.NIFTY_LIVE_ORDERS_ENABLED // "0"')"
+NIFTY_LIVE_ORDERS_CONFIRMATION="$(printf '%s' "${SECRET_JSON}" | jq -r '.NIFTY_LIVE_ORDERS_CONFIRMATION // empty')"
 
 if [[ -z "${DHAN_CLIENT_ID}" || -z "${DHAN_ACCESS_TOKEN}" ]]; then
   echo "DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN is missing from Secrets Manager."
@@ -51,12 +53,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-grep -vE '^(DHAN_CLIENT_ID|DHAN_ACCESS_TOKEN)=' \
+grep -vE '^(DHAN_CLIENT_ID|DHAN_ACCESS_TOKEN|NIFTY_LIVE_ORDERS_ENABLED|NIFTY_LIVE_ORDERS_CONFIRMATION)=' \
   deploy/aws/ec2/dhan-engine.env.example > "${TEMP_ENV}"
 
 {
   printf 'DHAN_CLIENT_ID=%s\n' "${DHAN_CLIENT_ID}"
   printf 'DHAN_ACCESS_TOKEN=%s\n' "${DHAN_ACCESS_TOKEN}"
+  printf 'NIFTY_LIVE_ORDERS_ENABLED=%s\n' "${NIFTY_LIVE_ORDERS_ENABLED}"
+  printf 'NIFTY_LIVE_ORDERS_CONFIRMATION=%s\n' "${NIFTY_LIVE_ORDERS_CONFIRMATION}"
 } >> "${TEMP_ENV}"
 
 sudo install -m 0600 "${TEMP_ENV}" "${ENV_FILE}"
