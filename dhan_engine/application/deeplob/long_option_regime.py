@@ -9,6 +9,9 @@ from datetime import datetime, time as clock_time
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
+from dhan_engine.application.deeplob.state_driven_position_keeper import (
+    StateDrivenPositionKeeper,
+)
 from dhan_engine.application.deeplob.virtual_strategy_books import (
     ExecutableStrategyLedger,
     MarketMark,
@@ -92,8 +95,8 @@ class LongOptionRegimeExecutor:
         self.trade_summary_sink = trade_summary_sink
         self.contracts: dict[str, dict] = {}
         self.quotes: dict[int, dict] = {}
-        self.history = {"CE": deque(maxlen=512), "PE": deque(maxlen=512)}
-        self.future_history = deque(maxlen=512)
+        self.history = {"CE": deque(maxlen=4096), "PE": deque(maxlen=4096)}
+        self.future_history = deque(maxlen=4096)
         self._timezone = ZoneInfo("Asia/Kolkata")
         self._state = "UNCERTAIN"
         self._instant_state = "UNCERTAIN"
@@ -111,6 +114,7 @@ class LongOptionRegimeExecutor:
         self._last_evidence: dict = {}
         self._last_v1_books: dict = {}
         self._v1_ledger = ExecutableStrategyLedger()
+        self._position_keeper = StateDrivenPositionKeeper()
 
     def register_contracts(self, selection: Mapping[str, Mapping]) -> list[dict]:
         subscriptions = []
@@ -132,6 +136,7 @@ class LongOptionRegimeExecutor:
         self.future_history.clear()
         self._last_v1_books = {}
         self._v1_ledger.reset()
+        self._position_keeper.reset()
         self._refresh_expiry_cycle()
         logger.info(
             "DEEPLOB_V1_CONTRACTS | ce_id=%s | ce_strike=%s | pe_id=%s | pe_strike=%s | "
@@ -166,6 +171,14 @@ class LongOptionRegimeExecutor:
             (float(received_ts), float(ltp), float(bid or 0.0), float(ask or 0.0))
         )
         self.paper_trader.on_tick(secid, float(ltp))
+        position = self.paper_trader.positions.get(secid)
+        if position is not None and float(bid or 0.0) > 0.0:
+            self._position_keeper.mark_excursion(
+                position=position,
+                side=side,
+                bid=float(bid),
+                received_ts=float(received_ts),
+            )
         self._prune(side, float(received_ts))
 
     def on_prediction(
@@ -227,6 +240,7 @@ class LongOptionRegimeExecutor:
             "samples": {side: len(values) for side, values in self.history.items()},
             "future_samples": len(self.future_history),
             "v1_books": dict(self._last_v1_books),
+            "position_keeper": self._position_keeper.snapshot,
             "open_positions": len(self.paper_trader.positions),
             "entries": self._entries,
             "exits": self._exits,
@@ -234,15 +248,27 @@ class LongOptionRegimeExecutor:
         }
 
     def _prune(self, side: str, now_ts: float) -> None:
-        cutoff = now_ts - max(60.0, self.settings.observation_sec * 4.0)
+        cutoff = now_ts - max(900.0, self.settings.observation_sec * 75.0)
         values = self.history[side]
         while values and values[0][0] < cutoff:
             values.popleft()
 
     def _prune_future(self, now_ts: float) -> None:
-        cutoff = now_ts - max(60.0, self.settings.observation_sec * 4.0)
+        cutoff = now_ts - max(900.0, self.settings.observation_sec * 75.0)
         while self.future_history and self.future_history[0][0] < cutoff:
             self.future_history.popleft()
+
+    @staticmethod
+    def _trajectory_metrics(values, value_index: int) -> dict:
+        prices = [float(item[value_index]) for item in values if float(item[value_index]) > 0]
+        if len(prices) < 2:
+            return {"context_change_pct": 0.0, "context_direction": 0.0}
+        net_move = prices[-1] - prices[0]
+        travelled = sum(abs(current - previous) for previous, current in zip(prices, prices[1:]))
+        return {
+            "context_change_pct": (prices[-1] / prices[0] - 1.0) * 100.0,
+            "context_direction": max(-1.0, min(1.0, net_move / max(travelled, 0.0001))),
+        }
 
     def _leg_metrics(self, side: str) -> dict | None:
         values = self.history[side]
@@ -280,6 +306,7 @@ class LongOptionRegimeExecutor:
             "window_start_bid": window[0][2],
             "window_start_ask": window[0][3],
             "received_ts": now_ts,
+            **self._trajectory_metrics(values, 1),
         }
 
     def _future_metrics(self, composite) -> dict | None:
@@ -309,6 +336,7 @@ class LongOptionRegimeExecutor:
             "short_change_pct": -change_pct,
             "velocity_pct_sec": change_pct / elapsed,
             "range_pct": range_pct,
+            **self._trajectory_metrics(self.future_history, 1),
         }
 
     @staticmethod
@@ -593,6 +621,7 @@ class LongOptionRegimeExecutor:
             self._entries += 1
             self._catastrophic_side = ""
             self._catastrophic_count = 0
+            self._position_keeper.reset()
             logger.info(
                 "DEEPLOB_V2_ENTRY | side=%s | state=%s | instant_state=%s | price=%.2f | "
                 "score=%.3f | ce_pct=%+.3f | pe_pct=%+.3f | pressure=%+.3f | "
@@ -607,35 +636,60 @@ class LongOptionRegimeExecutor:
     def _manage_open_position(self, evidence: dict, instant_state: str) -> None:
         secid, position = next(iter(self.paper_trader.positions.items()))
         side = "CE" if str(position.get("tag", "")).endswith("_CE") else "PE"
-        supporting = (side == "CE" and self._state == "BULLISH_EXPANSION") or (
-            side == "PE" and self._state == "BEARISH_EXPANSION"
-        )
-        opposite_state = "BEARISH_EXPANSION" if side == "CE" else "BULLISH_EXPANSION"
-        if self._state == opposite_state:
-            self._exit(f"DEEPLOB_V2_EXIT:V1_REVERSAL_TO_{'PE' if side == 'CE' else 'CE'}")
+        quote = self.quotes.get(int(secid), {})
+        bid = float(quote.get("bid", 0.0) or 0.0)
+        received_ts = float(quote.get("received_ts", 0.0) or 0.0)
+        if bid <= 0.0 or received_ts <= 0.0:
             return
-        matching_exhaustion = (side == "CE" and self._state == "BULLISH_EXHAUSTION") or (
-            side == "PE" and self._state == "BEARISH_EXHAUSTION"
+        decision = self._position_keeper.observe(
+            position=position,
+            side=side,
+            bid=bid,
+            received_ts=received_ts,
+            evidence=evidence,
+            stable_state=self._state,
+            instant_state=instant_state,
+            round_trip_fee=self.settings.round_trip_fee,
         )
-        if matching_exhaustion:
-            self._exit(f"DEEPLOB_V2_EXIT:{self._state}")
-            return
         if self._catastrophic_guard_triggered(side, position, evidence, instant_state):
             self._entry_rearm_state = self._state
             self._exit("DEEPLOB_V2_EXIT:DEPTH_CONFIRMED_CATASTROPHIC_GUARD")
+            return
+        if decision.action == "EXIT":
+            self._entry_rearm_state = self._state
+            self._exit(f"DEEPLOB_V2_EXIT:STATE_KEEPER_{decision.reason}")
             return
         now_mono = time.monotonic()
         if now_mono - self._last_hold_log_mono >= 5.0:
             self._last_hold_log_mono = now_mono
             logger.info(
-                "DEEPLOB_V2_HOLD | side=%s | state=%s | instant_state=%s | score=%.3f | "
-                "supporting=%s | direction_score=%+.3f | cycle=%s | premium_regime=%s",
+                "DEEPLOB_V2_POSITION_KEEPER | side=%s | action=%s | phase=%s | "
+                "context=%s | reason=%s | state=%s | instant_state=%s | "
+                "support=%+.3f | fast=%+.3f | context_support=%+.3f | "
+                "gross=%+.2f | net=%+.2f | best=%+.2f | worst=%+.2f | "
+                "surrendered_mfe=%.2f | capture_ratio=%s | observations=%s | "
+                "cycle=%s | premium_regime=%s",
                 side,
+                decision.action,
+                decision.phase,
+                decision.context,
+                decision.reason,
                 self._state,
                 instant_state,
-                evidence["state_score"],
-                supporting,
-                evidence.get("v1_books", {}).get("direction_score", 0.0),
+                decision.support_score,
+                decision.fast_support,
+                decision.context_support,
+                decision.gross_pnl,
+                decision.net_pnl,
+                decision.best_observed_pnl,
+                decision.worst_observed_pnl,
+                decision.surrendered_mfe,
+                (
+                    f"{decision.mfe_capture_ratio:.3f}"
+                    if decision.mfe_capture_ratio is not None
+                    else "NA"
+                ),
+                decision.observations,
                 self._expiry_cycle.get("cycle_label", "UNKNOWN"),
                 self._expiry_cycle.get("premium_regime", "UNKNOWN"),
             )
@@ -715,6 +769,31 @@ class LongOptionRegimeExecutor:
             return
         self.paper_trader.on_exit(int(secid), bid, reason=reason)
         summary = dict(self.paper_trader.last_trade_summary or {})
+        keeper = self._position_keeper.snapshot
+        if summary and keeper:
+            captured = float(summary.get("gross_pnl", 0.0) or 0.0)
+            best_observed = float(keeper.get("best_observed_pnl", captured) or captured)
+            capture_ratio = captured / best_observed if best_observed > 0.0 else None
+            summary.update(
+                best_observed_pnl=best_observed,
+                worst_observed_pnl=keeper.get("worst_observed_pnl"),
+                best_observed_bid=keeper.get("best_observed_bid"),
+                best_observed_ts=keeper.get("best_observed_ts"),
+                worst_observed_ts=keeper.get("worst_observed_ts"),
+                captured_gross_pnl=captured,
+                surrendered_mfe=max(
+                    0.0,
+                    best_observed - captured,
+                ),
+                mfe_capture_ratio=capture_ratio,
+                keeper_phase=keeper.get("phase"),
+                keeper_context=keeper.get("context"),
+                keeper_reason=keeper.get("reason"),
+                keeper_support_score=keeper.get("support_score"),
+                BestObservedPnl=best_observed,
+                WorstObservedPnl=keeper.get("worst_observed_pnl"),
+                CapturedGrossPnl=captured,
+            )
         if summary and self.trade_summary_sink is not None:
             summary.update({key: value for key, value in position.items() if key.startswith("v1_")})
             summary.update(
@@ -746,6 +825,7 @@ class LongOptionRegimeExecutor:
             self._expiry_cycle.get("cycle_label", "UNKNOWN"),
             self._expiry_cycle.get("premium_regime", "UNKNOWN"), self.profile,
         )
+        self._position_keeper.reset()
 
     def _log_v1(self, evidence: dict, proposed: str) -> None:
         now = time.monotonic()
