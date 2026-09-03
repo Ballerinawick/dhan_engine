@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import statistics
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Mapping
 
 
@@ -24,6 +24,13 @@ class KeeperDecision:
     support_score: float
     fast_support: float
     context_support: float
+    timeframe_short_support: float
+    timeframe_medium_support: float
+    timeframe_long_support: float
+    timeframe_overall_support: float
+    timeframe_ready_groups: int
+    premium_short_direction: float
+    premium_medium_direction: float
     gross_pnl: float
     net_pnl: float
     best_observed_pnl: float
@@ -56,7 +63,8 @@ class StateDrivenPositionKeeper:
         self.best_observed_bid = 0.0
         self.best_observed_ts = 0.0
         self.worst_observed_ts = 0.0
-        self._support = deque(maxlen=256)
+        self._support = deque(maxlen=8192)
+        self._price = deque(maxlen=16384)
         self._last_decision: KeeperDecision | None = None
         self._challenge_support: float | None = None
         self._recovery_support: float | None = None
@@ -103,6 +111,76 @@ class StateDrivenPositionKeeper:
             float(received_ts),
         )
 
+    def observe_quote(
+        self,
+        *,
+        position: Mapping,
+        side: str,
+        bid: float,
+        received_ts: float,
+        round_trip_fee: float,
+    ) -> KeeperDecision | None:
+        """Act on live premium continuation after model state enters defence."""
+        self.mark_excursion(
+            position=position,
+            side=side,
+            bid=bid,
+            received_ts=received_ts,
+        )
+        previous = self._last_decision
+        if previous is None or previous.action != "DEFEND":
+            return None
+        gross_pnl = self._gross_pnl(position, bid)
+        premium_short, short_ready = self._price_group(received_ts, (1.0, 5.0, 10.0, 30.0))
+        premium_medium, medium_ready = self._price_group(received_ts, (60.0, 240.0))
+        premium_adverse = short_ready and premium_short < 0.0 and (
+            not medium_ready or premium_medium <= 0.0
+        )
+        state_defensive = (
+            previous.timeframe_short_support < 0.0
+            or previous.timeframe_overall_support < 0.0
+            or previous.reason
+            in {
+                "EARNED_MOVE_PULLBACK",
+                "MULTITIMEFRAME_STATE_CHALLENGE",
+                "PRICE_STATE_DIVERGENCE",
+                "OPPOSING_STATE_CHALLENGE",
+            }
+        )
+        if not (
+            premium_adverse
+            and state_defensive
+            and gross_pnl < previous.gross_pnl
+        ):
+            return None
+
+        earned_move = self.best_observed_pnl > float(round_trip_fee)
+        self.phase = "FAILED_RECOVERY"
+        decision = replace(
+            previous,
+            action="EXIT",
+            phase=self.phase,
+            reason=(
+                "QUOTE_CONFIRMED_EARNED_MOVE_DECAY"
+                if earned_move
+                else "QUOTE_CONFIRMED_ENTRY_THESIS_FAILURE"
+            ),
+            premium_short_direction=premium_short,
+            premium_medium_direction=premium_medium,
+            gross_pnl=gross_pnl,
+            net_pnl=gross_pnl - float(round_trip_fee),
+            best_observed_pnl=self.best_observed_pnl,
+            worst_observed_pnl=self.worst_observed_pnl,
+            surrendered_mfe=max(0.0, self.best_observed_pnl - gross_pnl),
+            mfe_capture_ratio=(
+                gross_pnl / self.best_observed_pnl
+                if self.best_observed_pnl > 0.0
+                else None
+            ),
+        )
+        self._last_decision = decision
+        return decision
+
     def observe(
         self,
         *,
@@ -116,9 +194,7 @@ class StateDrivenPositionKeeper:
         round_trip_fee: float,
     ) -> KeeperDecision:
         secid = int(position.get("secid", 0) or 0)
-        entry = float(position.get("entry", 0.0) or 0.0)
-        qty = max(int(position.get("qty", 0) or 0), 1)
-        gross_pnl = (float(bid) - entry) * qty
+        gross_pnl = self._gross_pnl(position, bid)
         net_pnl = gross_pnl - float(round_trip_fee)
         self.mark_excursion(
             position=position,
@@ -130,30 +206,108 @@ class StateDrivenPositionKeeper:
         support_score = self._aligned_support(
             self.side, evidence, stable_state, instant_state
         )
+        timeframe = self._timeframe_support(self.side, evidence, support_score)
         previous_support = self._support[-1][1] if self._support else support_score
         previous_pnl = self._support[-1][2] if self._support else gross_pnl
-        self._support.append((float(received_ts), support_score, gross_pnl))
+        previous_short = self._support[-1][3] if self._support else timeframe["short"]
+        previous_medium = self._support[-1][4] if self._support else timeframe["medium"]
+        previous_overall = self._support[-1][6] if self._support else timeframe["overall"]
+        self._support.append(
+            (
+                float(received_ts),
+                support_score,
+                gross_pnl,
+                timeframe["short"],
+                timeframe["medium"],
+                timeframe["long"],
+                timeframe["overall"],
+            )
+        )
         fast_support, context_support = self._support_layers()
         context = self._context(fast_support, context_support)
         previous_phase = self.phase
+        premium_short, premium_short_ready = self._price_group(
+            received_ts, (1.0, 5.0, 10.0, 30.0)
+        )
+        premium_medium, premium_medium_ready = self._price_group(
+            received_ts, (60.0, 240.0)
+        )
 
-        supportive = support_score > 0.0 and fast_support > 0.0 and context_support >= 0.0
+        short_supportive = not timeframe["short_ready"] or timeframe["short"] > 0.0
+        overall_supportive = (
+            not timeframe["overall_ready"] or timeframe["overall"] >= 0.0
+        )
+        supportive = (
+            support_score > 0.0
+            and fast_support > 0.0
+            and context_support >= 0.0
+            and short_supportive
+            and overall_supportive
+        )
         opposing_state = self._is_opposing_state(self.side, stable_state)
         exhaustion_state = self._is_matching_exhaustion(self.side, stable_state)
+        short_opposing = timeframe["short_ready"] and timeframe["short"] < 0.0
+        medium_opposing = timeframe["medium_ready"] and timeframe["medium"] < 0.0
+        overall_opposing = timeframe["overall_ready"] and timeframe["overall"] < 0.0
+        timeframe_reversal = short_opposing and (medium_opposing or overall_opposing)
         opposing = (
             support_score < 0.0
             and fast_support < 0.0
             and (opposing_state or exhaustion_state)
         )
         earned_move = self.best_observed_pnl > float(round_trip_fee)
-        state_and_price_weakening = (
-            support_score < previous_support and gross_pnl < previous_pnl
+        support_weakening = support_score < previous_support
+        price_weakening = gross_pnl < previous_pnl
+        timeframe_weakening = (
+            timeframe["short"] < previous_short
+            and (
+                timeframe["medium"] < previous_medium
+                or timeframe["overall"] < previous_overall
+            )
+        )
+        state_and_price_weakening = price_weakening and (
+            support_weakening or timeframe_weakening or timeframe_reversal
+        )
+        premium_adverse = premium_short_ready and premium_short < 0.0 and (
+            not premium_medium_ready or premium_medium <= 0.0
+        )
+        price_state_divergence = (
+            not earned_move
+            and gross_pnl < 0.0
+            and price_weakening
+            and premium_adverse
+            and (supportive or timeframe_reversal)
+        )
+        continued_price_divergence = (
+            price_state_divergence and previous_phase == "PRICE_DIVERGENCE"
+        )
+        challenge_floor = float(
+            self._challenge_support
+            if self._challenge_support is not None
+            else previous_support
+        )
+        transition_failed = (
+            not earned_move
+            and previous_phase == "CHALLENGED"
+            and gross_pnl < 0.0
+            and price_weakening
+            and support_score <= challenge_floor
+            and (
+                fast_support < 0.0
+                or context_support < 0.0
+                or timeframe_reversal
+            )
         )
 
         action = "HOLD"
         reason = "STATE_SUPPORTED"
         if earned_move and state_and_price_weakening:
-            if previous_phase in {"PULLBACK", "RECOVERY", "CHALLENGED"}:
+            if previous_phase in {
+                "PULLBACK",
+                "RECOVERY",
+                "CHALLENGED",
+                "PRICE_DIVERGENCE",
+            }:
                 self.phase = "FAILED_RECOVERY"
                 action = "EXIT"
                 reason = "EARNED_MOVE_STATE_DECAY"
@@ -161,6 +315,29 @@ class StateDrivenPositionKeeper:
                 self.phase = "PULLBACK"
                 action = "DEFEND"
                 reason = "EARNED_MOVE_PULLBACK"
+        elif timeframe_reversal and premium_adverse:
+            if previous_phase in {"CHALLENGED", "PULLBACK", "PRICE_DIVERGENCE"}:
+                self.phase = "FAILED_RECOVERY"
+                action = "EXIT"
+                reason = "MULTITIMEFRAME_REVERSAL_ACCEPTED"
+            else:
+                self.phase = "CHALLENGED"
+                self._challenge_support = support_score
+                action = "DEFEND"
+                reason = "MULTITIMEFRAME_STATE_CHALLENGE"
+        elif continued_price_divergence:
+            self.phase = "FAILED_RECOVERY"
+            action = "EXIT"
+            reason = "PRICE_STATE_DIVERGENCE_ACCEPTED"
+        elif price_state_divergence:
+            self.phase = "PRICE_DIVERGENCE"
+            self._challenge_support = support_score
+            action = "DEFEND"
+            reason = "PRICE_STATE_DIVERGENCE"
+        elif transition_failed:
+            self.phase = "FAILED_RECOVERY"
+            action = "EXIT"
+            reason = "ENTRY_THESIS_INVALIDATED"
         elif supportive:
             recovery_confirmed = previous_phase == "RECOVERY" and (
                 support_score >= float(self._recovery_support or 0.0)
@@ -172,7 +349,12 @@ class StateDrivenPositionKeeper:
                 self._recovery_support = None
                 self._recovery_pnl = float("-inf")
                 reason = "STATE_RECOVERY_CONFIRMED"
-            elif previous_phase in {"PULLBACK", "CHALLENGED", "RECOVERY"}:
+            elif previous_phase in {
+                "PULLBACK",
+                "CHALLENGED",
+                "RECOVERY",
+                "PRICE_DIVERGENCE",
+            }:
                 self.phase = "RECOVERY"
                 self._recovery_support = support_score
                 self._recovery_pnl = max(self._recovery_pnl, gross_pnl)
@@ -222,6 +404,13 @@ class StateDrivenPositionKeeper:
             support_score=support_score,
             fast_support=fast_support,
             context_support=context_support,
+            timeframe_short_support=timeframe["short"],
+            timeframe_medium_support=timeframe["medium"],
+            timeframe_long_support=timeframe["long"],
+            timeframe_overall_support=timeframe["overall"],
+            timeframe_ready_groups=timeframe["ready_groups"],
+            premium_short_direction=premium_short,
+            premium_medium_direction=premium_medium,
             gross_pnl=gross_pnl,
             net_pnl=net_pnl,
             best_observed_pnl=self.best_observed_pnl,
@@ -234,6 +423,11 @@ class StateDrivenPositionKeeper:
         return decision
 
     def _record_excursion(self, gross_pnl: float, bid: float, received_ts: float) -> None:
+        point = (float(received_ts), float(gross_pnl))
+        if self._price and self._price[-1][0] == point[0]:
+            self._price[-1] = point
+        else:
+            self._price.append(point)
         if gross_pnl > self.best_observed_pnl:
             self.best_observed_pnl = gross_pnl
             self.best_observed_bid = bid
@@ -241,6 +435,73 @@ class StateDrivenPositionKeeper:
         if gross_pnl < self.worst_observed_pnl:
             self.worst_observed_pnl = gross_pnl
             self.worst_observed_ts = received_ts
+
+    @staticmethod
+    def _gross_pnl(position: Mapping, bid: float) -> float:
+        entry = float(position.get("entry", 0.0) or 0.0)
+        qty = max(int(position.get("qty", 0) or 0), 1)
+        return (float(bid) - entry) * qty
+
+    def _price_direction(self, received_ts: float, window_sec: float) -> float | None:
+        if len(self._price) < 2:
+            return None
+        cutoff = float(received_ts) - float(window_sec)
+        start_index = 0
+        for index, item in enumerate(self._price):
+            if item[0] <= cutoff:
+                start_index = index
+            else:
+                break
+        window = list(self._price)[start_index:]
+        if len(window) < 2:
+            return None
+        observed = window[-1][0] - window[0][0]
+        if observed < float(window_sec) * 0.8:
+            return None
+        travelled = sum(
+            abs(current[1] - previous[1])
+            for previous, current in zip(window, window[1:])
+        )
+        return _clip((window[-1][1] - window[0][1]) / max(travelled, 0.0001))
+
+    def _price_group(
+        self, received_ts: float, windows: tuple[float, ...]
+    ) -> tuple[float, bool]:
+        directions = [
+            direction
+            for seconds in windows
+            if (direction := self._price_direction(received_ts, seconds)) is not None
+        ]
+        if not directions:
+            return 0.0, False
+        return float(statistics.median(directions)), True
+
+    @staticmethod
+    def _timeframe_support(side: str, evidence: Mapping, fallback: float) -> dict:
+        sign = 1.0 if side == "CE" else -1.0
+        groups = evidence.get("timeframe_state", {}).get("groups", {})
+
+        def aligned(name: str) -> tuple[float, bool]:
+            group = groups.get(name, {})
+            ready = bool(group.get("ready"))
+            value = float(group.get("direction", 0.0)) * sign if ready else fallback
+            return value, ready
+
+        short, short_ready = aligned("short")
+        medium, medium_ready = aligned("medium")
+        long, long_ready = aligned("long")
+        overall, overall_ready = aligned("overall")
+        return {
+            "short": short,
+            "medium": medium,
+            "long": long,
+            "overall": overall,
+            "short_ready": short_ready,
+            "medium_ready": medium_ready,
+            "long_ready": long_ready,
+            "overall_ready": overall_ready,
+            "ready_groups": sum((short_ready, medium_ready, long_ready)),
+        }
 
     def _support_layers(self) -> tuple[float, float]:
         values = [item[1] for item in self._support]

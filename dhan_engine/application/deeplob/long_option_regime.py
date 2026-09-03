@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -19,6 +20,22 @@ from dhan_engine.application.deeplob.virtual_strategy_books import (
 from dhan_engine.domain.market.expiry_cycle import expiry_cycle_context
 
 logger = logging.getLogger(__name__)
+
+TIMEFRAME_WINDOWS = (
+    ("1s", 1.0),
+    ("5s", 5.0),
+    ("10s", 10.0),
+    ("30s", 30.0),
+    ("1m", 60.0),
+    ("4m", 240.0),
+    ("15m", 900.0),
+    ("1h", 3600.0),
+)
+TIMEFRAME_GROUPS = {
+    "short": ("1s", "5s", "10s", "30s"),
+    "medium": ("1m", "4m"),
+    "long": ("15m", "1h"),
+}
 
 
 def _env_bool(name: str, default: str) -> bool:
@@ -95,8 +112,9 @@ class LongOptionRegimeExecutor:
         self.trade_summary_sink = trade_summary_sink
         self.contracts: dict[str, dict] = {}
         self.quotes: dict[int, dict] = {}
-        self.history = {"CE": deque(maxlen=4096), "PE": deque(maxlen=4096)}
-        self.future_history = deque(maxlen=4096)
+        self.history = {"CE": deque(maxlen=16384), "PE": deque(maxlen=16384)}
+        self.future_history = deque(maxlen=8192)
+        self.pressure_history = deque(maxlen=8192)
         self._timezone = ZoneInfo("Asia/Kolkata")
         self._state = "UNCERTAIN"
         self._instant_state = "UNCERTAIN"
@@ -134,6 +152,7 @@ class LongOptionRegimeExecutor:
         for values in self.history.values():
             values.clear()
         self.future_history.clear()
+        self.pressure_history.clear()
         self._last_v1_books = {}
         self._v1_ledger.reset()
         self._position_keeper.reset()
@@ -173,12 +192,28 @@ class LongOptionRegimeExecutor:
         self.paper_trader.on_tick(secid, float(ltp))
         position = self.paper_trader.positions.get(secid)
         if position is not None and float(bid or 0.0) > 0.0:
-            self._position_keeper.mark_excursion(
+            quote_decision = self._position_keeper.observe_quote(
                 position=position,
                 side=side,
                 bid=float(bid),
                 received_ts=float(received_ts),
+                round_trip_fee=self.settings.round_trip_fee,
             )
+            if quote_decision is not None and quote_decision.action == "EXIT":
+                logger.info(
+                    "DEEPLOB_V2_POSITION_KEEPER_QUOTE_EXIT | side=%s | reason=%s | "
+                    "gross=%+.2f | net=%+.2f | premium_short=%+.3f | "
+                    "premium_medium=%+.3f",
+                    side,
+                    quote_decision.reason,
+                    quote_decision.gross_pnl,
+                    quote_decision.net_pnl,
+                    quote_decision.premium_short_direction,
+                    quote_decision.premium_medium_direction,
+                )
+                self._block_same_state_reentry(side)
+                self._exit(f"DEEPLOB_V2_EXIT:STATE_KEEPER_{quote_decision.reason}")
+                return
         self._prune(side, float(received_ts))
 
     def on_prediction(
@@ -248,15 +283,17 @@ class LongOptionRegimeExecutor:
         }
 
     def _prune(self, side: str, now_ts: float) -> None:
-        cutoff = now_ts - max(900.0, self.settings.observation_sec * 75.0)
+        cutoff = now_ts - 3660.0
         values = self.history[side]
         while values and values[0][0] < cutoff:
             values.popleft()
 
     def _prune_future(self, now_ts: float) -> None:
-        cutoff = now_ts - max(900.0, self.settings.observation_sec * 75.0)
+        cutoff = now_ts - 3660.0
         while self.future_history and self.future_history[0][0] < cutoff:
             self.future_history.popleft()
+        while self.pressure_history and self.pressure_history[0][0] < cutoff:
+            self.pressure_history.popleft()
 
     @staticmethod
     def _trajectory_metrics(values, value_index: int) -> dict:
@@ -269,6 +306,174 @@ class LongOptionRegimeExecutor:
             "context_change_pct": (prices[-1] / prices[0] - 1.0) * 100.0,
             "context_direction": max(-1.0, min(1.0, net_move / max(travelled, 0.0001))),
         }
+
+    @staticmethod
+    def _window_trajectory(values, value_index: int, window_sec: float) -> dict:
+        rows = [
+            item
+            for item in values
+            if len(item) > value_index and float(item[value_index]) > 0.0
+        ]
+        if len(rows) < 2:
+            return {
+                "ready": False,
+                "samples": len(rows),
+                "observed_sec": 0.0,
+                "change_pct": 0.0,
+                "direction": 0.0,
+                "velocity_pct_sec": 0.0,
+                "range_pct": 0.0,
+            }
+        cutoff = float(rows[-1][0]) - float(window_sec)
+        start_index = 0
+        for index, item in enumerate(rows):
+            if float(item[0]) <= cutoff:
+                start_index = index
+            else:
+                break
+        window = rows[start_index:]
+        first = float(window[0][value_index])
+        last = float(window[-1][value_index])
+        observed_sec = max(float(window[-1][0]) - float(window[0][0]), 0.0)
+        travelled = sum(
+            abs(float(current[value_index]) - float(previous[value_index]))
+            for previous, current in zip(window, window[1:])
+        )
+        change_pct = (last / first - 1.0) * 100.0
+        return {
+            "ready": observed_sec >= float(window_sec) * 0.8,
+            "samples": len(window),
+            "observed_sec": observed_sec,
+            "change_pct": change_pct,
+            "direction": max(
+                -1.0,
+                min(1.0, (last - first) / max(travelled, 0.0001)),
+            ),
+            "velocity_pct_sec": change_pct / max(observed_sec, 0.001),
+            "range_pct": (
+                max(float(item[value_index]) for item in window)
+                - min(float(item[value_index]) for item in window)
+            )
+            / first
+            * 100.0,
+        }
+
+    @classmethod
+    def _timeframe_metrics(cls, values, value_index: int) -> dict:
+        return {
+            label: cls._window_trajectory(values, value_index, seconds)
+            for label, seconds in TIMEFRAME_WINDOWS
+        }
+
+    @staticmethod
+    def _window_signal(values, window_sec: float) -> dict:
+        if len(values) < 2:
+            return {
+                "ready": False,
+                "samples": len(values),
+                "observed_sec": 0.0,
+                "direction": 0.0,
+                "persistence": 0.0,
+            }
+        cutoff = float(values[-1][0]) - float(window_sec)
+        start_index = 0
+        for index, item in enumerate(values):
+            if float(item[0]) <= cutoff:
+                start_index = index
+            else:
+                break
+        window = list(values)[start_index:]
+        observed_sec = max(float(window[-1][0]) - float(window[0][0]), 0.0)
+        samples = [max(-1.0, min(1.0, float(item[1]))) for item in window]
+        direction = float(statistics.median(samples))
+        matching = sum(
+            value == 0.0 or value * direction > 0.0
+            for value in samples
+        )
+        return {
+            "ready": observed_sec >= float(window_sec) * 0.8,
+            "samples": len(samples),
+            "observed_sec": observed_sec,
+            "direction": direction,
+            "persistence": matching / len(samples),
+        }
+
+    @classmethod
+    def _signal_timeframe_metrics(cls, values) -> dict:
+        return {
+            label: cls._window_signal(values, seconds)
+            for label, seconds in TIMEFRAME_WINDOWS
+        }
+
+    def _derive_timeframe_state(self, ce: dict, pe: dict, future: dict) -> dict:
+        timeframes = {}
+        for label, _ in TIMEFRAME_WINDOWS:
+            ce_frame = ce.get("timeframes", {}).get(label, {})
+            pe_frame = pe.get("timeframes", {}).get(label, {})
+            future_frame = future.get("timeframes", {}).get(label, {})
+            pressure_frame = future.get("pressure_timeframes", {}).get(label, {})
+            ready = all(
+                bool(frame.get("ready"))
+                for frame in (ce_frame, pe_frame, future_frame, pressure_frame)
+            )
+            option_change = float(ce_frame.get("change_pct", 0.0)) - float(
+                pe_frame.get("change_pct", 0.0)
+            )
+            option_scale = max(
+                abs(float(ce_frame.get("change_pct", 0.0)))
+                + abs(float(pe_frame.get("change_pct", 0.0))),
+                0.0001,
+            )
+            option_direction = self._signed_strength(option_change, option_scale)
+            future_direction = float(future_frame.get("direction", 0.0))
+            pressure_direction = float(pressure_frame.get("direction", 0.0))
+            direction = (
+                option_direction + future_direction + pressure_direction
+            ) / 3.0
+            timeframes[label] = {
+                "ready": ready,
+                "direction": direction if ready else 0.0,
+                "future_direction": future_direction,
+                "future_change_pct": float(future_frame.get("change_pct", 0.0)),
+                "ce_change_pct": float(ce_frame.get("change_pct", 0.0)),
+                "pe_change_pct": float(pe_frame.get("change_pct", 0.0)),
+                "option_direction": option_direction,
+                "depth_pressure_direction": pressure_direction,
+                "depth_pressure_persistence": float(
+                    pressure_frame.get("persistence", 0.0)
+                ),
+                "observed_sec": min(
+                    float(ce_frame.get("observed_sec", 0.0)),
+                    float(pe_frame.get("observed_sec", 0.0)),
+                    float(future_frame.get("observed_sec", 0.0)),
+                ),
+            }
+
+        groups = {}
+        ready_group_scores = []
+        for group, labels in TIMEFRAME_GROUPS.items():
+            scores = [
+                float(timeframes[label]["direction"])
+                for label in labels
+                if timeframes[label]["ready"]
+            ]
+            groups[group] = {
+                "ready": bool(scores),
+                "direction": sum(scores) / len(scores) if scores else 0.0,
+                "frames": len(scores),
+            }
+            if scores:
+                ready_group_scores.append(groups[group]["direction"])
+        groups["overall"] = {
+            "ready": bool(ready_group_scores),
+            "direction": (
+                sum(ready_group_scores) / len(ready_group_scores)
+                if ready_group_scores
+                else 0.0
+            ),
+            "groups": len(ready_group_scores),
+        }
+        return {"frames": timeframes, "groups": groups}
 
     def _leg_metrics(self, side: str) -> dict | None:
         values = self.history[side]
@@ -307,12 +512,20 @@ class LongOptionRegimeExecutor:
             "window_start_ask": window[0][3],
             "received_ts": now_ts,
             **self._trajectory_metrics(values, 1),
+            "timeframes": self._timeframe_metrics(values, 1),
         }
 
     def _future_metrics(self, composite) -> dict | None:
         full_quote = composite.full_quote or {}
         future_ltp = float(full_quote.get("ltp", 0.0) or 0.0)
         received_ts = float(full_quote.get("received_ts", time.time()) or time.time())
+        pressure = max(
+            -1.0,
+            min(
+                1.0,
+                float(getattr(composite.features, "pressure_score", 0.0) or 0.0),
+            ),
+        )
         if future_ltp <= 0:
             return None
         if not self.future_history or (
@@ -320,6 +533,11 @@ class LongOptionRegimeExecutor:
             or future_ltp != self.future_history[-1][1]
         ):
             self.future_history.append((received_ts, future_ltp))
+        if not self.pressure_history or (
+            received_ts > self.pressure_history[-1][0]
+            or pressure != self.pressure_history[-1][1]
+        ):
+            self.pressure_history.append((received_ts, pressure))
         self._prune_future(received_ts)
         cutoff = received_ts - self.settings.observation_sec
         window = [item for item in self.future_history if item[0] >= cutoff]
@@ -337,6 +555,10 @@ class LongOptionRegimeExecutor:
             "velocity_pct_sec": change_pct / elapsed,
             "range_pct": range_pct,
             **self._trajectory_metrics(self.future_history, 1),
+            "timeframes": self._timeframe_metrics(self.future_history, 1),
+            "pressure_timeframes": self._signal_timeframe_metrics(
+                self.pressure_history
+            ),
         }
 
     @staticmethod
@@ -470,6 +692,7 @@ class LongOptionRegimeExecutor:
         pressure = float(getattr(composite.features, "pressure_score", 0.0) or 0.0)
         v1_books = self._derive_v1_books(ce, pe, future, pressure)
         self._last_v1_books = dict(v1_books)
+        timeframe_state = self._derive_timeframe_state(ce, pe, future)
         future_ltp = future["ltp"]
         directional = ce["change_pct"] - pe["change_pct"]
         velocity = ce["velocity_pct_sec"] - pe["velocity_pct_sec"]
@@ -492,6 +715,7 @@ class LongOptionRegimeExecutor:
             "future_ltp": future_ltp,
             "future": future,
             "v1_books": v1_books,
+            "timeframe_state": timeframe_state,
             "model_action": str(paper_action),
             "model_confidence": float(confidence),
             "state_score": score,
@@ -508,12 +732,33 @@ class LongOptionRegimeExecutor:
         hybrid_direction_confirmed = not books.get("hybrid_ready", False) or bool(
             books.get("hybrid_agreement", False)
         )
+        timeframe_groups = evidence.get("timeframe_state", {}).get("groups", {})
+        short_frame = timeframe_groups.get("short", {})
+        medium_frame = timeframe_groups.get("medium", {})
+        overall_frame = timeframe_groups.get("overall", {})
+        timeframe_bullish = (
+            bool(short_frame.get("ready"))
+            and bool(medium_frame.get("ready"))
+            and bool(overall_frame.get("ready"))
+            and float(short_frame.get("direction", 0.0)) > 0.0
+            and float(medium_frame.get("direction", 0.0)) > 0.0
+            and float(overall_frame.get("direction", 0.0)) > 0.0
+        )
+        timeframe_bearish = (
+            bool(short_frame.get("ready"))
+            and bool(medium_frame.get("ready"))
+            and bool(overall_frame.get("ready"))
+            and float(short_frame.get("direction", 0.0)) < 0.0
+            and float(medium_frame.get("direction", 0.0)) < 0.0
+            and float(overall_frame.get("direction", 0.0)) < 0.0
+        )
         bullish = (
             books["bull_support"] >= 3
             and books["direction_score"] > 0
             and evidence["velocity_spread"] > 0
             and score >= self.settings.minimum_state_score
             and hybrid_direction_confirmed
+            and timeframe_bullish
         )
         bearish = (
             books["bear_support"] >= 3
@@ -521,6 +766,7 @@ class LongOptionRegimeExecutor:
             and evidence["velocity_spread"] < 0
             and score >= self.settings.minimum_state_score
             and hybrid_direction_confirmed
+            and timeframe_bearish
         )
         if bullish:
             return "REVERSAL_TO_BULLISH" if self._state in {"BEARISH_EXPANSION", "BEARISH_EXHAUSTION"} else "BULLISH_EXPANSION"
@@ -567,8 +813,14 @@ class LongOptionRegimeExecutor:
         if self._candidate_count >= required and normalized != self._state:
             previous = self._state
             self._state = normalized
-            if self._entry_rearm_state and self._state != self._entry_rearm_state:
-                self._entry_rearm_state = ""
+            if self._entry_rearm_state:
+                opposite = (
+                    "BEARISH_EXPANSION"
+                    if self._entry_rearm_state == "BULLISH_EXPANSION"
+                    else "BULLISH_EXPANSION"
+                )
+                if self._state == opposite:
+                    self._entry_rearm_state = ""
             logger.info(
                 "DEEPLOB_V1_REGIME_TRANSITION | previous=%s | current=%s | confirmations=%s | "
                 "cycle=%s | premium_regime=%s",
@@ -605,6 +857,7 @@ class LongOptionRegimeExecutor:
             "v1_velocity_spread": evidence["velocity_spread"],
             "v1_acceleration_spread": evidence["acceleration_spread"],
             "v1_books": dict(evidence["v1_books"]),
+            "v1_timeframe_state": dict(evidence.get("timeframe_state", {})),
             "future_ltp": evidence["future_ltp"],
             "pressure_score": evidence["pressure"],
             "entry_option_spread": ask - bid,
@@ -622,18 +875,28 @@ class LongOptionRegimeExecutor:
             self._catastrophic_side = ""
             self._catastrophic_count = 0
             self._position_keeper.reset()
+            timeframe_groups = evidence.get("timeframe_state", {}).get("groups", {})
             logger.info(
                 "DEEPLOB_V2_ENTRY | side=%s | state=%s | instant_state=%s | price=%.2f | "
                 "score=%.3f | ce_pct=%+.3f | pe_pct=%+.3f | pressure=%+.3f | "
-                "direction_score=%+.3f | spread_cost=%.2f | cycle=%s | premium_regime=%s",
+                "direction_score=%+.3f | tf_short=%+.3f | tf_medium=%+.3f | "
+                "tf_long=%+.3f | tf_overall=%+.3f | spread_cost=%.2f | "
+                "cycle=%s | premium_regime=%s",
                 side, self._state, self._instant_state, ask, evidence["state_score"], evidence["ce"]["change_pct"],
                 evidence["pe"]["change_pct"], evidence["pressure"],
-                evidence["v1_books"]["direction_score"], spread_cost,
+                evidence["v1_books"]["direction_score"],
+                timeframe_groups.get("short", {}).get("direction", 0.0),
+                timeframe_groups.get("medium", {}).get("direction", 0.0),
+                timeframe_groups.get("long", {}).get("direction", 0.0),
+                timeframe_groups.get("overall", {}).get("direction", 0.0),
+                spread_cost,
                 self._expiry_cycle.get("cycle_label", "UNKNOWN"),
                 self._expiry_cycle.get("premium_regime", "UNKNOWN"),
             )
 
     def _manage_open_position(self, evidence: dict, instant_state: str) -> None:
+        if not self.paper_trader.positions:
+            return
         secid, position = next(iter(self.paper_trader.positions.items()))
         side = "CE" if str(position.get("tag", "")).endswith("_CE") else "PE"
         quote = self.quotes.get(int(secid), {})
@@ -652,11 +915,11 @@ class LongOptionRegimeExecutor:
             round_trip_fee=self.settings.round_trip_fee,
         )
         if self._catastrophic_guard_triggered(side, position, evidence, instant_state):
-            self._entry_rearm_state = self._state
-            self._exit("DEEPLOB_V2_EXIT:DEPTH_CONFIRMED_CATASTROPHIC_GUARD")
+            self._block_same_state_reentry(side)
+            self._exit("DEEPLOB_V2_EXIT:CATASTROPHIC_LOSS_BOUNDARY")
             return
         if decision.action == "EXIT":
-            self._entry_rearm_state = self._state
+            self._block_same_state_reentry(side)
             self._exit(f"DEEPLOB_V2_EXIT:STATE_KEEPER_{decision.reason}")
             return
         now_mono = time.monotonic()
@@ -666,7 +929,10 @@ class LongOptionRegimeExecutor:
                 "DEEPLOB_V2_POSITION_KEEPER | side=%s | action=%s | phase=%s | "
                 "context=%s | reason=%s | state=%s | instant_state=%s | "
                 "support=%+.3f | fast=%+.3f | context_support=%+.3f | "
-                "gross=%+.2f | net=%+.2f | best=%+.2f | worst=%+.2f | "
+                "tf_short=%+.3f | tf_medium=%+.3f | tf_long=%+.3f | "
+                "tf_overall=%+.3f | tf_ready=%s | premium_short=%+.3f | "
+                "premium_medium=%+.3f | gross=%+.2f | net=%+.2f | "
+                "best=%+.2f | worst=%+.2f | "
                 "surrendered_mfe=%.2f | capture_ratio=%s | observations=%s | "
                 "cycle=%s | premium_regime=%s",
                 side,
@@ -679,6 +945,13 @@ class LongOptionRegimeExecutor:
                 decision.support_score,
                 decision.fast_support,
                 decision.context_support,
+                decision.timeframe_short_support,
+                decision.timeframe_medium_support,
+                decision.timeframe_long_support,
+                decision.timeframe_overall_support,
+                decision.timeframe_ready_groups,
+                decision.premium_short_direction,
+                decision.premium_medium_direction,
                 decision.gross_pnl,
                 decision.net_pnl,
                 decision.best_observed_pnl,
@@ -730,7 +1003,7 @@ class LongOptionRegimeExecutor:
             and evidence["velocity_spread"] > 0
             and leg["change_pct"] < 0
         )
-        if loss_pct < loss_floor or not adverse:
+        if loss_pct < loss_floor:
             self._reset_catastrophic_guard()
             return False
 
@@ -742,17 +1015,23 @@ class LongOptionRegimeExecutor:
         logger.warning(
             "DEEPLOB_V2_CATASTROPHIC_GUARD_PENDING | side=%s | loss_pct=%.3f | "
             "loss_floor_pct=%.3f | state=%s | instant_state=%s | pressure=%+.3f | "
-            "confirmations=%s/%s",
+            "state_aligned=%s | confirmations=%s/%s",
             side,
             loss_pct,
             loss_floor,
             self._state,
             instant_state,
             evidence["pressure"],
+            adverse,
             self._catastrophic_count,
             self.settings.catastrophic_confirmations,
         )
         return self._catastrophic_count >= self.settings.catastrophic_confirmations
+
+    def _block_same_state_reentry(self, side: str) -> None:
+        blocked_state = "BULLISH_EXPANSION" if side == "CE" else "BEARISH_EXPANSION"
+        opposite_state = "BEARISH_EXPANSION" if side == "CE" else "BULLISH_EXPANSION"
+        self._entry_rearm_state = "" if self._state == opposite_state else blocked_state
 
     def _reset_catastrophic_guard(self) -> None:
         self._catastrophic_side = ""
@@ -790,6 +1069,27 @@ class LongOptionRegimeExecutor:
                 keeper_context=keeper.get("context"),
                 keeper_reason=keeper.get("reason"),
                 keeper_support_score=keeper.get("support_score"),
+                keeper_timeframe_short_support=keeper.get(
+                    "timeframe_short_support"
+                ),
+                keeper_timeframe_medium_support=keeper.get(
+                    "timeframe_medium_support"
+                ),
+                keeper_timeframe_long_support=keeper.get(
+                    "timeframe_long_support"
+                ),
+                keeper_timeframe_overall_support=keeper.get(
+                    "timeframe_overall_support"
+                ),
+                keeper_timeframe_ready_groups=keeper.get(
+                    "timeframe_ready_groups"
+                ),
+                keeper_premium_short_direction=keeper.get(
+                    "premium_short_direction"
+                ),
+                keeper_premium_medium_direction=keeper.get(
+                    "premium_medium_direction"
+                ),
                 BestObservedPnl=best_observed,
                 WorstObservedPnl=keeper.get("worst_observed_pnl"),
                 CapturedGrossPnl=captured,
@@ -814,6 +1114,11 @@ class LongOptionRegimeExecutor:
                 paper=True, exit_execution_side="BID", v1_exit_state=self._state,
                 v1_exit_instant_state=self._instant_state,
                 v1_exit_score=self._last_evidence.get("state_score"),
+                v1_exit_timeframe_groups=dict(
+                    self._last_evidence.get("timeframe_state", {}).get(
+                        "groups", {}
+                    )
+                ),
             )
             self.trade_summary_sink.record(summary)
         self._exits += 1
@@ -832,6 +1137,7 @@ class LongOptionRegimeExecutor:
         if now - self._last_log_mono < 5.0:
             return
         self._last_log_mono = now
+        timeframe_groups = evidence.get("timeframe_state", {}).get("groups", {})
         logger.info(
             "DEEPLOB_V1_STATE | state=%s | instant_state=%s | proposed=%s | score=%.3f | "
             "call_pct=%+.3f | put_pct=%+.3f | "
@@ -839,7 +1145,8 @@ class LongOptionRegimeExecutor:
             "future_ltp=%.2f | future_pct=%+.4f | synthetic_long=%+.3f | "
             "synthetic_short=%+.3f | straddle=%+.3f | direction_score=%+.3f | "
             "fast_direction=%+.3f | executable_direction=%+.3f | hybrid_ready=%s | "
-            "hybrid_agreement=%s | book_updates=%s | "
+            "hybrid_agreement=%s | book_updates=%s | tf_short=%+.3f | "
+            "tf_medium=%+.3f | tf_long=%+.3f | tf_overall=%+.3f | "
             "bull_support=%s | bear_support=%s | pressure=%+.3f | confirmations=%s | cycle=%s | "
             "premium_regime=%s",
             self._state, self._instant_state, proposed, evidence["state_score"], evidence["ce"]["change_pct"],
@@ -856,6 +1163,10 @@ class LongOptionRegimeExecutor:
             evidence["v1_books"].get("hybrid_ready", False),
             evidence["v1_books"].get("hybrid_agreement", False),
             evidence["v1_books"].get("book_updates", 0),
+            timeframe_groups.get("short", {}).get("direction", 0.0),
+            timeframe_groups.get("medium", {}).get("direction", 0.0),
+            timeframe_groups.get("long", {}).get("direction", 0.0),
+            timeframe_groups.get("overall", {}).get("direction", 0.0),
             evidence["v1_books"]["bull_support"],
             evidence["v1_books"]["bear_support"],
             evidence["pressure"], self._candidate_count,
