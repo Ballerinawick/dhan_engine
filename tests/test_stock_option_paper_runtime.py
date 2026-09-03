@@ -207,3 +207,33 @@ def test_nifty_executor_defaults_remain_unchanged():
     assert executor.profile == "regime_v2"
     assert executor.strategy == "deeplob_long_option_regime_v2"
     assert {item["tag"] for item in subscriptions} == {"NIFTY_CE", "NIFTY_PE"}
+
+
+def test_stock_executor_records_executable_best_observed_pnl():
+    sink = FakeSink()
+    trader = FakePaperTrader()
+    executor = StockOptionRegimeExecutor(
+        "HDFCBANK", regime_settings(), trader, trade_summary_sink=sink
+    )
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 201, "strike": 1000},
+            "PE": {"security_id": 202, "strike": 1000},
+        }
+    )
+    trader.on_entry(201, "HDFCBANK_CE", "LONG", 100.0)
+    executor.on_quote(
+        201,
+        "HDFCBANK_CE",
+        102.0,
+        bid=102.0,
+        ask=102.1,
+        received_ts=time.time(),
+    )
+
+    executor._exit("DEEPLOB_V2_EXIT:MARKET_CLOSE")
+
+    assert sink.records[-1]["index"] == "HDFCBANK"
+    assert sink.records[-1]["BestObservedPnl"] == 1100.0
+    assert sink.records[-1]["CapturedGrossPnl"] == 1100.0
+    assert sink.records[-1]["mfe_capture_ratio"] == 1.0

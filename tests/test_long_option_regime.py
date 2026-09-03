@@ -174,7 +174,7 @@ def publish_pair(
     )
 
 
-def test_v1_bullish_state_drives_v2_ce_entry_and_reversal_exit():
+def test_v1_bullish_state_retains_profit_then_independently_confirms_pe():
     trader = FakePaperTrader()
     sink = FakeSink()
     executor = LongOptionRegimeExecutor(settings(), trader, trade_summary_sink=sink)
@@ -220,11 +220,12 @@ def test_v1_bullish_state_drives_v2_ce_entry_and_reversal_exit():
     assert sink.records[0]["profile"] == "regime_v2"
     assert sink.records[0]["strategy"] == "deeplob_long_option_regime_v2"
     assert sink.records[0]["v1_entry_state"] == "BULLISH_EXPANSION"
-    assert sink.records[0]["v1_exit_state"] in {
-        "BULLISH_EXHAUSTION",
-        "BEARISH_EXPANSION",
-    }
-    assert sink.records[0]["exit_reason"].startswith("DEEPLOB_V2_EXIT:")
+    assert sink.records[0]["v1_exit_state"] == "BULLISH_EXPANSION"
+    assert sink.records[0]["exit_reason"] == (
+        "DEEPLOB_V2_EXIT:STATE_KEEPER_EARNED_MOVE_STATE_DECAY"
+    )
+    assert sink.records[0]["BestObservedPnl"] > sink.records[0]["gross_pnl"] > 0
+    assert sink.records[0]["mfe_capture_ratio"] > 0
 
 
 def test_pair_structure_reflects_selected_strikes_without_extra_contracts():
@@ -325,7 +326,7 @@ def test_volatility_disagreement_waits_and_holds_existing_ce():
         assert list(trader.positions) == [101]
 
 
-def test_bullish_exhaustion_exits_ce_without_early_pe_entry():
+def test_bullish_exhaustion_requires_persistent_state_failure_before_exit():
     trader = FakePaperTrader()
     sink = FakeSink()
     executor = LongOptionRegimeExecutor(settings(), trader, trade_summary_sink=sink)
@@ -347,10 +348,18 @@ def test_bullish_exhaustion_exits_ce_without_early_pe_entry():
     executor._state = "BULLISH_EXHAUSTION"
     executor._instant_state = "BULLISH_EXHAUSTION"
 
-    executor._manage_open_position(evidence(), "BULLISH_EXHAUSTION")
+    adverse = evidence(ce_change=-1.0, pe_change=1.0, pressure=-0.2)
+    executor._manage_open_position(adverse, "BULLISH_EXHAUSTION")
+
+    assert list(trader.positions) == [101]
+    assert executor.health()["position_keeper"]["action"] == "DEFEND"
+
+    executor._manage_open_position(adverse, "BULLISH_EXHAUSTION")
 
     assert trader.positions == {}
-    assert sink.records[0]["exit_reason"] == "DEEPLOB_V2_EXIT:BULLISH_EXHAUSTION"
+    assert sink.records[0]["exit_reason"] == (
+        "DEEPLOB_V2_EXIT:STATE_KEEPER_OPPOSING_STATE_ACCEPTED"
+    )
     assert executor.health()["entries"] == 0
 
 
@@ -436,7 +445,7 @@ def test_entry_requires_current_instant_state_to_match_stable_state():
     assert trader.positions == {}
 
 
-def test_confirmed_opposite_v1_state_exits_without_second_confirmation_loop():
+def test_confirmed_opposite_v1_state_challenges_before_accepting_exit():
     trader = FakePaperTrader()
     sink = FakeSink()
     executor = LongOptionRegimeExecutor(settings(), trader, trade_summary_sink=sink)
@@ -463,9 +472,90 @@ def test_confirmed_opposite_v1_state_exits_without_second_confirmation_loop():
         "BEARISH_EXPANSION",
     )
 
+    assert list(trader.positions) == [101]
+    assert executor.health()["position_keeper"]["phase"] == "CHALLENGED"
+
+    executor._manage_open_position(
+        evidence(ce_change=-1.0, pe_change=1.0, pressure=-0.2),
+        "BEARISH_EXPANSION",
+    )
+
     assert trader.positions == {}
     assert len(sink.records) == 1
-    assert sink.records[0]["exit_reason"] == "DEEPLOB_V2_EXIT:V1_REVERSAL_TO_PE"
+    assert sink.records[0]["exit_reason"] == (
+        "DEEPLOB_V2_EXIT:STATE_KEEPER_OPPOSING_STATE_ACCEPTED"
+    )
+
+
+def test_fee_clearing_mfe_uses_pullback_then_recovery_without_fixed_trail():
+    trader = FakePaperTrader()
+    executor = LongOptionRegimeExecutor(settings(), trader)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    trader.on_entry(101, "NIFTY_CE", "LONG", 100.0)
+    executor._state = "BULLISH_EXPANSION"
+    executor._instant_state = "BULLISH_EXPANSION"
+    now = time.time()
+
+    executor.on_quote(101, "NIFTY_CE", 103.0, bid=103.0, ask=103.1, received_ts=now)
+    executor._manage_open_position(evidence(), "BULLISH_EXPANSION")
+
+    weaker = evidence(pressure=0.05)
+    weaker["v1_books"]["direction_score"] = 0.2
+    executor.on_quote(101, "NIFTY_CE", 102.0, bid=102.0, ask=102.1, received_ts=now + 1)
+    executor._manage_open_position(weaker, "BULLISH_EXPANSION")
+    assert executor.health()["position_keeper"]["phase"] == "PULLBACK"
+
+    executor.on_quote(101, "NIFTY_CE", 102.5, bid=102.5, ask=102.6, received_ts=now + 2)
+    executor._manage_open_position(evidence(), "BULLISH_EXPANSION")
+    assert executor.health()["position_keeper"]["phase"] == "RECOVERY"
+    assert list(trader.positions) == [101]
+
+    executor.on_quote(101, "NIFTY_CE", 103.2, bid=103.2, ask=103.3, received_ts=now + 3)
+    executor._manage_open_position(evidence(), "BULLISH_EXPANSION")
+    assert executor.health()["position_keeper"]["phase"] == "SUPPORTED"
+    assert list(trader.positions) == [101]
+
+
+def test_continued_state_and_price_decay_captures_positive_mfe_in_summary():
+    trader = FakePaperTrader()
+    sink = FakeSink()
+    executor = LongOptionRegimeExecutor(settings(), trader, trade_summary_sink=sink)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    trader.on_entry(101, "NIFTY_CE", "LONG", 100.0)
+    executor._state = "BULLISH_EXPANSION"
+    executor._instant_state = "BULLISH_EXPANSION"
+    now = time.time()
+    executor.on_quote(101, "NIFTY_CE", 105.0, bid=105.0, ask=105.1, received_ts=now)
+    executor._manage_open_position(evidence(), "BULLISH_EXPANSION")
+
+    weaker = evidence(pressure=0.05)
+    weaker["v1_books"]["direction_score"] = 0.2
+    executor.on_quote(101, "NIFTY_CE", 104.0, bid=104.0, ask=104.1, received_ts=now + 1)
+    executor._manage_open_position(weaker, "BULLISH_EXPANSION")
+    assert list(trader.positions) == [101]
+
+    weaker_again = evidence(pressure=0.01)
+    weaker_again["v1_books"]["direction_score"] = 0.1
+    executor.on_quote(101, "NIFTY_CE", 103.0, bid=103.0, ask=103.1, received_ts=now + 2)
+    executor._manage_open_position(weaker_again, "BULLISH_EXPANSION")
+
+    assert trader.positions == {}
+    assert sink.records[0]["gross_pnl"] == 195.0
+    assert sink.records[0]["BestObservedPnl"] == 325.0
+    assert sink.records[0]["WorstObservedPnl"] == 195.0
+    assert sink.records[0]["CapturedGrossPnl"] == 195.0
+    assert sink.records[0]["surrendered_mfe"] == 130.0
+    assert sink.records[0]["mfe_capture_ratio"] == 0.6
 
 
 def test_catastrophic_guard_requires_repeated_aligned_depth_evidence():
