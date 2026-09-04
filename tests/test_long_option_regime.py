@@ -1,5 +1,7 @@
 import time
+from collections import deque
 from datetime import date, time as clock_time
+from threading import Event, Thread
 from types import SimpleNamespace
 
 from dhan_engine.application.deeplob.long_option_regime import (
@@ -695,6 +697,57 @@ def test_depth_pressure_is_retained_across_all_market_timeframes():
     assert timeframes["1s"]["direction"] == 0.75
     assert timeframes["1h"]["direction"] > 0.0
     assert timeframes["1h"]["persistence"] == 1.0
+
+
+def test_quote_append_cannot_mutate_history_during_prediction_snapshot():
+    executor = LongOptionRegimeExecutor(settings(), FakePaperTrader())
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    iteration_started = Event()
+
+    class CoordinatedDeque(deque):
+        def __iter__(self):
+            iterator = super().__iter__()
+            first = True
+            for item in iterator:
+                if first:
+                    first = False
+                    iteration_started.set()
+                    time.sleep(0.05)
+                yield item
+
+    now = time.time()
+    executor.history["CE"] = CoordinatedDeque(
+        (
+            (now + offset, 100.0 + offset * 0.01, 99.95, 100.05)
+            for offset in range(20)
+        ),
+        maxlen=16384,
+    )
+
+    def append_quote():
+        assert iteration_started.wait(timeout=1.0)
+        executor.on_quote(
+            101,
+            "NIFTY_CE",
+            101.0,
+            bid=100.95,
+            ask=101.05,
+            received_ts=now + 21,
+        )
+
+    writer = Thread(target=append_quote)
+    writer.start()
+    metrics = executor._leg_metrics("CE")
+    writer.join(timeout=1.0)
+
+    assert metrics is not None
+    assert not writer.is_alive()
+    assert len(executor.history["CE"]) == 21
 
 
 def test_short_timeframe_contradiction_blocks_directional_entry_state():
