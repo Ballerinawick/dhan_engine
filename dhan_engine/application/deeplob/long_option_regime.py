@@ -7,6 +7,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, time as clock_time
+from threading import RLock
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
@@ -110,6 +111,7 @@ class LongOptionRegimeExecutor:
         self.settings = settings
         self.paper_trader = paper_trader
         self.trade_summary_sink = trade_summary_sink
+        self._history_lock = RLock()
         self.contracts: dict[str, dict] = {}
         self.quotes: dict[int, dict] = {}
         self.history = {"CE": deque(maxlen=16384), "PE": deque(maxlen=16384)}
@@ -137,22 +139,29 @@ class LongOptionRegimeExecutor:
     def register_contracts(self, selection: Mapping[str, Mapping]) -> list[dict]:
         subscriptions = []
         selected = set()
-        for side in ("CE", "PE"):
-            contract = dict(selection.get(side) or {})
-            secid = int(contract.get("security_id", 0) or 0)
-            if not secid:
-                continue
-            contract.update(security_id=secid, tag=f"NIFTY_{side}")
-            self.contracts[side] = contract
-            selected.add(secid)
-            subscriptions.append(
-                {"ExchangeSegment": "NSE_FNO", "SecurityId": str(secid), "tag": contract["tag"]}
-            )
-        self.quotes = {key: value for key, value in self.quotes.items() if key in selected}
-        for values in self.history.values():
-            values.clear()
-        self.future_history.clear()
-        self.pressure_history.clear()
+        with self._history_lock:
+            for side in ("CE", "PE"):
+                contract = dict(selection.get(side) or {})
+                secid = int(contract.get("security_id", 0) or 0)
+                if not secid:
+                    continue
+                contract.update(security_id=secid, tag=f"NIFTY_{side}")
+                self.contracts[side] = contract
+                selected.add(secid)
+                subscriptions.append(
+                    {
+                        "ExchangeSegment": "NSE_FNO",
+                        "SecurityId": str(secid),
+                        "tag": contract["tag"],
+                    }
+                )
+            self.quotes = {
+                key: value for key, value in self.quotes.items() if key in selected
+            }
+            for values in self.history.values():
+                values.clear()
+            self.future_history.clear()
+            self.pressure_history.clear()
         self._last_v1_books = {}
         self._v1_ledger.reset()
         self._position_keeper.reset()
@@ -172,12 +181,6 @@ class LongOptionRegimeExecutor:
 
     def on_quote(self, secid, tag, ltp, *, bid, ask, received_ts) -> None:
         secid = int(secid)
-        side = next(
-            (name for name, item in self.contracts.items() if int(item["security_id"]) == secid),
-            None,
-        )
-        if side is None:
-            return
         quote = {
             "tag": tag,
             "ltp": float(ltp),
@@ -185,10 +188,27 @@ class LongOptionRegimeExecutor:
             "ask": float(ask or 0.0),
             "received_ts": float(received_ts),
         }
-        self.quotes[secid] = quote
-        self.history[side].append(
-            (float(received_ts), float(ltp), float(bid or 0.0), float(ask or 0.0))
-        )
+        with self._history_lock:
+            side = next(
+                (
+                    name
+                    for name, item in self.contracts.items()
+                    if int(item["security_id"]) == secid
+                ),
+                None,
+            )
+            if side is None:
+                return
+            self.quotes[secid] = quote
+            self.history[side].append(
+                (
+                    float(received_ts),
+                    float(ltp),
+                    float(bid or 0.0),
+                    float(ask or 0.0),
+                )
+            )
+            self._prune(side, float(received_ts))
         self.paper_trader.on_tick(secid, float(ltp))
         position = self.paper_trader.positions.get(secid)
         if position is not None and float(bid or 0.0) > 0.0:
@@ -214,7 +234,6 @@ class LongOptionRegimeExecutor:
                 self._block_same_state_reentry(side)
                 self._exit(f"DEEPLOB_V2_EXIT:STATE_KEEPER_{quote_decision.reason}")
                 return
-        self._prune(side, float(received_ts))
 
     def on_prediction(
         self,
@@ -263,6 +282,9 @@ class LongOptionRegimeExecutor:
             self._exit("DEEPLOB_V2_EXIT:MARKET_CLOSE")
 
     def health(self) -> dict:
+        with self._history_lock:
+            samples = {side: len(values) for side, values in self.history.items()}
+            future_samples = len(self.future_history)
         return {
             "profile": self.profile,
             "strategy": self.strategy,
@@ -272,8 +294,8 @@ class LongOptionRegimeExecutor:
             "state_confirmations": self._candidate_count,
             "entry_rearm_state": self._entry_rearm_state or None,
             "expiry_cycle": dict(self._expiry_cycle),
-            "samples": {side: len(values) for side, values in self.history.items()},
-            "future_samples": len(self.future_history),
+            "samples": samples,
+            "future_samples": future_samples,
             "v1_books": dict(self._last_v1_books),
             "position_keeper": self._position_keeper.snapshot,
             "open_positions": len(self.paper_trader.positions),
@@ -475,8 +497,15 @@ class LongOptionRegimeExecutor:
         }
         return {"frames": timeframes, "groups": groups}
 
-    def _leg_metrics(self, side: str) -> dict | None:
-        values = self.history[side]
+    def _option_history_snapshot(self) -> dict[str, tuple]:
+        with self._history_lock:
+            return {
+                side: tuple(values) for side, values in self.history.items()
+            }
+
+    def _leg_metrics(self, side: str, values=None) -> dict | None:
+        if values is None:
+            values = self._option_history_snapshot()[side]
         if len(values) < self.settings.minimum_samples:
             return None
         now_ts, last, last_bid, last_ask = values[-1]
@@ -528,19 +557,22 @@ class LongOptionRegimeExecutor:
         )
         if future_ltp <= 0:
             return None
-        if not self.future_history or (
-            received_ts > self.future_history[-1][0]
-            or future_ltp != self.future_history[-1][1]
-        ):
-            self.future_history.append((received_ts, future_ltp))
-        if not self.pressure_history or (
-            received_ts > self.pressure_history[-1][0]
-            or pressure != self.pressure_history[-1][1]
-        ):
-            self.pressure_history.append((received_ts, pressure))
-        self._prune_future(received_ts)
+        with self._history_lock:
+            if not self.future_history or (
+                received_ts > self.future_history[-1][0]
+                or future_ltp != self.future_history[-1][1]
+            ):
+                self.future_history.append((received_ts, future_ltp))
+            if not self.pressure_history or (
+                received_ts > self.pressure_history[-1][0]
+                or pressure != self.pressure_history[-1][1]
+            ):
+                self.pressure_history.append((received_ts, pressure))
+            self._prune_future(received_ts)
+            future_values = tuple(self.future_history)
+            pressure_values = tuple(self.pressure_history)
         cutoff = received_ts - self.settings.observation_sec
-        window = [item for item in self.future_history if item[0] >= cutoff]
+        window = [item for item in future_values if item[0] >= cutoff]
         if len(window) < self.settings.minimum_samples or window[0][1] <= 0:
             return None
         elapsed = max(window[-1][0] - window[0][0], 0.001)
@@ -554,10 +586,10 @@ class LongOptionRegimeExecutor:
             "short_change_pct": -change_pct,
             "velocity_pct_sec": change_pct / elapsed,
             "range_pct": range_pct,
-            **self._trajectory_metrics(self.future_history, 1),
-            "timeframes": self._timeframe_metrics(self.future_history, 1),
+            **self._trajectory_metrics(future_values, 1),
+            "timeframes": self._timeframe_metrics(future_values, 1),
             "pressure_timeframes": self._signal_timeframe_metrics(
-                self.pressure_history
+                pressure_values
             ),
         }
 
@@ -684,8 +716,9 @@ class LongOptionRegimeExecutor:
 
     def _derive_evidence(self, composite, paper_action, confidence, metadata) -> dict | None:
         self._refresh_expiry_cycle()
-        ce = self._leg_metrics("CE")
-        pe = self._leg_metrics("PE")
+        option_history = self._option_history_snapshot()
+        ce = self._leg_metrics("CE", option_history["CE"])
+        pe = self._leg_metrics("PE", option_history["PE"])
         future = self._future_metrics(composite)
         if ce is None or pe is None or future is None:
             return None
