@@ -89,6 +89,19 @@ def composite(pressure, *, future_ltp=24350.0, received_ts=None):
 
 def evidence(*, ce_change=1.0, pe_change=-1.0, pressure=0.2):
     direction = 1.0 if ce_change > pe_change else -1.0
+    timeframe_groups = {
+        name: {"ready": True, "direction": direction * strength, "frames": frames}
+        for name, strength, frames in (
+            ("short", 0.8, 4),
+            ("medium", 0.6, 2),
+            ("long", 0.4, 2),
+        )
+    }
+    timeframe_groups["overall"] = {
+        "ready": True,
+        "direction": direction * 0.6,
+        "groups": 3,
+    }
     return {
         "ce": {
             "ltp": 101.0,
@@ -131,6 +144,7 @@ def evidence(*, ce_change=1.0, pe_change=-1.0, pressure=0.2):
             "hybrid_ready": False,
             "hybrid_agreement": True,
         },
+        "timeframe_state": {"frames": {}, "groups": timeframe_groups},
         "model_action": "BUY_CE" if pressure >= 0 else "BUY_PE",
         "model_confidence": 0.8,
         "state_score": 0.9,
@@ -188,7 +202,7 @@ def test_v1_bullish_state_retains_profit_then_independently_confirms_pe():
     assert executor.health()["v1_state"] == "UNCERTAIN"
 
     base = 1_800_000_000.0
-    for index in range(8):
+    for index in range(70):
         publish_pair(
             executor,
             base + index,
@@ -202,15 +216,15 @@ def test_v1_bullish_state_retains_profit_then_independently_confirms_pe():
     assert executor.health()["v1_state"] == "BULLISH_EXPANSION"
     assert list(trader.positions) == [101]
 
-    for index in range(8, 18):
+    for index in range(70, 140):
         publish_pair(
             executor,
             base + index,
-            111.0 - (index - 7) * 1.5,
-            93.0 + (index - 7) * 2.0,
+            203.5 - (index - 69) * 1.5,
+            31.0 + (index - 69) * 2.0,
             "BUY_PE",
             -0.20,
-            future_ltp=24364.0 - (index - 7) * 3.0,
+            future_ltp=24488.0 - (index - 69) * 3.0,
         )
 
     assert list(trader.positions) == [102]
@@ -540,6 +554,7 @@ def test_continued_state_and_price_decay_captures_positive_mfe_in_summary():
 
     weaker = evidence(pressure=0.05)
     weaker["v1_books"]["direction_score"] = 0.2
+    executor._last_evidence = weaker
     executor.on_quote(101, "NIFTY_CE", 104.0, bid=104.0, ask=104.1, received_ts=now + 1)
     executor._manage_open_position(weaker, "BULLISH_EXPANSION")
     assert list(trader.positions) == [101]
@@ -556,9 +571,155 @@ def test_continued_state_and_price_decay_captures_positive_mfe_in_summary():
     assert sink.records[0]["CapturedGrossPnl"] == 195.0
     assert sink.records[0]["surrendered_mfe"] == 130.0
     assert sink.records[0]["mfe_capture_ratio"] == 0.6
+    assert sink.records[0]["keeper_timeframe_short_support"] == 0.8
+    assert sink.records[0]["keeper_timeframe_medium_support"] == 0.6
+    assert sink.records[0]["keeper_timeframe_long_support"] == 0.4
+    assert sink.records[0]["keeper_timeframe_overall_support"] == 0.6
+    assert sink.records[0]["keeper_timeframe_ready_groups"] == 3
+    assert sink.records[0]["v1_exit_timeframe_groups"]["short"]["ready"]
 
 
-def test_catastrophic_guard_requires_repeated_aligned_depth_evidence():
+def test_earned_move_exits_after_state_defence_and_quote_confirmation():
+    trader = FakePaperTrader()
+    sink = FakeSink()
+    executor = LongOptionRegimeExecutor(settings(), trader, trade_summary_sink=sink)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    trader.on_entry(101, "NIFTY_CE", "LONG", 100.0)
+    executor._state = "BULLISH_EXPANSION"
+    executor._instant_state = "BULLISH_EXPANSION"
+    now = time.time()
+
+    executor.on_quote(101, "NIFTY_CE", 101.5, bid=101.5, ask=101.6, received_ts=now)
+    executor._manage_open_position(evidence(), "BULLISH_EXPANSION")
+
+    weaker = evidence(pressure=0.05)
+    weaker["v1_books"]["direction_score"] = 0.2
+    executor.on_quote(101, "NIFTY_CE", 101.0, bid=101.0, ask=101.1, received_ts=now + 1)
+    executor._manage_open_position(weaker, "BULLISH_EXPANSION")
+    assert executor.health()["position_keeper"]["phase"] == "PULLBACK"
+    assert list(trader.positions) == [101]
+
+    executor.on_quote(
+        101,
+        "NIFTY_CE",
+        100.95,
+        bid=100.95,
+        ask=101.0,
+        received_ts=now + 2,
+    )
+
+    assert trader.positions == {}
+    assert sink.records[0]["gross_pnl"] > sink.records[0]["fee"]
+    assert sink.records[0]["net_pnl"] > 0.0
+    assert sink.records[0]["exit_reason"] == (
+        "DEEPLOB_V2_EXIT:STATE_KEEPER_QUOTE_CONFIRMED_EARNED_MOVE_DECAY"
+    )
+
+
+def test_repeated_price_state_divergence_invalidates_losing_entry():
+    trader = FakePaperTrader()
+    sink = FakeSink()
+    executor = LongOptionRegimeExecutor(settings(), trader, trade_summary_sink=sink)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    trader.on_entry(101, "NIFTY_CE", "LONG", 100.0)
+    executor._state = "BULLISH_EXPANSION"
+    executor._instant_state = "BULLISH_EXPANSION"
+    now = time.time()
+
+    executor.on_quote(101, "NIFTY_CE", 99.5, bid=99.5, ask=99.6, received_ts=now)
+    executor._manage_open_position(evidence(), "BULLISH_EXPANSION")
+    executor.on_quote(101, "NIFTY_CE", 99.0, bid=99.0, ask=99.1, received_ts=now + 1)
+    executor._manage_open_position(evidence(), "BULLISH_EXPANSION")
+    assert executor.health()["position_keeper"]["phase"] == "PRICE_DIVERGENCE"
+
+    executor.on_quote(101, "NIFTY_CE", 98.5, bid=98.5, ask=98.6, received_ts=now + 2)
+    executor._manage_open_position(evidence(), "BULLISH_EXPANSION")
+
+    assert trader.positions == {}
+    assert sink.records[0]["exit_reason"] == (
+        "DEEPLOB_V2_EXIT:STATE_KEEPER_QUOTE_CONFIRMED_ENTRY_THESIS_FAILURE"
+    )
+
+
+def test_all_requested_market_timeframes_are_measured():
+    rows = [
+        (float(second), 100.0 + second * 0.01)
+        for second in range(3601)
+    ]
+
+    timeframes = LongOptionRegimeExecutor._timeframe_metrics(rows, 1)
+
+    assert list(timeframes) == [
+        "1s",
+        "5s",
+        "10s",
+        "30s",
+        "1m",
+        "4m",
+        "15m",
+        "1h",
+    ]
+    assert all(frame["ready"] for frame in timeframes.values())
+    assert all(frame["direction"] > 0.0 for frame in timeframes.values())
+
+
+def test_depth_pressure_is_retained_across_all_market_timeframes():
+    samples = [
+        (float(second), 0.75 if second >= 1800 else 0.25)
+        for second in range(3601)
+    ]
+
+    timeframes = LongOptionRegimeExecutor._signal_timeframe_metrics(samples)
+
+    assert list(timeframes) == [
+        "1s",
+        "5s",
+        "10s",
+        "30s",
+        "1m",
+        "4m",
+        "15m",
+        "1h",
+    ]
+    assert all(frame["ready"] for frame in timeframes.values())
+    assert timeframes["1s"]["direction"] == 0.75
+    assert timeframes["1h"]["direction"] > 0.0
+    assert timeframes["1h"]["persistence"] == 1.0
+
+
+def test_short_timeframe_contradiction_blocks_directional_entry_state():
+    executor = LongOptionRegimeExecutor(settings(), FakePaperTrader())
+    aligned = evidence()
+    assert executor._classify(aligned) == "BULLISH_EXPANSION"
+
+    contradicted = evidence()
+    contradicted["timeframe_state"]["groups"]["short"]["direction"] = -0.8
+
+    assert executor._classify(contradicted) == "UNCERTAIN"
+
+
+def test_medium_timeframe_must_be_ready_and_aligned_before_entry():
+    executor = LongOptionRegimeExecutor(settings(), FakePaperTrader())
+    missing_context = evidence()
+    missing_context["timeframe_state"]["groups"]["medium"]["ready"] = False
+    assert executor._classify(missing_context) == "UNCERTAIN"
+
+    opposing_context = evidence()
+    opposing_context["timeframe_state"]["groups"]["medium"]["direction"] = -0.6
+    assert executor._classify(opposing_context) == "UNCERTAIN"
+
+
+def test_catastrophic_guard_requires_repeated_boundary_breaches():
     trader = FakePaperTrader()
     executor = LongOptionRegimeExecutor(settings(), trader)
     executor.register_contracts(
@@ -594,6 +755,62 @@ def test_catastrophic_guard_requires_repeated_aligned_depth_evidence():
     assert executor._catastrophic_guard_triggered(
         "CE", position, adverse, "BEARISH_EXPANSION"
     )
+
+
+def test_catastrophic_guard_cannot_be_vetoed_by_supporting_model_state():
+    trader = FakePaperTrader()
+    executor = LongOptionRegimeExecutor(settings(), trader)
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    trader.on_entry(
+        101,
+        "NIFTY_CE",
+        "LONG",
+        100.0,
+        metadata={"entry_option_spread": 0.05},
+    )
+    executor.on_quote(
+        101,
+        "NIFTY_CE",
+        89.5,
+        bid=89.0,
+        ask=90.0,
+        received_ts=time.time(),
+    )
+    position = trader.positions[101]
+    supporting = evidence(ce_change=2.0, pe_change=-2.0, pressure=0.5)
+
+    assert not executor._catastrophic_guard_triggered(
+        "CE", position, supporting, "BULLISH_EXPANSION"
+    )
+    assert not executor._catastrophic_guard_triggered(
+        "CE", position, supporting, "BULLISH_EXPANSION"
+    )
+    assert executor._catastrophic_guard_triggered(
+        "CE", position, supporting, "BULLISH_EXPANSION"
+    )
+
+
+def test_neutral_transition_does_not_unlock_same_side_reentry():
+    executor = LongOptionRegimeExecutor(settings(), FakePaperTrader())
+    executor._state = "BULLISH_EXPANSION"
+    executor._candidate = "BULLISH_EXPANSION"
+    executor._candidate_count = settings().state_confirmations
+    executor._block_same_state_reentry("CE")
+
+    executor._advance_state("UNCERTAIN")
+    executor._advance_state("UNCERTAIN")
+    assert executor.health()["v1_state"] == "UNCERTAIN"
+    assert executor.health()["entry_rearm_state"] == "BULLISH_EXPANSION"
+
+    executor._advance_state("BEARISH_EXPANSION")
+    executor._advance_state("BEARISH_EXPANSION")
+    assert executor.health()["v1_state"] == "BEARISH_EXPANSION"
+    assert executor.health()["entry_rearm_state"] is None
 
 
 def test_expiry_cycle_marks_tuesday_expiry_as_day_five():
