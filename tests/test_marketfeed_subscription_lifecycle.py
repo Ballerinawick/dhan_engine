@@ -29,6 +29,18 @@ class MarketFeedSubscriptionLifecycleTests(unittest.TestCase):
         self.assertEqual(payloads[0]["InstrumentCount"], 2)
         self.assertEqual(payloads[1]["InstrumentCount"], 2)
 
+    def test_refresh_is_skipped_while_rate_limited(self):
+        client = DhanLiveMarketFeedWS(token="token", client_id="client")
+        client._ws = Mock()
+        client._connected.set()
+        client._connection_id = "test-rate-limit"
+        client._subs = [{"ExchangeSegment": "NSE_FNO", "SecurityId": "101", "tag": "NIFTY_FUT"}]
+        client._sub_keys = {("NSE_FNO", "101")}
+        client._blocked_until_ts = 10**18
+
+        self.assertFalse(client.refresh_full_subscriptions(reason="rate_limited_test"))
+        self.assertEqual(client._ws.send.call_count, 0)
+
     def test_wait_closed_reports_live_thread(self):
         client = DhanLiveMarketFeedWS(token="token", client_id="client")
         blocker = threading.Event()

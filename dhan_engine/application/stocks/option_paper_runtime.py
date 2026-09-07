@@ -496,10 +496,12 @@ class StockOptionPaperRuntime:
                 profile.selection_failures += 1
                 logger.warning(
                     "STOCK_OPTION_SELECTION_RETRY | symbol=%s | reason=FUTURE_QUOTE_UNAVAILABLE | "
-                    "attempts=%s | failures=%s",
+                    "attempts=%s | failures=%s | quote_age_sec=%.2f | feed_blocked=%s",
                     profile.root,
                     profile.selection_attempts,
                     profile.selection_failures,
+                    age,
+                    time.time() < self.fullquote_feed._effective_blocked_until() if hasattr(self.fullquote_feed, "_effective_blocked_until") else False,
                 )
                 continue
             try:
@@ -543,14 +545,20 @@ class StockOptionPaperRuntime:
                 )
         if subscriptions_changed:
             subscriptions = self._fullquote_subscriptions()
-            self.fullquote_feed.replace_subscriptions(
-                subscriptions, reason="stock_option_daily_contract_selection"
-            )
-            self.fullquote_feed.refresh_full_subscriptions(
-                reason="stock_option_daily_contract_selection"
-            )
-
-    def run(self) -> None:
+                if time.time() >= self.fullquote_feed._effective_blocked_until():
+                    self.fullquote_feed.replace_subscriptions(
+                        subscriptions, reason="stock_option_daily_contract_selection"
+                    )
+                    self.fullquote_feed.refresh_full_subscriptions(
+                        reason="stock_option_daily_contract_selection"
+                    )
+                else:
+                    logger.warning(
+                        "STOCK_OPTION_SELECTION_DEFERRED | reason=FULLQUOTE_RATE_LIMITED | "
+                        "symbol=%s | selection_date=%s",
+                        profile.root,
+                        now_ist.date(),
+                    )
         depth_instruments = [
             ("NSE_FNO", int(profile.future["security_id"]), profile.future_tag)
             for profile in self.profiles.values()
