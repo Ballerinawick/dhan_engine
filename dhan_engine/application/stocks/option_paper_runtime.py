@@ -545,20 +545,15 @@ class StockOptionPaperRuntime:
                 )
         if subscriptions_changed:
             subscriptions = self._fullquote_subscriptions()
-                if time.time() >= self.fullquote_feed._effective_blocked_until():
-                    self.fullquote_feed.replace_subscriptions(
-                        subscriptions, reason="stock_option_daily_contract_selection"
-                    )
-                    self.fullquote_feed.refresh_full_subscriptions(
-                        reason="stock_option_daily_contract_selection"
-                    )
-                else:
-                    logger.warning(
-                        "STOCK_OPTION_SELECTION_DEFERRED | reason=FULLQUOTE_RATE_LIMITED | "
-                        "symbol=%s | selection_date=%s",
-                        profile.root,
-                        now_ist.date(),
-                    )
+            # Preserve the desired set during backoff; the feed gates wire refreshes.
+            self.fullquote_feed.replace_subscriptions(
+                subscriptions, reason="stock_option_daily_contract_selection"
+            )
+            self.fullquote_feed.refresh_full_subscriptions(
+                reason="stock_option_daily_contract_selection"
+            )
+
+    def run(self) -> None:
         depth_instruments = [
             ("NSE_FNO", int(profile.future["security_id"]), profile.future_tag)
             for profile in self.profiles.values()
