@@ -137,12 +137,16 @@ class StateDrivenPositionKeeper:
             not medium_ready or premium_medium <= 0.0
         )
         state_defensive = (
-            previous.timeframe_short_support < 0.0
-            or previous.timeframe_overall_support < 0.0
+            (
+                previous.timeframe_short_support < 0.0
+                and (
+                    previous.timeframe_medium_support < 0.0
+                    or previous.timeframe_overall_support < 0.0
+                )
+            )
             or previous.reason
             in {
                 "EARNED_MOVE_PULLBACK",
-                "MULTITIMEFRAME_STATE_CHALLENGE",
                 "PRICE_STATE_DIVERGENCE",
                 "OPPOSING_STATE_CHALLENGE",
             }
@@ -276,7 +280,13 @@ class StateDrivenPositionKeeper:
             and gross_pnl < 0.0
             and price_weakening
             and premium_adverse
-            and (supportive or timeframe_reversal)
+            and (
+                timeframe_reversal
+                or (
+                    (opposing_state or exhaustion_state)
+                    and support_weakening
+                )
+            )
         )
         continued_price_divergence = (
             price_state_divergence and previous_phase == "PRICE_DIVERGENCE"

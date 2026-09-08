@@ -111,6 +111,14 @@ def evidence(*, ce_change=1.0, pe_change=-1.0, pressure=0.2):
             "velocity_pct_sec": ce_change / 10.0,
             "acceleration": ce_change / 100.0,
             "range_pct": abs(ce_change),
+            "executable_timeframes": {
+                label: {
+                    "ready": True,
+                    "direction": 1.0 if ce_change > 0 else -1.0,
+                    "executable_move": ce_change,
+                }
+                for label in ("1s", "5s", "10s", "30s", "1m", "4m")
+            },
         },
         "pe": {
             "ltp": 99.0,
@@ -118,6 +126,14 @@ def evidence(*, ce_change=1.0, pe_change=-1.0, pressure=0.2):
             "velocity_pct_sec": pe_change / 10.0,
             "acceleration": pe_change / 100.0,
             "range_pct": abs(pe_change),
+            "executable_timeframes": {
+                label: {
+                    "ready": True,
+                    "direction": 1.0 if pe_change > 0 else -1.0,
+                    "executable_move": pe_change,
+                }
+                for label in ("1s", "5s", "10s", "30s", "1m", "4m")
+            },
         },
         "directional_pct": ce_change - pe_change,
         "velocity_spread": (ce_change - pe_change) / 10.0,
@@ -143,7 +159,7 @@ def evidence(*, ce_change=1.0, pe_change=-1.0, pressure=0.2):
             "direction_score": 0.8 * direction,
             "bull_support": 4 if direction > 0 else 0,
             "bear_support": 4 if direction < 0 else 0,
-            "hybrid_ready": False,
+            "hybrid_ready": True,
             "hybrid_agreement": True,
         },
         "timeframe_state": {"frames": {}, "groups": timeframe_groups},
@@ -379,7 +395,7 @@ def test_bullish_exhaustion_requires_persistent_state_failure_before_exit():
     assert executor.health()["entries"] == 0
 
 
-def test_state_confirmed_entry_does_not_use_fixed_profit_forecast_gate():
+def test_state_entry_requires_observed_executable_cost_coverage():
     trader = FakePaperTrader()
     executor = LongOptionRegimeExecutor(settings(), trader)
     executor.register_contracts(
@@ -392,8 +408,10 @@ def test_state_confirmed_entry_does_not_use_fixed_profit_forecast_gate():
     executor.on_quote(101, "NIFTY_CE", 100.0, bid=99.95, ask=100.0, received_ts=now)
     executor.on_quote(102, "NIFTY_PE", 100.0, bid=99.95, ask=100.0, received_ts=now)
 
-    executor._try_entry("CE", evidence(ce_change=0.01, pe_change=-0.01),)
+    executor._try_entry("CE", evidence(ce_change=0.01, pe_change=-0.01))
 
+    assert not trader.positions
+    executor._try_entry("CE", evidence(ce_change=2.0, pe_change=-1.0))
     assert list(trader.positions) == [101]
 
 
@@ -623,7 +641,7 @@ def test_earned_move_exits_after_state_defence_and_quote_confirmation():
     )
 
 
-def test_repeated_price_state_divergence_invalidates_losing_entry():
+def test_losing_premium_needs_state_deterioration_before_exit():
     trader = FakePaperTrader()
     sink = FakeSink()
     executor = LongOptionRegimeExecutor(settings(), trader, trade_summary_sink=sink)
@@ -642,15 +660,41 @@ def test_repeated_price_state_divergence_invalidates_losing_entry():
     executor._manage_open_position(evidence(), "BULLISH_EXPANSION")
     executor.on_quote(101, "NIFTY_CE", 99.0, bid=99.0, ask=99.1, received_ts=now + 1)
     executor._manage_open_position(evidence(), "BULLISH_EXPANSION")
-    assert executor.health()["position_keeper"]["phase"] == "PRICE_DIVERGENCE"
+    assert executor.health()["position_keeper"]["phase"] == "SUPPORTED"
 
     executor.on_quote(101, "NIFTY_CE", 98.5, bid=98.5, ask=98.6, received_ts=now + 2)
     executor._manage_open_position(evidence(), "BULLISH_EXPANSION")
 
-    assert trader.positions == {}
-    assert sink.records[0]["exit_reason"] == (
-        "DEEPLOB_V2_EXIT:STATE_KEEPER_QUOTE_CONFIRMED_ENTRY_THESIS_FAILURE"
-    )
+    assert trader.positions
+    assert not sink.records
+
+    bearish = evidence(ce_change=-1.0, pe_change=1.0, pressure=-0.2)
+    executor._state = "BEARISH_EXPANSION"
+    executor._manage_open_position(bearish, "BEARISH_EXPANSION")
+    assert executor.health()["position_keeper"]["action"] == "DEFEND"
+    executor.on_quote(101, "NIFTY_CE", 98.0, bid=98.0, ask=98.1, received_ts=now + 3)
+    assert not trader.positions
+    assert sink.records[0]["exit_reason"].endswith("QUOTE_CONFIRMED_ENTRY_THESIS_FAILURE")
+
+
+def test_invalid_and_older_quotes_cannot_change_position_or_history():
+    trader = FakePaperTrader()
+    executor = LongOptionRegimeExecutor(settings(), trader)
+    executor.register_contracts({"CE": {"security_id": 101, "strike": 24350}})
+    trader.on_entry(101, "NIFTY_CE", "LONG", 100.0)
+    now = time.time()
+    executor.on_quote(101, "NIFTY_CE", 100.0, bid=99.9, ask=100.0, received_ts=now)
+    before = tuple(executor.history["CE"])
+    for bid, ask, timestamp in (
+        (110.0, 100.0, now + 1),
+        (float("nan"), 100.0, now + 1),
+        (90.0, 90.1, now - 1),
+        (90.0, 90.1, now),
+    ):
+        executor.on_quote(101, "NIFTY_CE", 90.0, bid=bid, ask=ask, received_ts=timestamp)
+    assert tuple(executor.history["CE"]) == before
+    assert trader.positions[101]["ltp"] == 100.0
+    assert executor.quotes[101]["bid"] == 99.9
 
 
 def test_all_requested_market_timeframes_are_measured():
@@ -759,6 +803,57 @@ def test_short_timeframe_contradiction_blocks_directional_entry_state():
     contradicted["timeframe_state"]["groups"]["short"]["direction"] = -0.8
 
     assert executor._classify(contradicted) == "UNCERTAIN"
+
+
+def test_quote_and_prediction_callbacks_share_one_decision_lock():
+    executor = LongOptionRegimeExecutor(settings(), FakePaperTrader())
+    executor.register_contracts(
+        {
+            "CE": {"security_id": 101, "strike": 24350},
+            "PE": {"security_id": 102, "strike": 24350},
+        }
+    )
+    executor._derive_evidence = lambda *args, **kwargs: evidence()
+    executor._classify = lambda current: "UNCERTAIN"
+    quote_finished = Event()
+    prediction_finished = Event()
+
+    def publish_quote():
+        executor.on_quote(
+            101,
+            "NIFTY_CE",
+            101.0,
+            bid=100.95,
+            ask=101.05,
+            received_ts=time.time(),
+        )
+        quote_finished.set()
+
+    def publish_prediction():
+        executor.on_prediction(
+            paper_action="BUY_CE",
+            confidence=0.8,
+            composite=composite(0.2),
+            probability_down=0.1,
+            probability_flat=0.1,
+            probability_up=0.8,
+            model_version="test",
+            horizon_sec=30,
+        )
+        prediction_finished.set()
+
+    with executor._decision_lock:
+        quote_writer = Thread(target=publish_quote)
+        prediction_writer = Thread(target=publish_prediction)
+        quote_writer.start()
+        prediction_writer.start()
+        assert not quote_finished.wait(timeout=0.05)
+        assert not prediction_finished.wait(timeout=0.05)
+
+    quote_writer.join(timeout=1.0)
+    prediction_writer.join(timeout=1.0)
+    assert quote_finished.is_set()
+    assert prediction_finished.is_set()
 
 
 def test_medium_timeframe_must_be_ready_and_aligned_before_entry():

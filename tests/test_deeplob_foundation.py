@@ -13,7 +13,11 @@ from dhan_engine.analytics.deeplob_recorder import (
     DepthRecorderSettings,
     ParquetDepthRecorder,
 )
-from dhan_engine.application.deeplob.live_runtime import DeepLobLiveSettings, DeepLobLiveRuntime
+from dhan_engine.application.deeplob.live_runtime import (
+    DeepLobLiveSettings,
+    DeepLobLiveRuntime,
+    _state_driven_execution_only,
+)
 from dhan_engine.application.deeplob.liquidity_pulse_scalp import (
     LiquidityPulseScalpRuntime,
 )
@@ -61,6 +65,12 @@ def snapshot(name="NIFTY_FUT"):
 
 
 class DeepLobFoundationTest(unittest.TestCase):
+    def test_state_driven_execution_is_the_default_runtime_policy(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(_state_driven_execution_only())
+        with patch.dict(os.environ, {"DEEPLOB_STATE_DRIVEN_ONLY": "0"}):
+            self.assertFalse(_state_driven_execution_only())
+
     def test_nifty_resolution_excludes_similarly_named_index(self):
         import pandas as pd
 

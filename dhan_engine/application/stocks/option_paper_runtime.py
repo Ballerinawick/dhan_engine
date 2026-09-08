@@ -543,6 +543,7 @@ class StockOptionPaperRuntime:
                 )
         if subscriptions_changed:
             subscriptions = self._fullquote_subscriptions()
+            # Preserve the desired set during backoff; the feed gates wire refreshes.
             self.fullquote_feed.replace_subscriptions(
                 subscriptions, reason="stock_option_daily_contract_selection"
             )

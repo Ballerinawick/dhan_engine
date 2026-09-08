@@ -50,6 +50,15 @@ from dhan_engine.domain.market.liquidity_event_state import LiquidityEventTracke
 logger = logging.getLogger(__name__)
 
 
+def _state_driven_execution_only() -> bool:
+    return os.getenv("DEEPLOB_STATE_DRIVEN_ONLY", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 @dataclass(frozen=True)
 class DeepLobLiveSettings:
     inference: DeepLobInferenceSettings
@@ -500,6 +509,7 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
     recorder = ParquetDepthRecorder(settings.recorder)
     option_paper_settings = DeepLobOptionPaperSettings.from_env()
     regime_v2_settings = LongOptionRegimeSettings.from_env()
+    state_driven_only = _state_driven_execution_only()
     scalp_paper_settings = DeepLobOptionPaperSettings.from_env(
         "DEEPLOB_SCALP_PAPER",
         defaults={
@@ -556,12 +566,26 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
             "MIN_HOLD_SEC": "5",
         },
     )
+    if state_driven_only and not regime_v2_settings.enabled:
+        raise RuntimeError(
+            "DEEPLOB_STATE_DRIVEN_ONLY requires DEEPLOB_REGIME_V2_ENABLED=1"
+        )
+    if state_driven_only:
+        logger.warning(
+            "DEEPLOB_STATE_DRIVEN_EXECUTION_ONLY | active_profile=regime_v2 | "
+            "legacy_dynamic=false | legacy_scalp=false | legacy_reversal=false | "
+            "normal_exits=state_keeper | fixed_exits=catastrophic,market_close"
+        )
     if (
-        option_paper_settings.enabled
+        (option_paper_settings.enabled and not state_driven_only)
         or regime_v2_settings.enabled
-        or scalp_paper_settings.enabled
-        or adaptive_scalp_settings.enabled
-        or (reversal_runtime_settings.enabled and reversal_paper_settings.enabled)
+        or (scalp_paper_settings.enabled and not state_driven_only)
+        or (adaptive_scalp_settings.enabled and not state_driven_only)
+        or (
+            reversal_runtime_settings.enabled
+            and reversal_paper_settings.enabled
+            and not state_driven_only
+        )
     ):
         option_selector = OptionChainSelector(
             access_token=inference_settings.access_token,
@@ -576,7 +600,7 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
             TradeSummaryS3Settings.from_env()
         )
         paper_executors = []
-        if option_paper_settings.enabled:
+        if option_paper_settings.enabled and not state_driven_only:
             paper_executors.append(
                 DeepLobOptionPaperExecutor(
                     option_paper_settings,
@@ -599,7 +623,7 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
                 "v2=long_only_ce_pe_execution | isolated_portfolio=true | "
                 "extra_broker_connections=0 | extra_subscriptions=0 | s3_profile=regime_v2"
             )
-        if scalp_paper_settings.enabled:
+        if scalp_paper_settings.enabled and not state_driven_only:
             paper_executors.append(
                 DeepLobOptionPaperExecutor(
                     scalp_paper_settings,
@@ -616,7 +640,7 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
                 "shared_live_evidence=true",
                 ",".join(executor.profile for executor in paper_executors),
             )
-        if adaptive_scalp_settings.enabled:
+        if adaptive_scalp_settings.enabled and not state_driven_only:
             scalp_option_paper = DeepLobOptionPaperExecutor(
                 adaptive_scalp_settings,
                 PaperTradeManager(capital=adaptive_scalp_settings.capital),
@@ -628,7 +652,11 @@ def build_deeplob_live_runtime(settings: DeepLobLiveSettings) -> DeepLobLiveRunt
                 LiquidityPulseScalpSettings.from_env(),
                 prediction_sink=scalp_option_paper.on_prediction,
             )
-        if reversal_runtime_settings.enabled and reversal_paper_settings.enabled:
+        if (
+            reversal_runtime_settings.enabled
+            and reversal_paper_settings.enabled
+            and not state_driven_only
+        ):
             reversal_option_paper = DeepLobOptionPaperExecutor(
                 reversal_paper_settings,
                 PaperTradeManager(capital=reversal_paper_settings.capital),

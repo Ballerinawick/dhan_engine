@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import statistics
 import time
@@ -112,6 +113,7 @@ class LongOptionRegimeExecutor:
         self.paper_trader = paper_trader
         self.trade_summary_sink = trade_summary_sink
         self._history_lock = RLock()
+        self._decision_lock = RLock()
         self.contracts: dict[str, dict] = {}
         self.quotes: dict[int, dict] = {}
         self.history = {"CE": deque(maxlen=16384), "PE": deque(maxlen=16384)}
@@ -135,8 +137,14 @@ class LongOptionRegimeExecutor:
         self._last_v1_books: dict = {}
         self._v1_ledger = ExecutableStrategyLedger()
         self._position_keeper = StateDrivenPositionKeeper()
+        self._last_evidence_clock = None
 
     def register_contracts(self, selection: Mapping[str, Mapping]) -> list[dict]:
+        with self._decision_lock:
+            return self._register_contracts(selection)
+
+    def _register_contracts(self, selection: Mapping[str, Mapping]) -> list[dict]:
+        self._last_evidence_clock = None
         subscriptions = []
         selected = set()
         with self._history_lock:
@@ -180,6 +188,10 @@ class LongOptionRegimeExecutor:
         return subscriptions
 
     def on_quote(self, secid, tag, ltp, *, bid, ask, received_ts) -> None:
+        with self._decision_lock:
+            self._on_quote_locked(secid, tag, ltp, bid=bid, ask=ask, received_ts=received_ts)
+
+    def _on_quote_locked(self, secid, tag, ltp, *, bid, ask, received_ts) -> None:
         secid = int(secid)
         quote = {
             "tag": tag,
@@ -188,6 +200,16 @@ class LongOptionRegimeExecutor:
             "ask": float(ask or 0.0),
             "received_ts": float(received_ts),
         }
+        previous = self.quotes.get(secid)
+        if (
+            not all(math.isfinite(quote[key]) for key in ("ltp", "bid", "ask", "received_ts"))
+            or quote["ltp"] <= 0.0
+            or quote["bid"] <= 0.0
+            or quote["ask"] < quote["bid"]
+            or quote["received_ts"] <= 0.0
+            or (previous is not None and quote["received_ts"] <= previous["received_ts"])
+        ):
+            return
         with self._history_lock:
             side = next(
                 (
@@ -211,7 +233,10 @@ class LongOptionRegimeExecutor:
             self._prune(side, float(received_ts))
         self.paper_trader.on_tick(secid, float(ltp))
         position = self.paper_trader.positions.get(secid)
-        if position is not None and float(bid or 0.0) > 0.0:
+        if (
+            position is not None
+            and time.time() - quote["received_ts"] <= self.settings.max_quote_age_sec
+        ):
             quote_decision = self._position_keeper.observe_quote(
                 position=position,
                 side=side,
@@ -236,6 +261,32 @@ class LongOptionRegimeExecutor:
                 return
 
     def on_prediction(
+        self,
+        *,
+        paper_action,
+        confidence,
+        composite,
+        probability_down,
+        probability_flat,
+        probability_up,
+        model_version,
+        horizon_sec,
+        signal_metadata=None,
+    ) -> None:
+        with self._decision_lock:
+            self._on_prediction_locked(
+                paper_action=paper_action,
+                confidence=confidence,
+                composite=composite,
+                probability_down=probability_down,
+                probability_flat=probability_flat,
+                probability_up=probability_up,
+                model_version=model_version,
+                horizon_sec=horizon_sec,
+                signal_metadata=signal_metadata,
+            )
+
+    def _on_prediction_locked(
         self,
         *,
         paper_action,
@@ -276,12 +327,20 @@ class LongOptionRegimeExecutor:
         self._try_entry("CE" if self._state == "BULLISH_EXPANSION" else "PE", evidence)
 
     def heartbeat(self) -> None:
+        with self._decision_lock:
+            self._heartbeat_locked()
+
+    def _heartbeat_locked(self) -> None:
         if not self.paper_trader.has_open_position():
             return
         if datetime.now(self._timezone).time() >= self.settings.market_end:
             self._exit("DEEPLOB_V2_EXIT:MARKET_CLOSE")
 
     def health(self) -> dict:
+        with self._decision_lock:
+            return self._health_locked()
+
+    def _health_locked(self) -> dict:
         with self._history_lock:
             samples = {side: len(values) for side, values in self.history.items()}
             future_samples = len(self.future_history)
@@ -364,6 +423,7 @@ class LongOptionRegimeExecutor:
         change_pct = (last / first - 1.0) * 100.0
         return {
             "ready": observed_sec >= float(window_sec) * 0.8,
+            "executable_move": last - float(window[0][3]) if value_index == 2 else None,
             "samples": len(window),
             "observed_sec": observed_sec,
             "change_pct": change_pct,
@@ -542,6 +602,7 @@ class LongOptionRegimeExecutor:
             "received_ts": now_ts,
             **self._trajectory_metrics(values, 1),
             "timeframes": self._timeframe_metrics(values, 1),
+            "executable_timeframes": self._timeframe_metrics(values, 2),
         }
 
     def _future_metrics(self, composite) -> dict | None:
@@ -555,13 +616,12 @@ class LongOptionRegimeExecutor:
                 float(getattr(composite.features, "pressure_score", 0.0) or 0.0),
             ),
         )
-        if future_ltp <= 0:
+        if not math.isfinite(future_ltp) or future_ltp <= 0 or not math.isfinite(received_ts):
             return None
         with self._history_lock:
-            if not self.future_history or (
-                received_ts > self.future_history[-1][0]
-                or future_ltp != self.future_history[-1][1]
-            ):
+            if self.future_history and received_ts < self.future_history[-1][0]:
+                return None
+            if not self.future_history or received_ts > self.future_history[-1][0]:
                 self.future_history.append((received_ts, future_ltp))
             if not self.pressure_history or (
                 received_ts > self.pressure_history[-1][0]
@@ -582,6 +642,7 @@ class LongOptionRegimeExecutor:
         ) / window[0][1] * 100.0
         return {
             "ltp": future_ltp,
+            "received_ts": received_ts,
             "change_pct": change_pct,
             "short_change_pct": -change_pct,
             "velocity_pct_sec": change_pct / elapsed,
@@ -609,10 +670,11 @@ class LongOptionRegimeExecutor:
                 pe_ask=float(pe["ask"] or 0.0),
             )
         )
-        executable = ledger.get("books", {})
+        recent = self._v1_ledger.recent_changes(self.settings.observation_sec)
+        recent_books = recent.get("books", {})
 
         def book_pct(name: str, fallback: float = 0.0) -> float:
-            return float(executable.get(name, {}).get("pnl_pct", fallback) or 0.0)
+            return float(recent_books.get(name, {}).get("change_pct", fallback) or 0.0)
 
         future_long_pct = book_pct("future_long", future["change_pct"])
         future_short_pct = book_pct("future_short", future["short_change_pct"])
@@ -630,20 +692,15 @@ class LongOptionRegimeExecutor:
             ce["executable_change_pct"] - pe["executable_change_pct"],
             option_range,
         )
-        synthetic_strength = self._signed_strength(
-            synthetic_long_pct - synthetic_short_pct,
-            option_range * 2.0,
-        )
         pressure_strength = max(-1.0, min(1.0, pressure))
         fast_direction_score = (
-            future_strength + option_strength + synthetic_strength + pressure_strength
-        ) / 4.0
+            future_strength + option_strength + pressure_strength
+        ) / 3.0
         fast_bull_support = sum(
             value > 0.0
             for value in (
                 future["change_pct"],
                 ce["executable_change_pct"] - pe["executable_change_pct"],
-                synthetic_long_pct - synthetic_short_pct,
                 pressure,
             )
         )
@@ -652,7 +709,6 @@ class LongOptionRegimeExecutor:
             for value in (
                 future["change_pct"],
                 ce["executable_change_pct"] - pe["executable_change_pct"],
-                synthetic_long_pct - synthetic_short_pct,
                 pressure,
             )
         )
@@ -662,10 +718,6 @@ class LongOptionRegimeExecutor:
                 max(future["range_pct"] * 2.0, 0.0001),
             ),
             self._signed_strength(long_ce_pct - long_pe_pct, option_range),
-            self._signed_strength(
-                synthetic_long_pct - synthetic_short_pct,
-                option_range * 2.0,
-            ),
         )
         executable_direction_score = sum(executable_components) / len(
             executable_components
@@ -675,6 +727,7 @@ class LongOptionRegimeExecutor:
         hybrid_ready = bool(
             self.settings.hybrid_enabled
             and ledger.get("ready")
+            and recent.get("ready")
             and int(ledger.get("updates", 0)) >= self.settings.hybrid_min_updates
         )
         hybrid_agreement = bool(
@@ -712,6 +765,8 @@ class LongOptionRegimeExecutor:
             "executable_bull_support": executable_bull_support,
             "executable_bear_support": executable_bear_support,
             "executable_books": ledger,
+            "recent_books": recent,
+            "decision_basis": "RECENT_EXECUTABLE_BOOK_CHANGE",
         }
 
     def _derive_evidence(self, composite, paper_action, confidence, metadata) -> dict | None:
@@ -722,6 +777,13 @@ class LongOptionRegimeExecutor:
         future = self._future_metrics(composite)
         if ce is None or pe is None or future is None:
             return None
+        now_ts = time.time()
+        if any(now_ts - leg["received_ts"] > self.settings.max_quote_age_sec for leg in (ce, pe, future)):
+            return None
+        evidence_clock = (ce["received_ts"], pe["received_ts"], future["received_ts"])
+        if evidence_clock == self._last_evidence_clock:
+            return None
+        self._last_evidence_clock = evidence_clock
         pressure = float(getattr(composite.features, "pressure_score", 0.0) or 0.0)
         v1_books = self._derive_v1_books(ce, pe, future, pressure)
         self._last_v1_books = dict(v1_books)
@@ -762,8 +824,8 @@ class LongOptionRegimeExecutor:
         pe = evidence["pe"]
         books = evidence["v1_books"]
         score = evidence["state_score"]
-        hybrid_direction_confirmed = not books.get("hybrid_ready", False) or bool(
-            books.get("hybrid_agreement", False)
+        hybrid_direction_confirmed = not self.settings.hybrid_enabled or (
+            bool(books.get("hybrid_ready")) and bool(books.get("hybrid_agreement"))
         )
         timeframe_groups = evidence.get("timeframe_state", {}).get("groups", {})
         short_frame = timeframe_groups.get("short", {})
@@ -870,13 +932,39 @@ class LongOptionRegimeExecutor:
         ask = float((quote or {}).get("ask", 0.0) or 0.0)
         bid = float((quote or {}).get("bid", 0.0) or 0.0)
         age = time.time() - float((quote or {}).get("received_ts", 0.0) or 0.0)
-        if not contract or not quote or ask <= 0 or bid <= 0 or age > self.settings.max_quote_age_sec:
+        if not contract or not quote or ask <= 0 or bid <= 0 or bid > ask or age > self.settings.max_quote_age_sec:
             self._blocks += 1
             logger.info("DEEPLOB_V2_ENTRY_BLOCKED | reason=OPTION_QUOTE_NOT_EXECUTABLE | side=%s", side)
             return
         lot_size = int(self.paper_trader.LOT_SIZES["NIFTY"])
         spread_cost = max(0.0, ask - bid) * lot_size
+        leg = evidence.get(side.lower(), {})
+        frames = leg.get("executable_timeframes", {})
+        short = [frames[label] for label in TIMEFRAME_GROUPS["short"] if frames.get(label, {}).get("ready")]
+        medium = [frames[label] for label in TIMEFRAME_GROUPS["medium"] if frames.get(label, {}).get("ready")]
+        observed_net = max(
+            (float(frame.get("executable_move", 0.0) or 0.0) * lot_size - self.settings.round_trip_fee for frame in short),
+            default=0.0,
+        )
+        selected_book = evidence.get("v1_books", {}).get(f"long_{side.lower()}_pct", 0.0)
+        if not (
+            selected_book > 0.0
+            and short and medium
+            and statistics.median(frame["direction"] for frame in short) > 0.0
+            and statistics.median(frame["direction"] for frame in medium) > 0.0
+            and observed_net > 0.0
+        ):
+            self._blocks += 1
+            logger.info(
+                "DEEPLOB_V2_ENTRY_BLOCKED | reason=SELECTED_OPTION_NOT_EXECUTABLY_SUPPORTED | "
+                "side=%s | recent_book_pct=%+.4f | observed_net=%.2f | "
+                "short_frames=%s | medium_frames=%s | basis=OBSERVED_NOT_FORECAST",
+                side, selected_book, observed_net, len(short), len(medium),
+            )
+            return
         metadata = {
+            "v1_entry_observed_net": observed_net,
+            "v1_entry_economics_basis": "RECENT_EXECUTABLE_MOVE_NOT_FORECAST",
             "strategy": self.strategy,
             "profile": self.profile,
             "paper_profile": self.profile,
@@ -935,7 +1023,12 @@ class LongOptionRegimeExecutor:
         quote = self.quotes.get(int(secid), {})
         bid = float(quote.get("bid", 0.0) or 0.0)
         received_ts = float(quote.get("received_ts", 0.0) or 0.0)
-        if bid <= 0.0 or received_ts <= 0.0:
+        if (
+            bid <= 0.0
+            or bid > float(quote.get("ask", 0.0) or 0.0)
+            or received_ts <= 0.0
+            or time.time() - received_ts > self.settings.max_quote_age_sec
+        ):
             return
         decision = self._position_keeper.observe(
             position=position,
