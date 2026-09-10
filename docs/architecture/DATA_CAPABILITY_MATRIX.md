@@ -1,0 +1,28 @@
+# Data Capability Matrix
+
+This matrix records repository-proven capabilities only. A selector response is contract metadata, not historical quote coverage.
+
+| Data need | Repository evidence | Current status | Limitation / verification needed |
+|---|---|---|---|
+| NIFTY futures identity | `InstrumentMaster.get_nearest_future` resolves the nearest non-expired `FUTIDX` row; `DeepLobLiveRuntime.run` subscribes it through `FullDepth200Adapter` and Full Quote. | Available for current NIFTY runtime | One selected future per configured index; rollover and historical availability depend on master/capture data. |
+| NIFTY future LTP | Full Quote `on_fullquote` stores LTP; composite validation and inference consume `full_quote["ltp"]`. | Available when Full Quote is synchronized | LTP is not a substitute for full executable bid/ask in the V1 ledger, which labels futures `LTP_PROXY`. |
+| NIFTY future depth | `FullDepth200Adapter` and `QuoteDepth` support bid/ask arrays; DeepLOB uses 200-depth snapshots. | Available for subscribed future | Actual Dhan server limits and continuity remain external capabilities requiring verification. |
+| Selected NIFTY CE/PE pair | `OptionChainSelector.select_best` returns one CE and one PE; `DeepLobLiveRuntime._ensure_option_contracts` registers exactly two option subscriptions. | Available in current DeepLOB path | Pair only; selected strikes can change daily and option selection can fail or use cache. |
+| Multiple strikes | `select_atm_reverse_iron_fly` resolves ATM CE/PE plus upper CE/lower PE; `TimedStraddleRuntime` subscribes four IDs. | Selector and separate experiment available | Not subscribed by normal DeepLOB V1/V2 runtime; no generic multi-strike ledger or cross-strike recorder path. |
+| Expiry selection | `InstrumentMaster.get_nearest_option_expiry`, selector calls, and returned contract metadata carry expiry. | Available for selection | Exact weekly/monthly semantics and external API behavior require verification; repository implementation must remain source of truth. |
+| Strike and option type | Master filters `OPTIDX`; selector returns strike and CE/PE; `find_option_security_id` resolves exact expiry/strike/type. | Available for selected contracts | Does not establish that every requested strike is subscribed or historically persisted. |
+| Bid/ask | Full Quote parser exposes best bid/ask; option executors reject invalid/non-positive/non-monotonic quotes; timed straddle uses executable sides. | Available for live subscribed instruments when synchronized | Historical availability is only as good as recorder rows; missing quotes are not reconstructed. |
+| LTP | Full Quote callbacks pass LTP into executors and paper traders. | Available for subscribed instruments | LTP alone is insufficient for executable entry/exit claims. |
+| Depth | `QuoteDepth` contains arrays and raw data; recorder persists full-depth rows for configured instruments. | Available for NIFTY future and recorder-configured depth stream | Normal option subscriptions are Full Quote, not demonstrated option depth; external Dhan option depth capability is unverified. |
+| Lot size | Master fields such as `SEM_LOT_UNITS`; timed selector returns ATM lot size; `PaperTradeManager.LOT_SIZES` has static NIFTY defaults. | Available, with separate sources | DeepLOB regime entry uses `PaperTradeManager.LOT_SIZES["NIFTY"]`; consistency must be verified when contracts/expiry change. |
+| Timestamps and freshness | Full Quote stores `received_ts`; option handlers reject old/non-monotonic timestamps; composite validation checks quote age; recorder stores timestamps and received nanoseconds. | Available for runtime quality checks | Clock alignment and historical timestamp quality need replay validation. |
+| Historical replay | `ParquetDepthRecorder` writes depth/quote capture; `PostMarketAnalysisRuntime` reads S3 Parquet; TriWave has separate JSONL replay tools. | Partial | No generic multi-strike V1 replay engine; no proof that selected option bid/ask history exists for every strategy leg. |
+| Storage | Local Parquet output, optional S3 market-data partitions, S3 paper-trade summaries, Mongo trade summary sink, and TriWave JSONL. | Available by runtime | Storage schemas are path/runtime-specific and not yet a generic strategy/evidence event schema. |
+| Subscription constraints | `DhanLiveMarketFeedWS` deduplicates subscriptions and chunks at 100; `FullDepth200Adapter` has connection limits; option-chain REST is rate-limited in selector. | Repository constraints known | Dhan account/server limits, option-chain permissions, depth entitlement, message limits, and historical retention require external verification. |
+
+## Actual coverage versus proposed strategies
+
+- Current selected-pair V1 evidence can simulate the existing fixed future/CE/PE books when synchronized quotes are captured.
+- The four-leg reverse-iron-fly can be simulated by the separate `TimedStraddleRuntime` when all four live quotes are subscribed and fresh. This is not current generic V1 coverage.
+- Strategies with more than four legs, multiple expiries, or multiple independent strikes require additional subscription planning, recorder schema, storage, and deterministic replay data.
+- A selector can identify a contract from the option chain or master CSV; it cannot prove that live quotes were subscribed, that bid/ask was available, or that historical rows exist.
