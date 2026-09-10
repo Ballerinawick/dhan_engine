@@ -496,10 +496,12 @@ class StockOptionPaperRuntime:
                 profile.selection_failures += 1
                 logger.warning(
                     "STOCK_OPTION_SELECTION_RETRY | symbol=%s | reason=FUTURE_QUOTE_UNAVAILABLE | "
-                    "attempts=%s | failures=%s",
+                    "attempts=%s | failures=%s | quote_age_sec=%.2f | feed_blocked=%s",
                     profile.root,
                     profile.selection_attempts,
                     profile.selection_failures,
+                    age,
+                    time.time() < self.fullquote_feed._effective_blocked_until() if hasattr(self.fullquote_feed, "_effective_blocked_until") else False,
                 )
                 continue
             try:

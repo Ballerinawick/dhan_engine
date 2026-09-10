@@ -235,6 +235,14 @@ class DhanLiveMarketFeedWS:
         reason: str = "stale_subscription",
     ) -> bool:
         """Refresh Dhan's server-side Full subscriptions without opening a socket."""
+        blocked_until = self._effective_blocked_until()
+        if time.time() < blocked_until:
+            remaining = max(0.0, blocked_until - time.time())
+            print(
+                "FULLQUOTE_SUBSCRIPTION_REFRESH_SKIPPED | "
+                f"reason={reason} | blocked_for={remaining:.0f}s | state=rate_limited"
+            )
+            return False
         if instruments is not None:
             self.replace_subscriptions(instruments, reason=f"refresh:{reason}")
         if not self._connected.is_set() or self._ws is None:
