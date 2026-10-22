@@ -29,12 +29,19 @@ def main() -> None:
         "deeplob_paper": "deeplob_live",
         "stock-option-paper": "stock_option_paper",
         "stock_option_paper": "stock_option_paper",
+        "nifty-cross-paper": "nifty_cross_paper",
+        "nifty_cross_paper": "nifty_cross_paper",
     }
     selected = aliases.get(service)
     if selected is None:
         valid = ", ".join(sorted(k for k in aliases if k))
         raise RuntimeError(f"Unknown DHAN_SERVICE={service!r}. Use one of: {valid}")
 
+    if selected == "nifty_cross_paper":
+        from dhan_engine.interfaces.cli.run_nifty_cross_paper import main as run_cross
+
+        run_cross()
+        return
     if selected == "stock":
         from dhan_engine.interfaces.cli.run_stock_paper import main as run_stock
 
