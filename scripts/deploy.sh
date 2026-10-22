@@ -65,6 +65,10 @@ DHAN_SERVICE="$(grep '^DHAN_SERVICE=' "${TEMP_ENV}" | cut -d= -f2- | tr '[:upper
 DEEPLOB_INSTALL="recorder"
 
 case "${DHAN_SERVICE}" in
+  nifty-cross-paper|nifty_cross_paper)
+    DEEPLOB_INSTALL="base"
+    echo "NIFTY_CROSS_PAPER_ONLY | DeepLOB paper and model startup skipped"
+    ;;
   deeplob-live|deeplob_live|deeplob-inference|deeplob_inference)
     # Live and inference services fail closed unless both versioned model
     # artifacts can be downloaded before the running service is replaced.
@@ -136,5 +140,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable dhan-engine
 sudo systemctl restart dhan-engine
 sudo systemctl --no-pager --full status dhan-engine
+if [[ "${DHAN_SERVICE}" == "nifty-cross-paper" || "${DHAN_SERVICE}" == "nifty_cross_paper" ]]; then
+  if sudo systemctl list-unit-files dhan-engine-stock-options.service --no-legend 2>/dev/null | grep -q "dhan-engine-stock-options"; then
+    sudo systemctl disable --now dhan-engine-stock-options.service
+    echo "NIFTY_CROSS_PAPER_ONLY | stock-options paper service stopped and disabled"
+  fi
+fi
 IMAGE_CREATED="$(sudo docker image inspect dhan-engine:latest --format '{{.Created}}')"
 echo "DEPLOY_RUNTIME_VERIFIED | source_sha256=${SOURCE_FINGERPRINT} | image_created=${IMAGE_CREATED} | service=${DHAN_SERVICE}"
